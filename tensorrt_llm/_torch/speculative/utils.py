@@ -1,7 +1,10 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
@@ -13,7 +16,8 @@ from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
 from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
-from .ngram_worker import NGramSampler, NGramSpecMetadata, NGramWorker
+from .ngram import NGramDrafter, NGramPoolManager
+from .sa_worker import SASampler, SASpecMetadata, SAWorker
 from .save_hidden_state import SaveHiddenStatesDrafter
 from .suffix_automaton import SuffixAutomatonManager
 
@@ -106,7 +110,15 @@ def get_spec_metadata(spec_config,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
         )
     if spec_config.spec_dec_mode.is_ngram():
-        return NGramSpecMetadata(
+        # NGram uses drafter path; no in-forward spec metadata with SA.
+        return SpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.max_total_draft_tokens,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+        )
+    if spec_config.spec_dec_mode.is_sa():
+        return SASpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.max_total_draft_tokens,
             spec_dec_mode=spec_config.spec_dec_mode,
@@ -171,6 +183,8 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_num_tokens,
         )
     if spec_dec_mode.is_ngram():
+        return NGramPoolManager(spec_config, max_num_requests)
+    if spec_dec_mode.is_sa():
         return SuffixAutomatonManager(spec_config, max_num_requests,
                                       max_seq_len)
     if spec_dec_mode.is_user_provided():
@@ -178,8 +192,10 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     return None
 
 
-def get_spec_decoder(sampler_args: TorchSampler.Args,
-                     spec_config: "DecodingBaseConfig"):
+def get_spec_decoder(
+    sampler_args: TorchSampler.Args,
+    spec_config: "DecodingBaseConfig",
+):
     if spec_config.spec_dec_mode.is_mtp_one_model():
         return MTPSampler(sampler_args,
                           nextn=spec_config.num_nextn_predict_layers)
@@ -189,9 +205,8 @@ def get_spec_decoder(sampler_args: TorchSampler.Args,
         return TorchSampler(sampler_args)
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSampler(sampler_args)
-    if spec_config.spec_dec_mode.is_ngram():
-        return NGramSampler(sampler_args,
-                            max_draft_len=spec_config.max_draft_len)
+    if spec_config.spec_dec_mode.is_sa():
+        return SASampler(sampler_args, max_draft_len=spec_config.max_draft_len)
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
@@ -221,9 +236,8 @@ def get_spec_drafter(model_engine,
                             spec_resource_manager=spec_resource_manager,
                             guided_decoder=guided_decoder)
 
-    # Note: NGram no longer uses external drafter - it uses in-forward NGramWorker
-    # if spec_config.spec_dec_mode.is_ngram():
-    #     return NGramDrafter(spec_config, spec_resource_manager)
+    if spec_config.spec_dec_mode.is_ngram():
+        return NGramDrafter(spec_config, spec_resource_manager)
 
     if spec_config.spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesDrafter(spec_config, spec_resource_manager)
@@ -248,8 +262,8 @@ def get_spec_worker(spec_config, model_config, mapping):
         return MTPEagleWorker(spec_config, model_config)
     if spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelWorker(spec_config, mapping)
-    if spec_dec_mode.is_ngram():
-        return NGramWorker(spec_config, model_config)
+    if spec_dec_mode.is_sa():
+        return SAWorker(spec_config, model_config)
     return None
 
 
