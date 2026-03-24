@@ -1,5 +1,4 @@
 #!/bin/bash
-# DeepSeek V3.1-NVFP4 Benchmark Script
 # Runs benchmarks with MTP/EAGLE3/PARD and +SA configurations
 #
 # Test Plan:
@@ -20,28 +19,65 @@
 #                   prompt includes cross-file context, output reuses identifiers from context)
 #   swebench      - SWE-bench Verified (real GitHub issues + code context,
 #                   grouped by repo, issue + hints + test patch as context)
+#   mtbench       - MT-Bench (multi-turn chat benchmark,
+#                   from philschmid/mt-bench on HuggingFace)
 
 set -e
 
 # ============================================================
 # Configuration
 # ============================================================
-# MTP (optional) target model
-MODEL_PATH="/home/scratch.trt_llm_data_ci/llm-models/DeepSeek-V3-0324-FP4"
-MODEL_NAME="deepseek-ai/DeepSeek-V3-0324-FP4"
 
-# EAGLE3 target model (default: single-GPU friendly)
-EAGLE3_TARGET_PATH="${EAGLE3_TARGET_PATH:-/home/scratch.trt_llm_data_ci/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct}"
-EAGLE3_TARGET_NAME="${EAGLE3_TARGET_NAME:-meta-llama/Llama-3.1-8B-Instruct}"
+# --- Shared Settings ---
+DATASET_TYPE=${DATASET_TYPE:-mtbench}
+SAMPLE_SIZE=100
+RANDOM_SEED=${RANDOM_SEED:-42}  # Use env var or default to 42 for reproducibility
+WARMUP=2
+CONCURRENCY=${CONCURRENCY:-1}
+SA_THRESHOLD=${SA_THRESHOLD:-4}
+NUM_REQUESTS=100
+OUTPUT_DIR="./sa_comparison_results_$(date +%Y%m%d_%H%M%S)"
+DATASET="$OUTPUT_DIR/sampled_data.jsonl"  # Will be created by sampling
 
-# PARD target model (default: match TRT-LLM integration tests)
+# --- MTP Configuration ---
+ENABLE_MTP=${ENABLE_MTP:-false}
+MTP_TARGET_PATH="${MTP_TARGET_PATH:-/home/scratch.trt_llm_data_ci/llm-models/DeepSeek-V3-0324-FP4}"
+MTP_TARGET_NAME="${MTP_TARGET_NAME:-deepseek-ai/DeepSeek-V3-0324-FP4}"
+MTP_BATCH_SIZE=${MTP_BATCH_SIZE:-4}
+MTP_CONCURRENCY=${MTP_CONCURRENCY:-$MTP_BATCH_SIZE}
+MTP_TP_SIZE=${MTP_TP_SIZE:-8}
+MTP_NUM_NEXTN_PREDICT_LAYERS=${MTP_NUM_NEXTN_PREDICT_LAYERS:-8}
+MTP_VARIANTS=${MTP_VARIANTS:-base,sa,sa_global}
+
+# --- EAGLE3 Configuration ---
+ENABLE_EAGLE3=${ENABLE_EAGLE3:-false}
+# Option A: Llama 3.1 8B + EAGLE3-LLaMA3.1 (default, works on single GPU)
+# EAGLE3_TARGET_PATH="${EAGLE3_TARGET_PATH:-/home/scratch.trt_llm_data_ci/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct}"
+# EAGLE3_TARGET_NAME="${EAGLE3_TARGET_NAME:-meta-llama/Llama-3.1-8B-Instruct}"
+# EAGLE3_MODEL="${EAGLE3_MODEL:-/home/scratch.trt_llm_data_ci/llm-models/EAGLE3-LLaMA3.1-Instruct-8B}"
+# Option B: GPT-OSS 120B + gpt-oss-120b-Eagle3 (requires multi-GPU)
+EAGLE3_TARGET_PATH="${EAGLE3_TARGET_PATH:-/home/scratch.trt_llm_data_ci/llm-models/gpt_oss/gpt-oss-120b}"
+EAGLE3_TARGET_NAME="${EAGLE3_TARGET_NAME:-GPT-OSS/120B-MXFP4}"
+EAGLE3_MODEL="${EAGLE3_MODEL:-/home/scratch.trt_llm_data_ci/llm-models/gpt_oss/gpt-oss-120b-Eagle3}"
+EAGLE3_BATCH_SIZE=${EAGLE3_BATCH_SIZE:-1}
+EAGLE3_CONCURRENCY=${EAGLE3_CONCURRENCY:-$EAGLE3_BATCH_SIZE}
+EAGLE3_TP_SIZE=${EAGLE3_TP_SIZE:-1}
+EAGLE3_DRAFT_LEN=${EAGLE3_DRAFT_LEN:-8}
+EAGLE3_VARIANTS=${EAGLE3_VARIANTS:-base,sa,sa_global}
+
+# --- PARD Configuration ---
+ENABLE_PARD=${ENABLE_PARD:-false}
 PARD_TARGET_PATH="${PARD_TARGET_PATH:-/home/scratch.trt_llm_data_ci/llm-models/llama-3.1-model/Llama-3.1-8B-Instruct}"
 PARD_TARGET_NAME="${PARD_TARGET_NAME:-meta-llama/Llama-3.1-8B-Instruct}"
-EAGLE3_MODEL="${EAGLE3_MODEL:-yuhuili/EAGLE3-LLaMA3.1-Instruct-8B}"
 PARD_MODEL="${PARD_MODEL:-/home/scratch.trt_llm_data_ci/llm-models/PARD-Llama-3.2-1B}"
+PARD_BATCH_SIZE=${PARD_BATCH_SIZE:-4}
+PARD_CONCURRENCY=${PARD_CONCURRENCY:-$PARD_BATCH_SIZE}
+PARD_TP_SIZE=${PARD_TP_SIZE:-1}
+PARD_DRAFT_LEN=${PARD_DRAFT_LEN:-4}
+PARD_VARIANTS=${PARD_VARIANTS:-base,sa,sa_global}
 
-# Dataset selection: "code_edits" or "repobench" or "crosscodeeval" or "swebench"R
-DATASET_TYPE=${DATASET_TYPE:-code_edits}
+# --- Dataset Settings ---
+# Dataset selection: "code_edits" or "repobench" or "crosscodeeval" or "swebench" or "mtbench"
 
 # code_edits settings
 SOURCE_JSON="/home/scratch.guijuz_coreai/code_edits_sample/edits_data.json"
@@ -73,29 +109,9 @@ SWEBENCH_MAX_PER_REPO=${SWEBENCH_MAX_PER_REPO:-0}
 # Output tokens (default 512 for patch generation)
 SWEBENCH_OUTPUT_TOKENS=${SWEBENCH_OUTPUT_TOKENS:-512}
 
-SAMPLE_SIZE=100
-RANDOM_SEED=${RANDOM_SEED:-42}  # Use env var or default to 42 for reproducibility
-TP_SIZE=${TP_SIZE:-1}
-ENABLE_MTP=${ENABLE_MTP:-false}
-ENABLE_EAGLE3=${ENABLE_EAGLE3:-false}
-ENABLE_PARD=${ENABLE_PARD:-false}
-NUM_REQUESTS=100
-WARMUP=2
-CONCURRENCY=${CONCURRENCY:-1}
-MTP_BATCH_SIZE=${MTP_BATCH_SIZE:-4}
-MTP_CONCURRENCY=${MTP_CONCURRENCY:-$MTP_BATCH_SIZE}
-OUTPUT_DIR="./sa_comparison_results_$(date +%Y%m%d_%H%M%S)"
-DATASET="$OUTPUT_DIR/sampled_data.jsonl"  # Will be created by sampling
-
-
-EAGLE3_BATCH_SIZE=${EAGLE3_BATCH_SIZE:-4}
-EAGLE3_CONCURRENCY=${EAGLE3_CONCURRENCY:-$EAGLE3_BATCH_SIZE}
-# Which EAGLE3 variants to run: comma-separated list of "base", "sa", "sa_global" (default: all)
-EAGLE3_VARIANTS=${EAGLE3_VARIANTS:-base,sa,sa_global}
-
-PARD_BATCH_SIZE=${PARD_BATCH_SIZE:-4}
-PARD_CONCURRENCY=${PARD_CONCURRENCY:-$PARD_BATCH_SIZE}
-PARD_DRAFT_LEN=${PARD_DRAFT_LEN:-4}
+# mtbench settings (downloaded on first run from HuggingFace)
+MTBENCH_OUTPUT_TOKENS=${MTBENCH_OUTPUT_TOKENS:-2048}
+MTBENCH_NUM_REQUESTS=${MTBENCH_NUM_REQUESTS:-128}
 
 # ============================================================
 # Setup
@@ -117,6 +133,8 @@ elif [ "$DATASET_TYPE" = "crosscodeeval" ]; then
     echo "CrossCodeEval dataset will be downloaded from HuggingFace (language=$CCEVAL_LANGUAGE)"
 elif [ "$DATASET_TYPE" = "swebench" ]; then
     echo "SWE-bench Verified will be downloaded from HuggingFace"
+elif [ "$DATASET_TYPE" = "mtbench" ]; then
+    echo "MT-Bench will be downloaded from HuggingFace"
 elif [ "$DATASET_TYPE" = "code_edits" ]; then
     if [ ! -f "$SOURCE_JSON" ]; then
         echo "ERROR: Source JSON not found: $SOURCE_JSON"
@@ -125,13 +143,13 @@ elif [ "$DATASET_TYPE" = "code_edits" ]; then
     fi
 else
     echo "ERROR: Unknown DATASET_TYPE: $DATASET_TYPE"
-    echo "Supported values: code_edits, repobench, crosscodeeval, swebench"
+    echo "Supported values: code_edits, repobench, crosscodeeval, swebench, mtbench"
     exit 1
 fi
 
-# Check if model path exists
-if [ ! -d "$MODEL_PATH" ]; then
-    echo "ERROR: Model path not found: $MODEL_PATH"
+# Check if MTP model path exists (when MTP is enabled)
+if [ "$ENABLE_MTP" = "true" ] && [ ! -d "$MTP_TARGET_PATH" ]; then
+    echo "ERROR: MTP target model path not found: $MTP_TARGET_PATH"
     exit 1
 fi
 
@@ -162,9 +180,6 @@ fi
 mkdir -p "$OUTPUT_DIR"
 echo "Output directory: $OUTPUT_DIR"
 echo "Dataset type: $DATASET_TYPE"
-echo "MTP target model path: $MODEL_PATH"
-echo "EAGLE3 target model path: $EAGLE3_TARGET_PATH"
-echo "PARD target model path: $PARD_TARGET_PATH"
 if [ "$DATASET_TYPE" = "repobench" ]; then
     echo "RepoBench JSON: $REPOBENCH_JSON"
     echo "Max repos: $REPOBENCH_MAX_REPOS"
@@ -177,17 +192,37 @@ elif [ "$DATASET_TYPE" = "swebench" ]; then
     echo "SWE-bench Verified (HuggingFace)"
     echo "Max repos: $SWEBENCH_MAX_REPOS"
     echo "Max per repo: $SWEBENCH_MAX_PER_REPO (0=all)"
+elif [ "$DATASET_TYPE" = "mtbench" ]; then
+    echo "MT-Bench (HuggingFace: philschmid/mt-bench)"
+    echo "Num requests: $MTBENCH_NUM_REQUESTS"
+    echo "Output tokens: $MTBENCH_OUTPUT_TOKENS"
 else
     echo "Source JSON: $SOURCE_JSON"
 fi
-echo "EAGLE3 model: $EAGLE3_MODEL"
-echo "PARD model: $PARD_MODEL"
 echo "Sample size: $SAMPLE_SIZE"
 echo "Random seed: $RANDOM_SEED"
-echo "TP Size: $TP_SIZE"
+echo "SA Threshold: $SA_THRESHOLD"
+echo ""
 echo "MTP enabled: $ENABLE_MTP"
+if [ "$ENABLE_MTP" = "true" ]; then
+    echo "  Target: $MTP_TARGET_PATH ($MTP_TARGET_NAME)"
+    echo "  TP Size: $MTP_TP_SIZE | Batch: $MTP_BATCH_SIZE | Concurrency: $MTP_CONCURRENCY"
+    echo "  MTP Layers: $MTP_NUM_NEXTN_PREDICT_LAYERS | Variants: $MTP_VARIANTS"
+fi
 echo "EAGLE3 enabled: $ENABLE_EAGLE3"
+if [ "$ENABLE_EAGLE3" = "true" ]; then
+    echo "  Target: $EAGLE3_TARGET_PATH ($EAGLE3_TARGET_NAME)"
+    echo "  Draft model: $EAGLE3_MODEL"
+    echo "  TP Size: $EAGLE3_TP_SIZE | Batch: $EAGLE3_BATCH_SIZE | Concurrency: $EAGLE3_CONCURRENCY"
+    echo "  Draft Length: $EAGLE3_DRAFT_LEN | Variants: $EAGLE3_VARIANTS"
+fi
 echo "PARD enabled: $ENABLE_PARD"
+if [ "$ENABLE_PARD" = "true" ]; then
+    echo "  Target: $PARD_TARGET_PATH ($PARD_TARGET_NAME)"
+    echo "  Draft model: $PARD_MODEL"
+    echo "  TP Size: $PARD_TP_SIZE | Batch: $PARD_BATCH_SIZE | Concurrency: $PARD_CONCURRENCY"
+    echo "  Draft Length: $PARD_DRAFT_LEN | Variants: $PARD_VARIANTS"
+fi
 echo ""
 
 # ============================================================
@@ -445,6 +480,43 @@ with open(output_jsonl, 'w') as f:
 print(f"  Saved SWE-bench dataset to: {output_jsonl}")
 SAMPLE_SCRIPT
 
+elif [ "$DATASET_TYPE" = "mtbench" ]; then
+    echo "Preparing MT-Bench dataset (num_requests=$MTBENCH_NUM_REQUESTS, output_tokens=$MTBENCH_OUTPUT_TOKENS)..."
+
+    DATASET_OUT="$DATASET" \
+    MTBENCH_NUM_REQUESTS_VAL="$MTBENCH_NUM_REQUESTS" \
+    MTBENCH_OUTPUT_TOKENS_VAL="$MTBENCH_OUTPUT_TOKENS" \
+    python3 << 'SAMPLE_SCRIPT'
+import json
+import os
+
+output_jsonl = os.environ["DATASET_OUT"]
+num_requests = int(os.environ["MTBENCH_NUM_REQUESTS_VAL"])
+output_tokens = int(os.environ["MTBENCH_OUTPUT_TOKENS_VAL"])
+
+from datasets import load_dataset
+
+print("  Downloading MT-Bench from HuggingFace (philschmid/mt-bench)...")
+ds = load_dataset("philschmid/mt-bench", split="train")
+data = list(ds)
+print(f"  Total entries: {len(data)}")
+
+selected = data[:num_requests]
+print(f"  Selected {len(selected)} requests")
+
+with open(output_jsonl, 'w') as f:
+    for entry in selected:
+        record = {
+            "question_id": entry.get("question_id"),
+            "category": entry.get("category"),
+            "turns": entry["turns"],
+            "output_tokens": output_tokens
+        }
+        f.write(json.dumps(record) + '\n')
+
+print(f"  Saved MT-Bench dataset to: {output_jsonl}")
+SAMPLE_SCRIPT
+
 else
     echo "Sampling $SAMPLE_SIZE random entries from code_edits source data..."
 
@@ -517,81 +589,73 @@ echo ""
 echo "Creating configuration files..."
 
 if [ "$ENABLE_MTP" = "true" ]; then
-    # MTP config with cudagraph and overlap scheduler enabled
-    # NOTE: enable_attention_dp must be false for speculative decoding to work properly
     cat > "$OUTPUT_DIR/config_mtp.yml" << EOF
 max_batch_size: $MTP_BATCH_SIZE
 speculative_config:
   decoding_type: "MTP"
-  num_nextn_predict_layers: 8
+  num_nextn_predict_layers: $MTP_NUM_NEXTN_PREDICT_LAYERS
 EOF
-    echo "  - Created: config_mtp.yml (MTP, max_batch_size=$MTP_BATCH_SIZE)"
+    echo "  - Created: config_mtp.yml (MTP, max_batch_size=$MTP_BATCH_SIZE, layers=$MTP_NUM_NEXTN_PREDICT_LAYERS)"
 
-    # MTP + SA config with sa_spec_threshold = 4
-    # NOTE: enable_attention_dp must be false for speculative decoding to work properly
     cat > "$OUTPUT_DIR/config_mtp_sa.yml" << EOF
 max_batch_size: $MTP_BATCH_SIZE
 speculative_config:
   decoding_type: "MTP"
-  num_nextn_predict_layers: 8
-  use_sa_spec: true
-  sa_spec_threshold: 4
+  num_nextn_predict_layers: $MTP_NUM_NEXTN_PREDICT_LAYERS
+  sa_config:
+    threshold: $SA_THRESHOLD
 EOF
-    echo "  - Created: config_mtp_sa.yml (MTP + SA, max_batch_size=$MTP_BATCH_SIZE)"
+    echo "  - Created: config_mtp_sa.yml (MTP + SA, max_batch_size=$MTP_BATCH_SIZE, threshold=$SA_THRESHOLD)"
 
-    # MTP + SA + Global Pool config
     cat > "$OUTPUT_DIR/config_mtp_sa_global.yml" << EOF
 max_batch_size: $MTP_BATCH_SIZE
 speculative_config:
   decoding_type: "MTP"
-  num_nextn_predict_layers: 8
-  use_sa_spec: true
-  sa_spec_threshold: 4
-  enable_global_pool: true
+  num_nextn_predict_layers: $MTP_NUM_NEXTN_PREDICT_LAYERS
+  sa_config:
+    threshold: $SA_THRESHOLD
+    enable_global_pool: true
 EOF
-    echo "  - Created: config_mtp_sa_global.yml (MTP + SA + Global Pool, max_batch_size=$MTP_BATCH_SIZE)"
+    echo "  - Created: config_mtp_sa_global.yml (MTP + SA + Global Pool, max_batch_size=$MTP_BATCH_SIZE, threshold=$SA_THRESHOLD)"
 else
     echo "  - Skipped MTP configs (ENABLE_MTP=false)"
 fi
 
 if [ "$ENABLE_EAGLE3" = "true" ]; then
-    # EAGLE3 config
     cat > "$OUTPUT_DIR/config_eagle3.yml" << EOF
 max_batch_size: $EAGLE3_BATCH_SIZE
 enable_chunked_prefill: true
 speculative_config:
   decoding_type: Eagle3
-  max_draft_len: 8
+  max_draft_len: $EAGLE3_DRAFT_LEN
   speculative_model: $EAGLE3_MODEL
 EOF
-    echo "  - Created: config_eagle3.yml (EAGLE3, max_batch_size=$EAGLE3_BATCH_SIZE, chunked_prefill=true)"
+    echo "  - Created: config_eagle3.yml (EAGLE3, max_batch_size=$EAGLE3_BATCH_SIZE, draft_len=$EAGLE3_DRAFT_LEN)"
 
-    # EAGLE3 + SA config
     cat > "$OUTPUT_DIR/config_eagle3_sa.yml" << EOF
 max_batch_size: $EAGLE3_BATCH_SIZE
 enable_chunked_prefill: true
 speculative_config:
   decoding_type: Eagle3
-  max_draft_len: 8
+  max_draft_len: $EAGLE3_DRAFT_LEN
   speculative_model: $EAGLE3_MODEL
-  use_sa_spec: true
-  sa_spec_threshold: 4
+  sa_config:
+    threshold: $SA_THRESHOLD
 EOF
-    echo "  - Created: config_eagle3_sa.yml (EAGLE3 + SA, max_batch_size=$EAGLE3_BATCH_SIZE, chunked_prefill=true)"
+    echo "  - Created: config_eagle3_sa.yml (EAGLE3 + SA, max_batch_size=$EAGLE3_BATCH_SIZE, threshold=$SA_THRESHOLD)"
 
-    # EAGLE3 + SA + Global Pool config
     cat > "$OUTPUT_DIR/config_eagle3_sa_global.yml" << EOF
 max_batch_size: $EAGLE3_BATCH_SIZE
 enable_chunked_prefill: true
 speculative_config:
   decoding_type: Eagle3
-  max_draft_len: 8
+  max_draft_len: $EAGLE3_DRAFT_LEN
   speculative_model: $EAGLE3_MODEL
-  use_sa_spec: true
-  sa_spec_threshold: 4
-  enable_global_pool: true
+  sa_config:
+    threshold: $SA_THRESHOLD
+    enable_global_pool: true
 EOF
-    echo "  - Created: config_eagle3_sa_global.yml (EAGLE3 + SA + Global Pool, max_batch_size=$EAGLE3_BATCH_SIZE, chunked_prefill=true)"
+    echo "  - Created: config_eagle3_sa_global.yml (EAGLE3 + SA + Global Pool, max_batch_size=$EAGLE3_BATCH_SIZE, threshold=$SA_THRESHOLD)"
 else
     echo "  - Skipped EAGLE3 configs (ENABLE_EAGLE3=false)"
 fi
@@ -599,7 +663,6 @@ fi
 
 
 if [ "$ENABLE_PARD" = "true" ]; then
-    # PARD config
     cat > "$OUTPUT_DIR/config_pard.yml" << EOF
 max_batch_size: $PARD_BATCH_SIZE
 speculative_config:
@@ -607,32 +670,30 @@ speculative_config:
   max_draft_len: $PARD_DRAFT_LEN
   speculative_model: $PARD_MODEL
 EOF
-    echo "  - Created: config_pard.yml (PARD, max_batch_size=$PARD_BATCH_SIZE, max_draft_len=$PARD_DRAFT_LEN)"
+    echo "  - Created: config_pard.yml (PARD, max_batch_size=$PARD_BATCH_SIZE, draft_len=$PARD_DRAFT_LEN)"
 
-    # PARD + SA config
     cat > "$OUTPUT_DIR/config_pard_sa.yml" << EOF
 max_batch_size: $PARD_BATCH_SIZE
 speculative_config:
   decoding_type: PARD
   max_draft_len: $PARD_DRAFT_LEN
   speculative_model: $PARD_MODEL
-  use_sa_spec: true
-  sa_spec_threshold: 4
+  sa_config:
+    threshold: $SA_THRESHOLD
 EOF
-    echo "  - Created: config_pard_sa.yml (PARD + SA, max_batch_size=$PARD_BATCH_SIZE, max_draft_len=$PARD_DRAFT_LEN)"
+    echo "  - Created: config_pard_sa.yml (PARD + SA, max_batch_size=$PARD_BATCH_SIZE, threshold=$SA_THRESHOLD)"
 
-    # PARD + SA + Global Pool config
     cat > "$OUTPUT_DIR/config_pard_sa_global.yml" << EOF
 max_batch_size: $PARD_BATCH_SIZE
 speculative_config:
   decoding_type: PARD
   max_draft_len: $PARD_DRAFT_LEN
   speculative_model: $PARD_MODEL
-  use_sa_spec: true
-  sa_spec_threshold: 4
-  enable_global_pool: true
+  sa_config:
+    threshold: $SA_THRESHOLD
+    enable_global_pool: true
 EOF
-    echo "  - Created: config_pard_sa_global.yml (PARD + SA + Global Pool, max_batch_size=$PARD_BATCH_SIZE, max_draft_len=$PARD_DRAFT_LEN)"
+    echo "  - Created: config_pard_sa_global.yml (PARD + SA + Global Pool, max_batch_size=$PARD_BATCH_SIZE, threshold=$SA_THRESHOLD)"
 else
     echo "  - Skipped PARD configs (ENABLE_PARD=false)"
 fi
@@ -677,36 +738,58 @@ elif [ "$DATASET_TYPE" = "crosscodeeval" ]; then
     DATASET_SOURCE_LABEL="Vincentvmt/CrossCodeEval (language=$CCEVAL_LANGUAGE, max_repos=$CCEVAL_MAX_REPOS, max_per_repo=$CCEVAL_MAX_PER_REPO)"
 elif [ "$DATASET_TYPE" = "swebench" ]; then
     DATASET_SOURCE_LABEL="princeton-nlp/SWE-bench_Verified (max_repos=$SWEBENCH_MAX_REPOS, max_per_repo=$SWEBENCH_MAX_PER_REPO)"
+elif [ "$DATASET_TYPE" = "mtbench" ]; then
+    DATASET_SOURCE_LABEL="philschmid/mt-bench (num_requests=$MTBENCH_NUM_REQUESTS, output_tokens=$MTBENCH_OUTPUT_TOKENS)"
 fi
 
 cat > "$SUMMARY_FILE" << EOF
 ============================================================
-DeepSeek V3.1-NVFP4 Benchmark Summary
+Benchmark Summary
 ============================================================
 Date: $(date)
 Dataset Type: $DATASET_TYPE
-MTP Target Model: $MODEL_PATH
-EAGLE3 Target Model: $EAGLE3_TARGET_PATH
-PARD Target Model: $PARD_TARGET_PATH
 Source Data: $DATASET_SOURCE_LABEL
 Sampled Dataset: $DATASET
 Dataset Size: $NUM_REQUESTS (random seed: $RANDOM_SEED)
 Num Requests: $NUM_REQUESTS
 Warmup: $WARMUP
-Concurrency: $CONCURRENCY
-TP Size: $TP_SIZE
-============================================================
+SA Threshold: $SA_THRESHOLD
 
-Test Plan:
-1. EAGLE3 speculative decoding (optional, ENABLE_EAGLE3=$ENABLE_EAGLE3)
-2. EAGLE3 + SA (optional, ENABLE_EAGLE3=$ENABLE_EAGLE3)
-3. EAGLE3 + SA + Global Pool (optional, ENABLE_EAGLE3=$ENABLE_EAGLE3)
-4. PARD speculative decoding (optional, ENABLE_PARD=$ENABLE_PARD)
-5. PARD + SA (optional, ENABLE_PARD=$ENABLE_PARD)
-6. PARD + SA + Global Pool (optional, ENABLE_PARD=$ENABLE_PARD)
-7. Baseline reference (no speculative decoding)
-8. MTP, MTP + SA, MTP + SA + Global Pool (optional, ENABLE_MTP=$ENABLE_MTP)
+EOF
 
+if [ "$ENABLE_MTP" = "true" ]; then
+    cat >> "$SUMMARY_FILE" << EOF
+--- MTP ---
+  Target Model: $MTP_TARGET_PATH ($MTP_TARGET_NAME)
+  TP Size: $MTP_TP_SIZE | Batch: $MTP_BATCH_SIZE | Concurrency: $MTP_CONCURRENCY
+  MTP Layers: $MTP_NUM_NEXTN_PREDICT_LAYERS | Variants: $MTP_VARIANTS
+
+EOF
+fi
+
+if [ "$ENABLE_EAGLE3" = "true" ]; then
+    cat >> "$SUMMARY_FILE" << EOF
+--- EAGLE3 ---
+  Target Model: $EAGLE3_TARGET_PATH ($EAGLE3_TARGET_NAME)
+  Draft Model: $EAGLE3_MODEL
+  TP Size: $EAGLE3_TP_SIZE | Batch: $EAGLE3_BATCH_SIZE | Concurrency: $EAGLE3_CONCURRENCY
+  Draft Length: $EAGLE3_DRAFT_LEN | Variants: $EAGLE3_VARIANTS
+
+EOF
+fi
+
+if [ "$ENABLE_PARD" = "true" ]; then
+    cat >> "$SUMMARY_FILE" << EOF
+--- PARD ---
+  Target Model: $PARD_TARGET_PATH ($PARD_TARGET_NAME)
+  Draft Model: $PARD_MODEL
+  TP Size: $PARD_TP_SIZE | Batch: $PARD_BATCH_SIZE | Concurrency: $PARD_CONCURRENCY
+  Draft Length: $PARD_DRAFT_LEN | Variants: $PARD_VARIANTS
+
+EOF
+fi
+
+cat >> "$SUMMARY_FILE" << EOF
 ============================================================
 
 EOF
@@ -717,8 +800,8 @@ EOF
 run_benchmark() {
     local config_name="$1"
     local config_file="$2"
-    local benchmark_model_name="${3:-$MODEL_NAME}"
-    local benchmark_model_path="${4:-$MODEL_PATH}"
+    local benchmark_model_name="${3:-$MTP_TARGET_NAME}"
+    local benchmark_model_path="${4:-$MTP_TARGET_PATH}"
     local log_file="$OUTPUT_DIR/bench_${config_name}.log"
     local json_file="$OUTPUT_DIR/bench_${config_name}.json"
 
@@ -737,7 +820,7 @@ run_benchmark() {
     # Run benchmark
     trtllm-bench --model "$benchmark_model_name" \
         --model_path "$benchmark_model_path" \
-        latency \
+        throughput \
         --dataset "$DATASET" \
         --tp "$TP_SIZE" \
         --config "$config_file" \
@@ -774,6 +857,7 @@ run_benchmark() {
     echo "------------------------------------------------------------" >> "$SUMMARY_FILE"
     echo "Configuration: $config_name" >> "$SUMMARY_FILE"
     echo "Batch Size: $batch_size" >> "$SUMMARY_FILE"
+    echo "TP Size: $TP_SIZE" >> "$SUMMARY_FILE"
     echo "Concurrency: $CONCURRENCY" >> "$SUMMARY_FILE"
     echo "Duration: ${duration}s" >> "$SUMMARY_FILE"
     echo "Exit code: $exit_code" >> "$SUMMARY_FILE"
@@ -849,45 +933,57 @@ all_passed=true
 # Optional MTP runs (usually disabled on single-H100 setups)
 if [ "$ENABLE_MTP" = "true" ]; then
     SAVED_CONCURRENCY=$CONCURRENCY
+    SAVED_TP_SIZE=$TP_SIZE
     CONCURRENCY=$MTP_CONCURRENCY
+    TP_SIZE=$MTP_TP_SIZE
 
-    # 1. MTP only (with cudagraph and overlap scheduler)
-    echo ""
-    echo "============================================================"
-    echo "Part 1: MTP Speculative Decoding (batch=$MTP_BATCH_SIZE, concurrency=$MTP_CONCURRENCY)"
-    echo "============================================================"
-    echo ""
+    if [[ ",$MTP_VARIANTS," == *",base,"* ]]; then
+        echo ""
+        echo "============================================================"
+        echo "Part 1: MTP Speculative Decoding (batch=$MTP_BATCH_SIZE, concurrency=$MTP_CONCURRENCY)"
+        echo "============================================================"
+        echo ""
 
-    if ! run_benchmark "mtp" "$OUTPUT_DIR/config_mtp.yml" "$MODEL_NAME" "$MODEL_PATH"; then
-        echo "WARNING: MTP benchmark failed"
-        all_passed=false
+        if ! run_benchmark "mtp" "$OUTPUT_DIR/config_mtp.yml" "$MTP_TARGET_NAME" "$MTP_TARGET_PATH"; then
+            echo "WARNING: MTP benchmark failed"
+            all_passed=false
+        fi
+    else
+        echo "Skipping MTP base (MTP_VARIANTS=$MTP_VARIANTS)"
     fi
 
-    # 2. MTP + SA
-    echo ""
-    echo "============================================================"
-    echo "Part 2: MTP + SA (batch=$MTP_BATCH_SIZE, concurrency=$MTP_CONCURRENCY)"
-    echo "============================================================"
-    echo ""
+    if [[ ",$MTP_VARIANTS," == *",sa,"* ]]; then
+        echo ""
+        echo "============================================================"
+        echo "Part 2: MTP + SA (batch=$MTP_BATCH_SIZE, concurrency=$MTP_CONCURRENCY)"
+        echo "============================================================"
+        echo ""
 
-    if ! run_benchmark "mtp_sa" "$OUTPUT_DIR/config_mtp_sa.yml" "$MODEL_NAME" "$MODEL_PATH"; then
-        echo "WARNING: MTP+SA benchmark failed"
-        all_passed=false
+        if ! run_benchmark "mtp_sa" "$OUTPUT_DIR/config_mtp_sa.yml" "$MTP_TARGET_NAME" "$MTP_TARGET_PATH"; then
+            echo "WARNING: MTP+SA benchmark failed"
+            all_passed=false
+        fi
+    else
+        echo "Skipping MTP+SA (MTP_VARIANTS=$MTP_VARIANTS)"
     fi
 
-    # 3. MTP + SA + Global Pool
-    echo ""
-    echo "============================================================"
-    echo "Part 3: MTP + SA + Global Pool (batch=$MTP_BATCH_SIZE, concurrency=$MTP_CONCURRENCY)"
-    echo "============================================================"
-    echo ""
+    if [[ ",$MTP_VARIANTS," == *",sa_global,"* ]]; then
+        echo ""
+        echo "============================================================"
+        echo "Part 3: MTP + SA + Global Pool (batch=$MTP_BATCH_SIZE, concurrency=$MTP_CONCURRENCY)"
+        echo "============================================================"
+        echo ""
 
-    if ! run_benchmark "mtp_sa_global" "$OUTPUT_DIR/config_mtp_sa_global.yml" "$MODEL_NAME" "$MODEL_PATH"; then
-        echo "WARNING: MTP+SA+Global Pool benchmark failed"
-        all_passed=false
+        if ! run_benchmark "mtp_sa_global" "$OUTPUT_DIR/config_mtp_sa_global.yml" "$MTP_TARGET_NAME" "$MTP_TARGET_PATH"; then
+            echo "WARNING: MTP+SA+Global Pool benchmark failed"
+            all_passed=false
+        fi
+    else
+        echo "Skipping MTP+SA+Global Pool (MTP_VARIANTS=$MTP_VARIANTS)"
     fi
 
     CONCURRENCY=$SAVED_CONCURRENCY
+    TP_SIZE=$SAVED_TP_SIZE
 else
     echo "Skipping MTP and MTP+SA benchmarks (ENABLE_MTP=false)"
 fi
@@ -895,7 +991,9 @@ fi
 # Optional EAGLE3 runs
 if [ "$ENABLE_EAGLE3" = "true" ]; then
     SAVED_CONCURRENCY=$CONCURRENCY
+    SAVED_TP_SIZE=$TP_SIZE
     CONCURRENCY=$EAGLE3_CONCURRENCY
+    TP_SIZE=$EAGLE3_TP_SIZE
 
     if [[ ",$EAGLE3_VARIANTS," == *",base,"* ]]; then
         # 3. EAGLE3 Speculative Decoding
@@ -946,6 +1044,7 @@ if [ "$ENABLE_EAGLE3" = "true" ]; then
     fi
 
     CONCURRENCY=$SAVED_CONCURRENCY
+    TP_SIZE=$SAVED_TP_SIZE
 else
     echo "Skipping EAGLE3 and EAGLE3+SA benchmarks (ENABLE_EAGLE3=false)"
 fi
@@ -953,45 +1052,57 @@ fi
 # Optional PARD runs
 if [ "$ENABLE_PARD" = "true" ]; then
     SAVED_CONCURRENCY=$CONCURRENCY
+    SAVED_TP_SIZE=$TP_SIZE
     CONCURRENCY=$PARD_CONCURRENCY
+    TP_SIZE=$PARD_TP_SIZE
 
-    # 5. PARD Speculative Decoding
-    echo ""
-    echo "============================================================"
-    echo "Part 5: PARD Speculative Decoding (batch=$PARD_BATCH_SIZE, concurrency=$PARD_CONCURRENCY, K=$PARD_DRAFT_LEN)"
-    echo "============================================================"
-    echo ""
+    if [[ ",$PARD_VARIANTS," == *",base,"* ]]; then
+        echo ""
+        echo "============================================================"
+        echo "Part 5: PARD Speculative Decoding (batch=$PARD_BATCH_SIZE, concurrency=$PARD_CONCURRENCY, K=$PARD_DRAFT_LEN)"
+        echo "============================================================"
+        echo ""
 
-    if ! run_benchmark "pard" "$OUTPUT_DIR/config_pard.yml" "$PARD_TARGET_NAME" "$PARD_TARGET_PATH"; then
-        echo "WARNING: PARD benchmark failed"
-        all_passed=false
+        if ! run_benchmark "pard" "$OUTPUT_DIR/config_pard.yml" "$PARD_TARGET_NAME" "$PARD_TARGET_PATH"; then
+            echo "WARNING: PARD benchmark failed"
+            all_passed=false
+        fi
+    else
+        echo "Skipping PARD base (PARD_VARIANTS=$PARD_VARIANTS)"
     fi
 
-    # 6. PARD + SA
-    echo ""
-    echo "============================================================"
-    echo "Part 6: PARD + SA (batch=$PARD_BATCH_SIZE, concurrency=$PARD_CONCURRENCY, K=$PARD_DRAFT_LEN)"
-    echo "============================================================"
-    echo ""
+    if [[ ",$PARD_VARIANTS," == *",sa,"* ]]; then
+        echo ""
+        echo "============================================================"
+        echo "Part 6: PARD + SA (batch=$PARD_BATCH_SIZE, concurrency=$PARD_CONCURRENCY, K=$PARD_DRAFT_LEN)"
+        echo "============================================================"
+        echo ""
 
-    if ! run_benchmark "pard_sa" "$OUTPUT_DIR/config_pard_sa.yml" "$PARD_TARGET_NAME" "$PARD_TARGET_PATH"; then
-        echo "WARNING: PARD+SA benchmark failed"
-        all_passed=false
+        if ! run_benchmark "pard_sa" "$OUTPUT_DIR/config_pard_sa.yml" "$PARD_TARGET_NAME" "$PARD_TARGET_PATH"; then
+            echo "WARNING: PARD+SA benchmark failed"
+            all_passed=false
+        fi
+    else
+        echo "Skipping PARD+SA (PARD_VARIANTS=$PARD_VARIANTS)"
     fi
 
-    # 7. PARD + SA + Global Pool
-    echo ""
-    echo "============================================================"
-    echo "Part 7: PARD + SA + Global Pool (batch=$PARD_BATCH_SIZE, concurrency=$PARD_CONCURRENCY, K=$PARD_DRAFT_LEN)"
-    echo "============================================================"
-    echo ""
+    if [[ ",$PARD_VARIANTS," == *",sa_global,"* ]]; then
+        echo ""
+        echo "============================================================"
+        echo "Part 7: PARD + SA + Global Pool (batch=$PARD_BATCH_SIZE, concurrency=$PARD_CONCURRENCY, K=$PARD_DRAFT_LEN)"
+        echo "============================================================"
+        echo ""
 
-    if ! run_benchmark "pard_sa_global" "$OUTPUT_DIR/config_pard_sa_global.yml" "$PARD_TARGET_NAME" "$PARD_TARGET_PATH"; then
-        echo "WARNING: PARD+SA+Global Pool benchmark failed"
-        all_passed=false
+        if ! run_benchmark "pard_sa_global" "$OUTPUT_DIR/config_pard_sa_global.yml" "$PARD_TARGET_NAME" "$PARD_TARGET_PATH"; then
+            echo "WARNING: PARD+SA+Global Pool benchmark failed"
+            all_passed=false
+        fi
+    else
+        echo "Skipping PARD+SA+Global Pool (PARD_VARIANTS=$PARD_VARIANTS)"
     fi
 
     CONCURRENCY=$SAVED_CONCURRENCY
+    TP_SIZE=$SAVED_TP_SIZE
 else
     echo "Skipping PARD and PARD+SA benchmarks (ENABLE_PARD=false)"
 fi
@@ -1001,28 +1112,34 @@ fi
 # Match concurrency to the corresponding speculative decoding config for fair comparison.
 if [ "$ENABLE_MTP" = "true" ]; then
     SAVED_CONCURRENCY=$CONCURRENCY
+    SAVED_TP_SIZE=$TP_SIZE
     CONCURRENCY=$MTP_CONCURRENCY
+    TP_SIZE=$MTP_TP_SIZE
 
     echo ""
     echo "============================================================"
-    echo "Part 8a: Baseline for MTP (${MODEL_NAME}, concurrency=$CONCURRENCY)"
+    echo "Part 8a: Baseline for MTP (${MTP_TARGET_NAME}, concurrency=$CONCURRENCY)"
     echo "============================================================"
     echo ""
 
-    if ! run_benchmark "baseline" "$OUTPUT_DIR/config_baseline.yml" "$MODEL_NAME" "$MODEL_PATH"; then
+    if ! run_benchmark "baseline" "$OUTPUT_DIR/config_baseline.yml" "$MTP_TARGET_NAME" "$MTP_TARGET_PATH"; then
         echo "WARNING: MTP Baseline benchmark failed"
         all_passed=false
     fi
 
     CONCURRENCY=$SAVED_CONCURRENCY
+    TP_SIZE=$SAVED_TP_SIZE
 fi
 
 if [ "$ENABLE_EAGLE3" = "true" ] || [ "$ENABLE_PARD" = "true" ]; then
     SAVED_CONCURRENCY=$CONCURRENCY
+    SAVED_TP_SIZE=$TP_SIZE
     if [ "$ENABLE_EAGLE3" = "true" ]; then
         CONCURRENCY=$EAGLE3_CONCURRENCY
+        TP_SIZE=$EAGLE3_TP_SIZE
     else
         CONCURRENCY=$PARD_CONCURRENCY
+        TP_SIZE=$PARD_TP_SIZE
     fi
 
     echo ""
@@ -1043,6 +1160,7 @@ if [ "$ENABLE_EAGLE3" = "true" ] || [ "$ENABLE_PARD" = "true" ]; then
     fi
 
     CONCURRENCY=$SAVED_CONCURRENCY
+    TP_SIZE=$SAVED_TP_SIZE
 fi
 
 # Fallback: if neither MTP nor EAGLE3/PARD enabled, run MTP model baseline
@@ -1053,7 +1171,7 @@ if [ "$ENABLE_MTP" != "true" ] && [ "$ENABLE_EAGLE3" != "true" ] && [ "$ENABLE_P
     echo "============================================================"
     echo ""
 
-    if ! run_benchmark "baseline" "$OUTPUT_DIR/config_baseline.yml" "$MODEL_NAME" "$MODEL_PATH"; then
+    if ! run_benchmark "baseline" "$OUTPUT_DIR/config_baseline.yml" "$MTP_TARGET_NAME" "$MTP_TARGET_PATH"; then
         echo "WARNING: Baseline benchmark failed"
         all_passed=false
     fi
@@ -1295,7 +1413,7 @@ import re
 from pathlib import Path
 
 output_dir = "$OUTPUT_DIR"
-model_path = "$MODEL_PATH"
+mtp_target_path = "$MTP_TARGET_PATH"
 eagle3_target_path = "$EAGLE3_TARGET_PATH"
 pard_target_path = "$PARD_TARGET_PATH"
 dataset_path = "$DATASET"
@@ -1311,7 +1429,13 @@ swebench_max_per_repo = "$SWEBENCH_MAX_PER_REPO"
 cceval_max_per_repo = "$CCEVAL_MAX_PER_REPO"
 sample_size = "$SAMPLE_SIZE"
 random_seed = "$RANDOM_SEED"
-tp_size = "$TP_SIZE"
+mtp_tp_size = "$MTP_TP_SIZE"
+eagle3_tp_size = "$EAGLE3_TP_SIZE"
+pard_tp_size = "$PARD_TP_SIZE"
+mtp_num_layers = "$MTP_NUM_NEXTN_PREDICT_LAYERS"
+eagle3_draft_len = "$EAGLE3_DRAFT_LEN"
+pard_draft_len = "$PARD_DRAFT_LEN"
+sa_threshold = "$SA_THRESHOLD"
 enable_mtp = "${ENABLE_MTP}".lower() == "true"
 enable_eagle3 = "${ENABLE_EAGLE3}".lower() == "true"
 enable_pard = "${ENABLE_PARD}".lower() == "true"
@@ -1487,10 +1611,6 @@ print("## Configuration")
 print("")
 print("| Setting | Value |")
 print("|---------|-------|")
-print(f"| **MTP Target** | {model_path} |")
-print(f"| **EAGLE3 Target** | {eagle3_target_path} |")
-print(f"| **PARD Target** | {pard_target_path} |")
-print(f"| **TP Size** | {tp_size} |")
 print(f"| **Dataset Type** | {dataset_type} |")
 print(f"| **Sample Size** | {sample_size} (seed: {random_seed}) |")
 if dataset_type == "repobench":
@@ -1508,15 +1628,32 @@ elif dataset_type == "swebench":
     print(f"| **Max Per Repo** | {swebench_max_per_repo} (0=all) |")
 else:
     print(f"| **Source Data** | {source_json} |")
-print(f"| **CUDA Graph** | Enabled (max_batch_size=8) |")
-print(f"| **Overlap Scheduler** | Enabled |")
+print(f"| **SA Threshold** | {sa_threshold} |")
+print("")
 if enable_mtp:
-    print(f"| **MTP Layers** | 8 |")
+    print("### MTP")
+    print("| Setting | Value |")
+    print("|---------|-------|")
+    print(f"| **Target Model** | {mtp_target_path} |")
+    print(f"| **TP Size** | {mtp_tp_size} |")
+    print(f"| **MTP Layers** | {mtp_num_layers} |")
+    print("")
 if enable_eagle3:
-    print(f"| **EAGLE3 Draft Length** | 4 |")
+    print("### EAGLE3")
+    print("| Setting | Value |")
+    print("|---------|-------|")
+    print(f"| **Target Model** | {eagle3_target_path} |")
+    print(f"| **TP Size** | {eagle3_tp_size} |")
+    print(f"| **Draft Length** | {eagle3_draft_len} |")
+    print("")
 if enable_pard:
-    print(f"| **PARD Draft Length** | 4 |")
-print(f"| **SA Threshold** | 4 |")
+    print("### PARD")
+    print("| Setting | Value |")
+    print("|---------|-------|")
+    print(f"| **Target Model** | {pard_target_path} |")
+    print(f"| **TP Size** | {pard_tp_size} |")
+    print(f"| **Draft Length** | {pard_draft_len} |")
+    print("")
 print("")
 
 print("## Dataset Details")
@@ -1692,6 +1829,7 @@ if [ "$ENABLE_MTP" = "true" ]; then
     echo "  - bench_mtp.{log,json} - MTP only"
     echo "  - bench_mtp_sa.{log,json} - MTP + SA"
     echo "  - bench_mtp_sa_global.{log,json} - MTP + SA + Global Pool"
+    echo "  - bench_baseline.{log,json} - Baseline ($MTP_TARGET_NAME, no speculative decoding)"
 fi
 if [ "$ENABLE_EAGLE3" = "true" ]; then
     echo "  - bench_eagle3.{log,json} - EAGLE3 only"
@@ -1703,9 +1841,15 @@ if [ "$ENABLE_PARD" = "true" ]; then
     echo "  - bench_pard_sa.{log,json} - PARD + SA"
     echo "  - bench_pard_sa_global.{log,json} - PARD + SA + Global Pool"
 fi
-echo "  - bench_baseline.{log,json} - Baseline for MTP model (no speculative decoding)"
-if [ "$ENABLE_MTP" = "true" ] && ([ "$ENABLE_EAGLE3" = "true" ] || [ "$ENABLE_PARD" = "true" ]); then
-    echo "  - bench_baseline_ep.{log,json} - Baseline for EAGLE3/PARD model (no speculative decoding)"
+if [ "$ENABLE_EAGLE3" = "true" ] || [ "$ENABLE_PARD" = "true" ]; then
+    if [ "$ENABLE_MTP" = "true" ]; then
+        echo "  - bench_baseline_ep.{log,json} - Baseline ($EAGLE3_TARGET_NAME, no speculative decoding)"
+    else
+        echo "  - bench_baseline.{log,json} - Baseline ($EAGLE3_TARGET_NAME, no speculative decoding)"
+    fi
+fi
+if [ "$ENABLE_MTP" != "true" ] && [ "$ENABLE_EAGLE3" != "true" ] && [ "$ENABLE_PARD" != "true" ]; then
+    echo "  - bench_baseline.{log,json} - Baseline (no speculative decoding)"
 fi
 echo ""
 echo "To view results:"
