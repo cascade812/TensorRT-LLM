@@ -226,7 +226,6 @@ flowchart TD
 
 - **Main difference vs. legacy:**
   - **next iteration vs single iteration**
-  - **single stream vs. two streams.** Two streams enable **inter-iteration overlap** (iter N+1 encoder runs concurrently with iter N decoder); a single stream does not.
 
 ---
 
