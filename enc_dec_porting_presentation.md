@@ -71,14 +71,10 @@ flowchart LR
 | **Inflight Batching**     | Supported via `TrtGptModelInflightBatching` (decoder side)                                                                                                                          |
 | **LoRA**                  | Supported on BART (target modules incl. `cross_attn_q`, `cross_attn_v`)                                                                                                             |
 | **Beam search**           | Supported, configured at build time via `--max_beam_width`                                                                                                                          |
-| **Disaggregated serving** | **Not supported** for enc-dec on either path                                                                                                                                        |
-
 
 ---
 
 ## 4. How the Scheduler Works on the TRT Path
-
-**Core invariant:** encoder and decoder requests are **never** mixed in the same micro-batch.
 
 ```mermaid
 stateDiagram-v2
@@ -93,7 +89,7 @@ stateDiagram-v2
 
 **Two model wrappers, two schedulers, two CUDA streams, one event per iteration:**
 
-1. `**TrtEncoderModel`** owns encoder engine + its own `CapacityScheduler` + `MicroBatchScheduler`. Scheduler is **gated to `[ENCODER_INIT, CONTEXT_INIT)`** — only encoder-phase requests are visible.
+1. `**TrtEncoderModel`** owns encoder engine + its own `CapacityScheduler` + `MicroBatchScheduler`. Scheduler is **gated to `ENCODER_INIT`** — only encoder-phase requests are visible.
 2. `**TrtGptModelInflightBatching**` owns decoder engine. Its scheduler only admits requests at `CONTEXT_INIT` or later.
 3. `**Executor::Impl::forwardAsync**` drives both per iteration:
   - Run encoder → record CUDA event → decoder stream waits on event → run decoder.
@@ -205,7 +201,7 @@ After 5α + 5β, `ModelConfig.attn_backend == "TRTLLM"` selects the production b
 
 **State machine: same as legacy** (`ENCODER_INIT → CONTEXT_INIT → GENERATION_IN_PROGRESS → GENERATION_COMPLETE`).
 
-**Invariant:** encoder and decoder requests **never share one micro-batch**. The executor splits the scheduler's `context_requests` bucket into encoder vs. decoder-context subsets so each forward pass sees one type only.
+**Invariant:** encoder and decoder requests **never share one batch**. The executor splits the scheduler's `context_requests` bucket into encoder vs. decoder-context subsets so each forward pass sees one type only.
 
 **Per-request flow (next-iteration dispatch):**
 
@@ -228,8 +224,9 @@ flowchart TD
 
 
 
-- **Main gap vs. legacy:**
-  - **single stream vs. two streams.** Two streams enable **inter-iteration overlap** (iter M+1 encoder runs concurrently with iter M decoder); a single stream does not. Within one iteration, encoder→decoder is serialized by the event in both cases — no within-iter overlap.
+- **Main difference vs. legacy:**
+  - **next iteration vs single iteration**
+  - **single stream vs. two streams.** Two streams enable **inter-iteration overlap** (iter N+1 encoder runs concurrently with iter N decoder); a single stream does not.
 
 ---
 
@@ -238,8 +235,7 @@ flowchart TD
 **Tensor Parallelism (TP):**
 
 - Works out of the box via existing `Attention` sharding in `_torch/modules/attention.py`.
-- Both encoder self-attention and decoder self-attention shard along `num_heads`.
-- **Caveat (T5-family only):** relative attention bias table is split along `num_heads` ⇒ `num_heads` must be divisible by `tp_size`.
+- Both encoder self-attention, decoder self-attention and decoder cross attention shard along `num_heads`.
 
 **Pipeline Parallelism (PP):**
 
