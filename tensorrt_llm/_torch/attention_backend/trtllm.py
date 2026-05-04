@@ -1469,6 +1469,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                            dim=1).contiguous()
             k_arg = None if metadata.is_cross else k
             v_arg = None if metadata.is_cross else v
+            legacy_attention_kwargs = {}
+            if metadata.is_cross:
+                legacy_attention_kwargs = {
+                    "cross_attention": True,
+                    "cross_kv": cross_kv_input,
+                    "encoder_input_lengths": encoder_seq_lens_arg,
+                }
             thop.attention(
                 q,
                 k_arg,
@@ -1556,9 +1563,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 forward_args.sage_attn_qk_int8,
                 num_contexts=metadata.num_contexts,
                 num_ctx_tokens=metadata.num_ctx_tokens,
-                cross_attention=metadata.is_cross,
-                cross_kv=cross_kv_input,
-                encoder_input_lengths=encoder_seq_lens_arg,
+                **legacy_attention_kwargs,
             )
 
         if self.print_skip_softmax_stat:
