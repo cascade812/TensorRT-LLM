@@ -1599,8 +1599,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata,
             TrtllmAttentionMetadata,
         )
-        # Cross-attention uses trtllm-gen on Blackwell and the legacy
-        # thop.attention path on earlier architectures.
+        # Cross-attention uses trtllm-gen when supported and legacy thop otherwise.
 
         use_paged_context_fmha = (
             metadata.runtime_features.chunked_prefill
