@@ -374,6 +374,11 @@ class GenerationExecutor(ABC):
         pass
 
     @property
+    def resource_governor_queue(self):
+        """Return the resource governor queue if this executor supports it."""
+        return None
+
+    @property
     def enable_postprocess_parallel(self) -> bool:
         return self.postproc_config.enabled
 

@@ -22,7 +22,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 GB = 1 << 30
@@ -33,8 +33,15 @@ def _make_creator(
     host_cache_size=None,
     total_kv_per_token: int = 100,
     target_kv_per_token: int = 80,
+    total_kv_cost=None,
+    target_kv_cost=None,
 ) -> KvCacheCreator:
-    """Build a minimal KvCacheCreator wired for _split_kv_cache_budget_for_draft."""
+    """Build a minimal KvCacheCreator wired for _split_kv_cache_budget_for_draft.
+
+    Per-token costs are exposed via the new ``CacheCost`` shape; the manager
+    mock returns a raw int so we also exercise ``_per_manager_cache_cost``'s
+    ``CacheCost.from_raw`` wrapping.
+    """
     c = object.__new__(KvCacheCreator)
 
     c._kv_cache_config = KvCacheConfig(
@@ -42,13 +49,19 @@ def _make_creator(
         host_cache_size=host_cache_size,
     )
     c._tokens_per_block = 64
+    c._max_batch_size = 1
     c._mapping = Mock()
     c._model_engine = Mock()
 
-    c._kv_cache_manager_cls = Mock()
-    c._kv_cache_manager_cls.get_cache_size_per_token = Mock(return_value=target_kv_per_token)
+    if total_kv_cost is None:
+        total_kv_cost = CacheCost(slope=total_kv_per_token)
+    if target_kv_cost is None:
+        target_kv_cost = target_kv_per_token
 
-    c._get_kv_size_per_token = Mock(return_value=total_kv_per_token)
+    c._kv_cache_manager_cls = Mock()
+    c._kv_cache_manager_cls.get_cache_size_per_token = Mock(return_value=target_kv_cost)
+
+    c._get_kv_size_per_token = Mock(return_value=total_kv_cost)
 
     return c
 
@@ -60,11 +73,12 @@ class TestSplitKvCacheBudgetForDraft:
             max_gpu_total_bytes=total_gpu, total_kv_per_token=100, target_kv_per_token=80
         )
 
-        draft_config = c._split_kv_cache_budget_for_draft()
+        target_config, draft_config = c._split_kv_cache_budget_for_draft()
 
         assert draft_config is not None
-        assert c._kv_cache_config.max_gpu_total_bytes == 8 * GB
+        assert target_config.max_gpu_total_bytes == 8 * GB
         assert draft_config.max_gpu_total_bytes == 2 * GB
+        assert c._kv_cache_config.max_gpu_total_bytes == total_gpu
 
     def test_host_budget_split_proportionally(self):
         total_gpu = 10 * GB
@@ -76,15 +90,17 @@ class TestSplitKvCacheBudgetForDraft:
             target_kv_per_token=80,
         )
 
-        draft_config = c._split_kv_cache_budget_for_draft()
+        target_config, draft_config = c._split_kv_cache_budget_for_draft()
 
         assert draft_config is not None
         # GPU: 80% target, 20% draft
-        assert c._kv_cache_config.max_gpu_total_bytes == 8 * GB
+        assert target_config.max_gpu_total_bytes == 8 * GB
         assert draft_config.max_gpu_total_bytes == 2 * GB
         # Host: same ratio
-        assert c._kv_cache_config.host_cache_size == 16 * GB
+        assert target_config.host_cache_size == 16 * GB
         assert draft_config.host_cache_size == 4 * GB
+        assert c._kv_cache_config.max_gpu_total_bytes == total_gpu
+        assert c._kv_cache_config.host_cache_size == total_host
 
     def test_host_budget_not_doubled(self):
         """Regression: before the fix, both target and draft managers each
@@ -97,11 +113,12 @@ class TestSplitKvCacheBudgetForDraft:
             target_kv_per_token=80,
         )
 
-        draft_config = c._split_kv_cache_budget_for_draft()
+        target_config, draft_config = c._split_kv_cache_budget_for_draft()
 
-        target_host = c._kv_cache_config.host_cache_size
+        target_host = target_config.host_cache_size
         draft_host = draft_config.host_cache_size
         assert target_host + draft_host == total_host
+        assert c._kv_cache_config.host_cache_size == total_host
 
     def test_budgets_sum_to_original(self):
         total_gpu = 15 * GB
@@ -113,12 +130,10 @@ class TestSplitKvCacheBudgetForDraft:
             target_kv_per_token=700,
         )
 
-        draft_config = c._split_kv_cache_budget_for_draft()
+        target_config, draft_config = c._split_kv_cache_budget_for_draft()
 
-        assert (
-            c._kv_cache_config.max_gpu_total_bytes + draft_config.max_gpu_total_bytes
-        ) == total_gpu
-        assert (c._kv_cache_config.host_cache_size + draft_config.host_cache_size) == total_host
+        assert (target_config.max_gpu_total_bytes + draft_config.max_gpu_total_bytes) == total_gpu
+        assert (target_config.host_cache_size + draft_config.host_cache_size) == total_host
 
     def test_no_host_cache_leaves_none(self):
         c = _make_creator(
@@ -128,10 +143,10 @@ class TestSplitKvCacheBudgetForDraft:
             target_kv_per_token=80,
         )
 
-        draft_config = c._split_kv_cache_budget_for_draft()
+        target_config, draft_config = c._split_kv_cache_budget_for_draft()
 
         assert draft_config is not None
-        assert c._kv_cache_config.host_cache_size is None
+        assert target_config.host_cache_size is None
         assert draft_config.host_cache_size is None
 
     def test_zero_host_cache_unchanged(self):
@@ -142,23 +157,41 @@ class TestSplitKvCacheBudgetForDraft:
             target_kv_per_token=80,
         )
 
-        draft_config = c._split_kv_cache_budget_for_draft()
+        _, draft_config = c._split_kv_cache_budget_for_draft()
 
         assert draft_config is not None
         # host_cache_size=0 should not be split (guard: host_budget > 0)
         assert draft_config.host_cache_size == 0
 
-    def test_returns_none_when_no_gpu_budget(self):
+    def test_returns_no_draft_when_no_gpu_budget(self):
         c = _make_creator(max_gpu_total_bytes=0)
 
-        assert c._split_kv_cache_budget_for_draft() is None
+        target_config, draft_config = c._split_kv_cache_budget_for_draft()
 
-    def test_returns_none_when_draft_kv_zero(self):
+        assert target_config is c._kv_cache_config
+        assert draft_config is None
+
+    def test_returns_no_draft_when_draft_kv_zero(self):
         c = _make_creator(
             max_gpu_total_bytes=10 * GB, total_kv_per_token=100, target_kv_per_token=100
         )
 
-        assert c._split_kv_cache_budget_for_draft() is None
+        target_config, draft_config = c._split_kv_cache_budget_for_draft()
+
+        assert target_config is c._kv_cache_config
+        assert draft_config is None
+
+    def test_returns_no_draft_when_fixed_cost_exceeds_budget(self):
+        c = _make_creator(
+            max_gpu_total_bytes=1 * GB,
+            total_kv_cost=CacheCost(slope=100, intercept=2 * GB),
+            target_kv_cost=(80, 1 * GB),
+        )
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft()
+
+        assert target_config is c._kv_cache_config
+        assert draft_config is None
 
     @pytest.mark.parametrize("target_frac", [0.5, 0.75, 0.9, 0.95])
     def test_various_ratios(self, target_frac):
@@ -174,9 +207,7 @@ class TestSplitKvCacheBudgetForDraft:
             target_kv_per_token=target_kv,
         )
 
-        draft_config = c._split_kv_cache_budget_for_draft()
+        target_config, draft_config = c._split_kv_cache_budget_for_draft()
 
-        assert (
-            c._kv_cache_config.max_gpu_total_bytes + draft_config.max_gpu_total_bytes
-        ) == total_gpu
-        assert (c._kv_cache_config.host_cache_size + draft_config.host_cache_size) == total_host
+        assert (target_config.max_gpu_total_bytes + draft_config.max_gpu_total_bytes) == total_gpu
+        assert (target_config.host_cache_size + draft_config.host_cache_size) == total_host

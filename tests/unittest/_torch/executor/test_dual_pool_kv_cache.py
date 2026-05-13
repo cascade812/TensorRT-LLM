@@ -389,7 +389,8 @@ class TestCrossKvCacheConstruction:
         ) as get_size_mock:
             kv_size = creator._get_kv_size_per_token()
 
-        assert kv_size == 140
+        assert kv_size.slope == 140
+        assert kv_size.intercept == 0
         assert get_size_mock.call_count == 2
 
         cross_call = get_size_mock.call_args_list[1]
