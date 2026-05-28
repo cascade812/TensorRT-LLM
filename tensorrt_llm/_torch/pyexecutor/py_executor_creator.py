@@ -330,6 +330,12 @@ def create_py_executor(
         from tensorrt_llm._torch.speculative import suggest_spec_config
         spec_config = suggest_spec_config(max_batch_size)
 
+    if spec_config is not None:
+        logger.info(
+            "Speculative decoding allow_advanced_sampling=%s decoding_type=%s spec_dec_mode=%s",
+            spec_config.allow_advanced_sampling, spec_config.decoding_type,
+            spec_config.spec_dec_mode.name)
+
     if not llm_args.disable_overlap_scheduler and spec_config is not None:
         if not spec_config.spec_dec_mode.support_overlap_scheduler():
             logger.warning(

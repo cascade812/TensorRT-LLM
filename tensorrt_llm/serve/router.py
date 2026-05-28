@@ -743,12 +743,15 @@ class BlockHashMixin:
         from tensorrt_llm.serve import harmony_adapter
 
         tools = self._tool_dicts(request) if request.tools else None
+        tool_choice = getattr(request, "tool_choice", None)
+        logger.info("Router harmony tokenization tool_choice=%s tools_count=%s",
+                    tool_choice, len(tools) if tools else 0)
         result = harmony_adapter.get_harmony_adapter().openai_to_harmony_tokens(
             request.messages,
             tools,
             reasoning_effort=harmony_adapter.maybe_transform_reasoning_effort(
                 request.reasoning_effort),
-            tool_choice=getattr(request, "tool_choice", None),
+            tool_choice=tool_choice,
         )
         return [result]
 

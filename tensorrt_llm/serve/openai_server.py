@@ -1051,6 +1051,10 @@ class OpenAIServer:
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
+            logger.info(
+                "ChatCompletionRequest sampling greedy=%s temperature=%s top_p=%s top_k=%s",
+                sampling_params._greedy_decoding, sampling_params.temperature,
+                sampling_params.top_p, sampling_params.top_k)
             # Enable per-request perf metrics when the env var is set;
             # without this the /perf_metrics deque stays empty on this path.
             if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
@@ -1512,6 +1516,8 @@ class OpenAIServer:
                 request.reasoning_effort)
             # Get tool_choice from request
             tool_choice = getattr(request, 'tool_choice', None)
+            logger.info("ChatCompletionRequest tool_choice=%s tools_count=%s",
+                        tool_choice, len(tools_dict) if tools_dict else 0)
 
             # Reuse pre-tokenized harmony tokens forwarded by the disagg
             # ctx worker; only the agg path runs the adapter here.
@@ -1540,6 +1546,10 @@ class OpenAIServer:
             sampling_params = request.to_sampling_params(
                 vocab_size=self.tokenizer.tokenizer.vocab_size,
                 reasoning_parser="gpt_oss")
+            logger.info(
+                "ChatCompletionRequest harmony sampling greedy=%s temperature=%s top_p=%s top_k=%s",
+                sampling_params._greedy_decoding, sampling_params.temperature,
+                sampling_params.top_p, sampling_params.top_k)
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
             # Enable per-request perf metrics when the env var is set;
             # without this the /perf_metrics deque stays empty on this path.
