@@ -123,6 +123,13 @@ class DSACacheManager(KVCacheManager):
             **kwargs,
         )
         self.num_blocks = self.blocks_in_primary_pool
+        from .kv_offload_prototype import configure_cache_manager
+
+        configure_cache_manager(
+            self,
+            sparse_attention_config,
+            pretrained_config,
+        )
 
         # Indexer K cache pool for DSA attention
         # Shape: [num_blocks, self.tokens_per_block * (index_head_dim + scale_size)]
@@ -164,6 +171,8 @@ class DSACacheManager(KVCacheManager):
     def shutdown(self):
         """Release indexer K-cache pool references before C++ buffer cleanup."""
         # Clear Python references BEFORE C++ frees the underlying CUDA buffers
+        self.dsa_kv_offload_groups = {}
+        self.dsa_kv_offload_shared_to_group = {}
         self.indexer_k_cache_pool_per_layer = []
         super().shutdown()
 

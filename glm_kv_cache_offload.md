@@ -262,4 +262,146 @@ Summary: incompatible with any design that puts the host in the per-step loop (w
    - Caveats: this node is PCIe **Gen4** (absolute numbers ≈ half of Gen5); its driver rejects single pinned allocations ≥4 GiB (pool must be allocated in chunks — verify on target hosts); C2C behavior (coherent loads from Grace LPDDR, expected several-hundred GB/s) is the remaining measurement, needing a GB200/GB300 node.
 3. **One-group prototype** (3 shared layers host-resident) on a GB300 setup at 64–128k ISL; measure TPOT delta at fixed batch, then batch uplift at fixed TPOT. **An aggregated setup (TP4/EP4, as in Allen's study) is the recommended prototype vehicle** — the decode path is identical to disagg-gen, it's apples-to-apples with the §6.1 index statistics, and a starting config exists (`tests/scripts/perf-sanity/aggregated/glm5_fp4_grace_blackwell.yaml`). Handle the prefill→decode transition by **dual-writing** the group's shared-layer KV to both GPU and host pools during prefill (the prototype measures decode overhead, not memory reclamation, so keeping both copies is fine); measure steady-state decode after prefill drains. Deferred by this choice, knowingly: NIXL→host-pool landing (disagg-specific plumbing) and batch-uplift-at-fixed-TPOT (needs all 19 groups offloaded, in any setup). Bonus measurement available only in agg: chunked-prefill chunks competing with decode gathers for SMs and link bandwidth.
 
+   **Status (2026-08-13): verified end to end on GB300.** The existing AArch64 wheel was
+   installed into `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc24` and run against
+   `/lustre/share/coreai_dlalgo_ci/artifacts/model/nvidia_glm-5.2-nvfp4/hf/hf-b0b2b68_orig`
+   on four 284208 MiB GB300 GPUs (driver 580.173.02), TP4/EP4, CUTEDSL MoE, batch/concurrency 4,
+   OSL 256, and decode CUDA-graph buckets 1/2/4. The perf cases needed one configuration fix:
+   with `max_num_tokens=8192`, 64k/128k inputs are rejected unless chunked prefill is enabled,
+   so all four matched cases now explicitly set `enable_chunked_prefill: true`.
+
+   The native operator checks also passed directly on GB300 (Slurm job 2681132): exact
+   three-layer mirror/gather correctness, invalid-index zero fill, and CUDA-graph replay while
+   changing the device-side indices between replays. The full service run (job 2680363) completed
+   all four cases, and repeat runs completed the three-trial 64k pair before a backfill preemption
+   (job 2680740) and the three-trial 128k pair (job 2680974). Across the primary and repeat runs,
+   each case served 64 requests with zero failed requests and no CUDA/server errors. The offload
+   server logs confirm that the path was active rather than silently bypassed: full layer 2,
+   shared layers `(3, 4, 5)`, and per-rank pinned mirrors of 0.4235 GiB at 64k and 0.8454 GiB at
+   128k.
+
+   Repeated-run results below are the median of three client trials per already-warmed server;
+   each trial contains 16 requests. This avoids allowing one transiently slow third trial to
+   dominate the result while keeping the baseline and offload protocol identical.
+
+   | ISL | mode | mean TPOT (ms) | median TPOT (ms) | mean TTFT (ms) | output tok/s | total tok/s |
+   |---:|---|---:|---:|---:|---:|---:|
+   | 64k | baseline | 33.41 | 35.63 | 8263.05 | 58.76 | 15102.41 |
+   | 64k | one-group offload | 33.71 | 35.97 | 8300.53 | 58.35 | 14995.85 |
+   | 64k | offload delta | **+0.90%** | **+0.95%** | +0.45% | -0.70% | -0.71% |
+   | 128k | baseline | 59.66 | 64.49 | 16116.68 | 31.79 | 16307.53 |
+   | 128k | one-group offload | 60.13 | 65.07 | 16219.77 | 31.57 | 16195.62 |
+   | 128k | offload delta | **+0.79%** | **+0.90%** | +0.64% | -0.69% | -0.69% |
+
+   Thus the conservative one-group full-refetch path adds about 0.30 ms mean TPOT at 64k and
+   0.47 ms at 128k: under 1% TPOT overhead and about 0.7% throughput loss at fixed batch 4. An
+   independent single-trial run measured +1.02% and +0.18% mean-TPOT deltas at 64k and 128k,
+   respectively, so the exact sub-percent value has normal run-to-run noise but the conclusion is
+   stable. This passes Step 3's fixed-batch prototype objective. It intentionally does not claim
+   HBM reclamation, the 19-group working-set design, or batch uplift at fixed TPOT; those remain
+   follow-on work.
+
+   **All-group full-refetch follow-up (2026-08-13):** The overhead-only mode was extended to all
+   19 complete IndexShare groups (full layers 2, 6, ..., 74), still retaining the authoritative
+   GPU KV and reusing one graph-stable staging buffer and auxiliary stream sequentially across
+   groups. The 64k run allocated 8.05 GiB and the 128k run 16.06 GiB of pinned mirrors per rank.
+   CUDA-graph capture/replay succeeded, and every case completed 48/48 requests with no failures.
+   Results are median-of-three trials from paired baseline/all-group jobs 2683954 and 2684081:
+
+   | ISL | mode | mean TPOT (ms) | median TPOT (ms) | mean TTFT (ms) | output tok/s | total tok/s |
+   |---:|---|---:|---:|---:|---:|---:|
+   | 64k | paired baseline | 33.52 | 35.78 | 8286.31 | 58.59 | 15056.48 |
+   | 64k | 19-group full-refetch | 37.07 | 39.60 | 8630.88 | 54.64 | 14041.32 |
+   | 64k | offload delta | **+10.59%** | **+10.68%** | +4.16% | -6.74% | -6.74% |
+   | 128k | paired baseline | 60.10 | 65.04 | 16250.46 | 31.55 | 16183.06 |
+   | 128k | 19-group full-refetch | 63.74 | 68.90 | 17840.32 | 29.23 | 14993.03 |
+   | 128k | offload delta | **+6.06%** | **+5.94%** | +9.78% | -7.35% | -7.35% |
+
+   The added mean-TPOT cost is 3.55 ms at 64k and 3.64 ms at 128k. It is much less than 19× the
+   one-group percentage because the absolute gather payload is fixed by TopK rather than context
+   length, and the baseline TPOT is almost 2× larger at 128k. This remains a deliberately
+   pessimistic full-refetch measurement: 19 groups × 2048 rows × 1728 B = 64.1 MiB per sequence
+   per decode step (256.5 MiB at batch 4), with no hot-set reuse and no HBM/concurrency benefit.
+   At the measured 24% miss rate, a production delta-fetch path would move about one quarter of
+   this traffic before accounting for a larger working set, but that projection is not measured
+   here.
+
+
+   **Per-layer staged-gather follow-up (2026-08-14):** The original 1728 B gather for all three
+   shared layers was replaced by the intended one-layer-ahead pipeline. After layer 2 produces
+   TopK, stage 0 gathers only layer 3's 576 B rows; layer 3 waits for stage 0 and launches the
+   layer 4 gather; layer 4 waits for stage 1 and launches the layer 5 gather; layer 5 waits for
+   stage 2. The host mirror stays token-major at 1728 B/row, while the native 16-block kernel
+   selects one 576 B slice. Three graph-stable staging slices, auxiliary streams, and event pairs
+   prevent a later stage from overwriting or serializing with the preceding stage. The
+   authoritative GPU cache is still retained, so this remains an overhead prototype rather than
+   HBM reclamation.
+
+   The rebuilt AArch64/SM103 native library passed exact per-layer gather, invalid-index, and
+   three-gather CUDA-graph replay tests on GB300 (job 2689094, 3/3 tests). A TP4/EP4 service
+   profile then ran the one-group `(2, 3, 4, 5)` path on 4x GB300 at ISL 65,536 and batch 4
+   (job 2689330). Nsight captured 150 steady batch-4 CUDA-graph replays on each of GPUs/ranks 1-3;
+   rank 0's worker timeline is absent from this report. Per-stage kernel results pool the 450
+   captured calls for each target layer:
+
+   | gather target | samples | avg (us) | median (us) | p90 (us) |
+   |---:|---:|---:|---:|---:|
+   | layer 3 | 450 | 151.586 | 148.272 | 177.706 |
+   | layer 4 | 450 | 114.904 | 111.712 | 126.464 |
+   | layer 5 | 450 | 93.756 | 91.024 | 99.315 |
+   | all stages | 1350 | 120.082 | 111.968 | 175.754 |
+
+   Effective layer latency is measured from the first `oi642048` RMSNorm kernel of layer L to the
+   same boundary of layer L+1 (layer 77 ends at the first post-transformer sampling kernel). It is
+   therefore wall-clock latency including overlap, contention, and any exposed event wait, not a
+   sum of individual kernel durations. The affected group is:
+
+   | layer | role | samples | avg (us) | median (us) | p90 (us) |
+   |---:|---|---:|---:|---:|---:|
+   | 2 | full-indexer / launches layer 3 | 450 | 173.345 | 172.992 | 174.336 |
+   | 3 | shared-1 / launches layer 4 | 450 | 232.036 | 235.008 | 240.909 |
+   | 4 | shared-2 / launches layer 5 | 450 | 134.465 | 136.864 | 141.702 |
+   | 5 | shared-3 | 450 | 127.925 | 128.384 | 133.830 |
+
+   In the trace, stage 0 starts during layer 2 but still crosses layer 3's start boundary, so its
+   remaining wait is visible in layer 3. Stages 1 and 2 have much more of their transfer hidden:
+   layers 4 and 5 are close to ordinary shared-layer medians (generally 115-125 us). The full
+   78-layer avg/median/p90 table, per-GPU tables, SQLite export, and GUI report are under
+   `build/step3_results/nsys_staged_gather_v3_job_2689330/`; open
+   `glm52_group2_staged_per_layer_64k_b4_decode.nsys-rep` for manual review.
+
+   The earlier 19-group numbers above used the original monolithic 1728 B gather. They remain a
+   historical upper-bound measurement, but must be rerun before quoting all-group overhead for
+   this staged 576 B implementation.
+
+   **All-group staged-gather benchmark (2026-08-14):** Job 2694682 ran matched baseline and
+   staged-gather cases sequentially on the same exclusive 4x GB300 node using TP4/EP4, batch and
+   concurrency 4, OSL 256, and three trials per case. Setup 1 offloads group positions 2-4; Setup
+   2 keeps position 2 resident and offloads positions 3-4. All requests completed successfully,
+   and the native correctness and CUDA-graph replay checks passed before the service runs.
+
+   Decode latency below is the median of the three reported trial-level metrics:
+
+   | ISL | mode | mean TPOT (ms) | delta | median TPOT (ms) | delta |
+   |---:|---|---:|---:|---:|---:|
+   | 64k | baseline | 33.25 | - | 35.52 | - |
+   | 64k | Setup 1: positions 2-4 | 35.41 | **+6.50%** | 37.78 | **+6.36%** |
+   | 64k | Setup 2: positions 3-4 | 34.26 | **+3.04%** | 36.59 | **+3.01%** |
+   | 128k | baseline | 59.74 | - | 64.60 | - |
+   | 128k | Setup 1: positions 2-4 | 62.59 | **+4.77%** | 67.17 | **+3.98%** |
+   | 128k | Setup 2: positions 3-4 | 63.22 | **+5.83%** | 66.03 | **+2.21%** |
+
+   Client-reported mean end-to-end request latency, also median-of-three trials:
+
+   | ISL | baseline | Setup 1: positions 2-4 | Setup 2: positions 3-4 |
+   |---:|---:|---:|---:|
+   | 64k | 16.706 s | 17.524 s (**+4.90%**) | 17.090 s (**+2.30%**) |
+   | 128k | 31.380 s | 32.823 s (**+4.60%**) | 33.584 s (**+7.03%**) |
+
+   The 128k mean metrics contain substantial tail noise: Setup 2's mean-TPOT trials were 60.89,
+   74.25, and 63.22 ms, whereas its median-TPOT trials stayed within 65.91-66.69 ms. The typical
+   decode result therefore favors Setup 2, but the 128k mean/E2E tail result needs repetition
+   before drawing a tail-latency conclusion. Full trial data and the comparison table are under
+   `build/step3_results/job_2694682_staged_all_groups_subsets/`.
+
 Bottom line for the thread: the China team's skepticism was justified against the naive design (block-granular, no cache — that version genuinely doesn't fit in the compute window), but Allen's own data contains the evidence that a delta-fetching variant clears the bar with room to spare on GB-class hardware, in exactly the long-context regime GLM-5.2 is built for.

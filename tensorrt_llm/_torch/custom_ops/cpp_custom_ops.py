@@ -1526,6 +1526,16 @@ def _register_fake():
           stride_factor: int, layer_id: int) -> torch.Tensor:
         return torch.empty_like(token_indices)
 
+    @torch.library.register_fake("trtllm::dsa_kv_cache_offload_mirror")
+    def _(source_pool, global_indices, host_pool, stride_factor,
+          tokens_per_block, layer_offset, layer_in_group):
+        pass
+
+    @torch.library.register_fake("trtllm::dsa_kv_cache_offload_gather")
+    def _(host_pool, global_indices, output, stride_factor, tokens_per_block,
+          layer_offset, layer_in_group):
+        pass
+
     @torch.library.register_fake("trtllm::indexer_k_cache_gather_op")
     def _(k_cache: torch.Tensor, slot_mapping_fp8: torch.Tensor,
           slot_mapping_scale: torch.Tensor, k_token_start: int, num_tokens: int,

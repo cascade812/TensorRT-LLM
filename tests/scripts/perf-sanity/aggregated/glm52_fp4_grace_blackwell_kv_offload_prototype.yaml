@@ -1,0 +1,258 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+metadata:
+  model_name: glm_5.2_fp4
+  supported_gpus:
+  - GB300
+hardware:
+  gpus_per_node: 4
+server_configs:
+  # Matched TP4/EP4 cases for section 6.3 of glm_kv_cache_offload.md.
+  # Run baseline and prototype cases on the same otherwise-idle node.
+  - name: "glm52_fp4_tep4_64k256_baseline"
+    model_name: "glm_5.2_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 4
+    max_num_tokens: 8192
+    max_seq_len: 65792
+    attn_backend: "TRTLLM"
+    enable_chunked_prefill: true
+    enable_attention_dp: false
+    moe_config:
+      backend: "CUTEDSL"
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 4
+    kv_cache_config:
+      dtype: "fp8"
+      enable_block_reuse: false
+      max_tokens: 263168
+      free_gpu_memory_fraction: 0.8
+    client_configs:
+      - name: "con4_iter4_64k256"
+        concurrency: 4
+        iterations: 4
+        isl: 65536
+        osl: 256
+        backend: "openai"
+        dataset_file: <dataset_file>
+
+  - name: "glm52_fp4_tep4_64k256_one_group_offload"
+    server_env_var: "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_FULL_LAYER=2"
+    model_name: "glm_5.2_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 4
+    max_num_tokens: 8192
+    max_seq_len: 65792
+    attn_backend: "TRTLLM"
+    enable_chunked_prefill: true
+    enable_attention_dp: false
+    moe_config:
+      backend: "CUTEDSL"
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 4
+    kv_cache_config:
+      dtype: "fp8"
+      enable_block_reuse: false
+      max_tokens: 263168
+      free_gpu_memory_fraction: 0.8
+    client_configs:
+      - name: "con4_iter4_64k256"
+        concurrency: 4
+        iterations: 4
+        isl: 65536
+        osl: 256
+        backend: "openai"
+        dataset_file: <dataset_file>
+
+  - name: "glm52_fp4_tep4_128k256_baseline"
+    model_name: "glm_5.2_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 4
+    max_num_tokens: 8192
+    max_seq_len: 131328
+    attn_backend: "TRTLLM"
+    enable_chunked_prefill: true
+    enable_attention_dp: false
+    moe_config:
+      backend: "CUTEDSL"
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 4
+    kv_cache_config:
+      dtype: "fp8"
+      enable_block_reuse: false
+      max_tokens: 525312
+      free_gpu_memory_fraction: 0.8
+    client_configs:
+      - name: "con4_iter4_128k256"
+        concurrency: 4
+        iterations: 4
+        isl: 131072
+        osl: 256
+        backend: "openai"
+        dataset_file: <dataset_file>
+
+  - name: "glm52_fp4_tep4_128k256_one_group_offload"
+    server_env_var: "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_FULL_LAYER=2"
+    model_name: "glm_5.2_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 4
+    max_num_tokens: 8192
+    max_seq_len: 131328
+    attn_backend: "TRTLLM"
+    enable_chunked_prefill: true
+    enable_attention_dp: false
+    moe_config:
+      backend: "CUTEDSL"
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 4
+    kv_cache_config:
+      dtype: "fp8"
+      enable_block_reuse: false
+      max_tokens: 525312
+      free_gpu_memory_fraction: 0.8
+    client_configs:
+      - name: "con4_iter4_128k256"
+        concurrency: 4
+        iterations: 4
+        isl: 131072
+        osl: 256
+        backend: "openai"
+        dataset_file: <dataset_file>
+
+  - name: "glm52_fp4_tep4_64k256_all_groups_offload"
+    server_env_var: "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_FULL_LAYER=all TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_MAX_HOST_GIB=20"
+    model_name: "glm_5.2_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 4
+    max_num_tokens: 8192
+    max_seq_len: 65792
+    attn_backend: "TRTLLM"
+    enable_chunked_prefill: true
+    enable_attention_dp: false
+    moe_config:
+      backend: "CUTEDSL"
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 4
+    kv_cache_config:
+      dtype: "fp8"
+      enable_block_reuse: false
+      max_tokens: 263168
+      free_gpu_memory_fraction: 0.8
+    client_configs:
+      - name: "con4_iter4_64k256"
+        concurrency: 4
+        iterations: 4
+        isl: 65536
+        osl: 256
+        backend: "openai"
+        dataset_file: <dataset_file>
+
+  - name: "glm52_fp4_tep4_128k256_all_groups_offload"
+    server_env_var: "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_FULL_LAYER=all TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_MAX_HOST_GIB=20"
+    model_name: "glm_5.2_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 4
+    max_num_tokens: 8192
+    max_seq_len: 131328
+    attn_backend: "TRTLLM"
+    enable_chunked_prefill: true
+    enable_attention_dp: false
+    moe_config:
+      backend: "CUTEDSL"
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 4
+    kv_cache_config:
+      dtype: "fp8"
+      enable_block_reuse: false
+      max_tokens: 525312
+      free_gpu_memory_fraction: 0.8
+    client_configs:
+      - name: "con4_iter4_128k256"
+        concurrency: 4
+        iterations: 4
+        isl: 131072
+        osl: 256
+        backend: "openai"
+        dataset_file: <dataset_file>
+
+
+  - name: "glm52_fp4_tep4_64k256_all_groups_layers34_offload"
+    server_env_var: "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_FULL_LAYER=all TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_GROUP_LAYERS=3,4 TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_MAX_HOST_GIB=20"
+    model_name: "glm_5.2_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 4
+    max_num_tokens: 8192
+    max_seq_len: 65792
+    attn_backend: "TRTLLM"
+    enable_chunked_prefill: true
+    enable_attention_dp: false
+    moe_config:
+      backend: "CUTEDSL"
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 4
+    kv_cache_config:
+      dtype: "fp8"
+      enable_block_reuse: false
+      max_tokens: 263168
+      free_gpu_memory_fraction: 0.8
+    client_configs:
+      - name: "con4_iter4_64k256"
+        concurrency: 4
+        iterations: 4
+        isl: 65536
+        osl: 256
+        backend: "openai"
+        dataset_file: <dataset_file>
+
+  - name: "glm52_fp4_tep4_128k256_all_groups_layers34_offload"
+    server_env_var: "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_FULL_LAYER=all TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_GROUP_LAYERS=3,4 TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_MAX_HOST_GIB=20"
+    model_name: "glm_5.2_fp4"
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    max_batch_size: 4
+    max_num_tokens: 8192
+    max_seq_len: 131328
+    attn_backend: "TRTLLM"
+    enable_chunked_prefill: true
+    enable_attention_dp: false
+    moe_config:
+      backend: "CUTEDSL"
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 4
+    kv_cache_config:
+      dtype: "fp8"
+      enable_block_reuse: false
+      max_tokens: 525312
+      free_gpu_memory_fraction: 0.8
+    client_configs:
+      - name: "con4_iter4_128k256"
+        concurrency: 4
+        iterations: 4
+        isl: 131072
+        osl: 256
+        backend: "openai"
+        dataset_file: <dataset_file>

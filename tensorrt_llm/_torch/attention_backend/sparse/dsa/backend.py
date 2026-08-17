@@ -20,6 +20,7 @@ from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .indexer import Indexer, transform_local_topk_and_prepare_pool_view
+from .kv_offload_prototype import advance_gather_pipeline
 from .metadata import DSAtrtllmAttentionMetadata
 from .params import DSAParams
 
@@ -128,6 +129,9 @@ class DSATrtllmAttention(TrtllmAttention):
         topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
             topk_indices, metadata, self.get_local_layer_idx(metadata), is_generation
         )
+
+        if is_generation:
+            advance_gather_pipeline(self, topk_indices_global, metadata)
 
         return topk_indices_global, None
 

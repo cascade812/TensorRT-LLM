@@ -1,0 +1,313 @@
+# GLM 5.2 e2e AgentX — SOL-219k PARETO point 1/7: TEP8 c1 mtp5.
+#
+# One operating point off the rate-matched gen-only frontier
+# (summary_frontier_mtp.csv; synthetic ISL 218,922 / OSL 1024; MTP accept
+# lengths 1:1.84 2:2.50 3:2.99 4:3.33 5:3.61 6:3.78 7:3.91 8:4.06):
+#   306.3 tok/s/user · 31.3 output tok/s/GPU · 6,714 total tok/s/GPU.
+#
+# SIZING — 1 ctx : 4 gen, 40 GPUs. One DEP8 ctx sustains 1.33 req/s;
+# one TEP8 gen at c1 consumes 0.299 req/s, so the rate-matched ratio is
+# 1:4. agentx.concurrency 4 = 4 gen x c1 — that is what holds
+# each gen instance at the per-instance point that was actually measured.
+#
+# GEN — the rate-matching stack, copied from that run's rendered
+# extra_llm_api_options.yaml: TRTLLM MoE, dsa sparse attention, kv frac 0.70 fp8
+# no-reuse, mtp5, batch 1, cuda-graph padding on, stream_interval 20,
+# num_postprocess_workers 4.
+#
+# CTX — the configuration behind the 1.33 req/s anchor, copied from that run's
+# own ctx_config.yaml (zpatel sol-projection-8k-mnt, case
+# ctx1_dep8_b128_mnt8192_..._conc40, ranked 0.1663 req/s per ctx GPU at ISL
+# 218,922): DEP8, bs 128, 8k chunk, kv frac 0.75 fp8 WITH block reuse,
+# TRTLLM MoE, conversation-affinity routing, kv-aware routing off. Its MTP depth
+# is forced to the gen's (5) — MTP-Eagle adds a draft KV layer, so a depth
+# mismatch gives the two servers different cacheStates and every handoff dies in
+# MLACacheFormatter::inquireSupport ("only support same number of layers").
+#
+# DELIBERATE DEVIATIONS from those two sources:
+#   * max_seq_len 1048576 and max_tokens_in_buffer 1048576 on BOTH servers, and
+#     TRTLLM_KVCACHE_{SEND,RECV}_BUFFER_COUNT=1 — requested for this family.
+#   * host_cache_size 137438953472 (128 GiB) IS now set on the ctx, matching the
+#     anchor, which ran exactly that. This reverses an earlier deliberate
+#     omission and is the known-risky combination: the cache transceiver cannot
+#     send from the host tier ("cache transceiver only supports primary blocks",
+#     kvCacheUtils.h:319), so a disagg CTX with a host tier can orphan requests
+#     mid-transfer. It is INTERMITTENT -- the same commit has both passed and
+#     stalled -- so a single green run does not clear it. If a run hangs with the
+#     GEN idle and ctx kv_cache_util high, drop this line first. Everything else
+#     in the ctx block — bs 128, 8k chunk, kv frac 0.75, block reuse, TRTLLM
+#     MoE, conversation affinity, 1M buffer — is the anchor verbatim.
+#     GEN is deliberately left without a host tier.
+#   * use_cute_dsl_paged_mqa_logits IS set on the gen server, through a
+#     value-injection workaround on sparse_attention_algorithm (the pinned BTK
+#     models no field for it). This restores the kernel the rate-matching runs
+#     used; measurement and the BTK follow-up are in MR !65.
+#     Do NOT also raise tokens_per_block: it is a compile key for this kernel and
+#     the pair is a measured-bad combination.
+#   * TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP is NOT set. It was carried by the
+#     gen-only sweeps to keep the handoff off the decode critical path; in e2e
+#     the overlap is wanted.
+#
+# __TRTLLM_IMAGE__, __DATE__ and __PIPELINE__ are substituted by
+# scripts/submit_btk_sweep.py.
+# NVL72 RE-SIZE. ctx:gen and instance counts come from the <=72-GPU frontier in
+# postprocess_synth219k/summary_frontier_mtp_nvlfilter.csv (1:2  4+16=20 GPU), replacing the
+# sizing taken from the old 1.33 req/s-per-DEP8 anchor.
+#
+# The ctx is now the DEP4 mnt12k configuration -- tp/moe_ep 8 -> 4 and
+# max_num_tokens 8192 -> 12288 -- because that is the shape the anchor was
+# MEASURED on (1ctx_dep4_agentx_ctx_only_burst_nodelay_mnt12k, 0.64 req/s per 4
+# GPUs). A rate taken at 12k chunk on DEP4 does not describe a DEP8 ctx at 8k,
+# so the sizing is only valid if the deployed ctx matches. max_batch_size 128 and
+# kv frac 0.75 already matched the anchor and are untouched.
+#
+# Per GPU the old and new anchors are within 4% (0.166 vs 0.160 req/s/GPU), so
+# the ctx:gen GPU ratio barely moves; what changes is the realization, and only
+# the DEP4 one fits NVL72 (these points on DEP8 ctx need up to 88 ctx GPUs
+# alone). agentx.concurrency = gen instances x per-instance concurrency.
+#
+# NOT changed: tokens_per_block and the CPP/UCX transceiver stay per-config.
+# The anchor ran tpb 32; 01/02 keep 64. tpb is this family's A/B variable, not
+# part of the ctx topology, and the PYTHON transceiver is unusable on this pin.
+#
+# CONCURRENCY IS start_conc, NOT gen_instances x per-gen concurrency. The latter
+# assumes every client session is decoding at all times. It is not: a session
+# also spends ctx_compute in prefill and turn_delay thinking, so holding a gen
+# instance at its measured point needs MORE sessions than that point's batch.
+#   start_conc = conc x (ctx_compute + gen_latency + turn_delay) / gen_latency
+# with ctx_compute 1.711 s (dep4 mnt12k anchor) and turn_delay 19.57 s (mean
+# think_time in the weka corpus under the configured 300 s idle cap). Per gen
+# instance 7.4, x 2 gen = 15.
+#
+# KV TRANSFER: PYTHON transceiver, NIXL backend, 5 GB bounce, tokens_per_block 64.
+#
+# NIXL is not a free choice -- PYTHON and UCX are mutually exclusive. Executor
+# construction dies with "Python transceiver currently only supports NIXL or
+# DEFAULT backend, got UCX. Please use transceiver_runtime='CPP' for MPI, UCX, or
+# MOONCAKE backends", so the backend has to move with the runtime.
+#
+# tokens_per_block 64 over 32 is measured, not assumed. The 05l/05m A/B ran both
+# arms with the KV-transfer collector: block 32 doubles transfer_entry_count
+# (2,910 -> 5,834 median) and halves avg_segment_size for the same bytes, which
+# costs almost nothing on the ctx send path (+4-5% across percentiles) but nearly
+# triples the GEN receive tail (p99 1,369 -> 4,060 ms) and lands as +34% e2e TTFT
+# (11.36 -> 15.22 s) and -25% output throughput. 64 wins.
+#
+# Requires the a25a71e6 pin: fee76dc6 cannot run the PYTHON transceiver on GLM
+# 5.2 at all (per-layer masked indexer k-cache pool NotImplementedError), and it
+# presents as a hang rather than an error.
+
+plugins:
+  - type: trtllm_server
+    instance: ctx
+  - type: trtllm_server
+    instance: gen
+  - type: trtllm_disagg
+    instance: disagg
+  - type: server_health_check
+    instance: disagg_hc
+  - type: agentx
+    instance: agentx
+
+configs:
+  common:
+    output_mode: "e2e"
+    output_path: "/lustre/fsw/coreai_comparch_inferencex/itabrizian/disagg-benchmarking-results/agentx/glm_5.2/gb300/e2e_pareto/__DATE__/__PIPELINE__/sol_pareto01_tep8_c1_mtp5"
+    hf_cache: "/lustre/fsw/coreai_comparch_aarwlt/itabrizian/hf_cache/"
+  ctx:
+    backend: "pytorch"
+    disagg_mode: "prefill"
+    server_timeout: 45
+    container_settings: &trtllm_container
+      image: "__TRTLLM_IMAGE__"
+      mounts: &lustre_mounts
+        /lustre: /lustre
+    env_vars: &server_env
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      TQDM_DISABLE: "1"
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+      TLLM_LOG_LEVEL: "INFO"
+      TRTLLM_SERVER_DISABLE_GC: "1"
+      TRTLLM_WORKER_DISABLE_GC: "1"
+      TRTLLM_ENABLE_PDL: "1"
+      NCCL_GRAPH_MIXING_SUPPORT: "0"
+      MIMALLOC_PURGE_DELAY: "0"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      TRTLLM_SERVE_ENABLE_MSGSPEC: "1"
+      TLLM_ADP_ROUTER_MATCH_RATE_THRESHOLD: "0.10"
+      TRTLLM_KV_CACHE_TRANSFER_TIMEOUT_SEC: "480"
+      UCX_CUDA_IPC_ENABLE_MNNVL: "y"
+      UCX_RNDV_SCHEME: "put_zcopy"
+      # One buffer each way, per this family's spec.
+      TRTLLM_KVCACHE_SEND_BUFFER_COUNT: "1"
+      TRTLLM_KVCACHE_RECV_BUFFER_COUNT: "1"
+      # Pin MTP acceptance to the value this point was SOLVED at, so the
+      # measured-vs-predicted gap cannot be AL drift. The frontier assumed
+      # AL 3.61 at MTP 5 (the table in this file's header).
+      # The variable counts ACCEPTED DRAFT tokens and AL = value + 1
+      # (interface.py:1288), so 3.61 - 1 = 2.61. The fraction is the
+      # per-iteration probability of one extra token; it is CUDA-graph safe
+      # and TP-deterministic (fixed-seed pool + device counter), clamped at
+      # the MTP depth, and skipped during warmup.
+      # NOTE: accepted drafts are no longer verified, so generated TEXT is
+      # synthetic past the first token -- throughput-only, never quality.
+      # Shared with the ctx via *server_env, where it is inert: the override
+      # writes only generation rows and a prefill batch has none.
+      TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS: "2.61"
+  gen:
+    backend: "pytorch"
+    disagg_mode: "decode"
+    server_timeout: 45
+    container_settings: *trtllm_container
+    env_vars: *server_env
+  disagg:
+    backend: "pytorch"
+    server_timeout: 45
+    request_timeout: 3600
+    servers:
+      - ctx
+      - gen
+    container_settings: *trtllm_container
+    # Cross-instance conversation routing. WITHOUT this key create_router
+    # defaults to "round_robin" (serve/router.py:1886), which scatters a
+    # conversation's turns across the ctx fleet and destroys the prefix reuse
+    # this workload depends on -- measured hit falls 96% at 1 ctx instance to
+    # 30% at 13, against a 95.3% theoretical. ConversationRouter pins by
+    # conversation_id, then block-hash prefix match at 0.75, then least-loaded.
+    #
+    # This is NOT the same as ctx.kv_cache_routing_conversation_affinity, which
+    # renders under attention_dp_config and only routes across the ADP ranks
+    # inside ONE server. Both are wanted; they operate at different levels.
+    #
+    # Requires BTK >= 4e0c812c for the server_config passthrough; the disagg
+    # plugin previously emitted a fixed YAML with no router key available.
+    server_config:
+      backend: pytorch
+      port: 8333
+      context_servers:
+        router:
+          type: conversation
+      generation_servers:
+        router:
+          type: conversation
+      # gen gets only the new turn rather than the full transcript, and takes
+      # token ids + bytes from ctx instead of re-deriving them.
+      gen_strip_message_history: true
+      gen_tokids_ctxbytes: true
+  disagg_hc:
+    server_instance: "disagg"
+  agentx:
+    server_instance: "disagg"
+    container_settings:
+      image: "__TRTLLM_IMAGE__"
+      mounts: *lustre_mounts
+    env_vars:
+      AIPERF_DATASET_MMAP_CACHE_DIR: "/lustre/fsw/coreai_comparch_aarwlt/itabrizian/hf_cache/aiperf_mmap_cache"
+      AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID: "true"
+      AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID: "true"
+      TQDM_DISABLE: "1"
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+
+sweep_params:
+  ctx:
+    num_instances: [1]
+    model: &model ["/lustre/share/coreai_dlalgo_ci/artifacts/model/nvidia_glm-5.2-nvfp4/hf/hf-b0b2b68_orig"]
+    tp: [4]
+    pp: [1]
+    moe_ep: [4]
+    trust_remote_code: ["True"]
+    enable_attention_dp: ["true"]
+    moe_backend: ["TRTLLM"]
+    enable_chunked_prefill: ["true"]
+    max_num_tokens: [12288]
+    max_batch_size: [128]
+    disable_overlap_scheduler: ["true"]
+    use_cuda_graph: ["false"]
+    print_iter_log: ["true"]
+    kv_cache_dtype: ["fp8"]
+    kv_cache_free_gpu_memory_fraction: [0.75]
+    host_cache_size: [137438953472]
+    tokens_per_block: [64]
+    enable_block_reuse: ["true"]
+    enable_kv_cache_aware_routing: ["false"]
+    kv_cache_routing_conversation_affinity: ["true"]
+    kv_cache_routing_max_sessions: [65536]
+    kv_cache_bounce_size_mb: [5120]
+    cache_transceiver_backend: ["NIXL"]
+    transceiver_runtime: ["PYTHON"]
+    max_tokens_in_buffer: [1048576]
+    kv_transfer_timeout_ms: [480000]
+    max_seq_len: [1048576]
+    decoding_type: ["MTP"]
+    num_nextn_predict_layers: [5]
+    num_postprocess_workers: [8]
+    tool_parser: "glm47"
+
+  gen:
+    num_instances: [2]
+    model: *model
+    tp: [8]
+    pp: [1]
+    moe_ep: [8]
+    trust_remote_code: ["True"]
+    enable_attention_dp: ["false"]
+    moe_backend: ["TRTLLM"]
+    sparse_attention_algorithm: ["dsa --key-bool sparse_attention_config.use_cute_dsl_paged_mqa_logits true"]
+    use_cuda_graph: ["true"]
+    cuda_graph_padding_enabled: ["true"]
+    max_batch_size: [1]
+    max_num_tokens: [6]
+    cuda_graph_max_batch_size: [1]
+    print_iter_log: ["true"]
+    kv_cache_dtype: ["fp8"]
+    kv_cache_free_gpu_memory_fraction: [0.70]
+    tokens_per_block: [64]
+    enable_block_reuse: ["false"]
+    kv_cache_bounce_size_mb: [5120]
+    cache_transceiver_backend: ["NIXL"]
+    transceiver_runtime: ["PYTHON"]
+    max_tokens_in_buffer: [1048576]
+    kv_transfer_timeout_ms: [480000]
+    max_seq_len: [1048576]
+    decoding_type: ["MTP"]
+    num_nextn_predict_layers: [5]
+    stream_interval: [20]
+    num_postprocess_workers: [4]
+    tool_parser: "glm47"
+
+  agentx:
+    stream: ["enable"]
+    concurrency: [15]
+    # 900 is the FLOOR: the plugin auto-adds --unsafe-override below 900s
+    # (agentx.py, unsafe_override "auto"), which taints the run.
+    benchmark_duration: [900]
+    public_dataset: ["semianalysis_cc_traces_weka_062126"]
+    num_dataset_entries: [393]
+    max_context_length: [1048576]
+    failed_request_threshold: [0.10]
+    random_seed: [42]
+    trajectory_start_min_ratio: [0.25]
+    trajectory_start_max_ratio: [0.75]
+    use_server_token_count: ["enable"]
+    use_dynamo_conv_aware_routing: ["disable"]
+    dynamo_session_timeout_seconds: [3600]
+    no_gpu_telemetry: ["enable"]
+    tokenizer_trust_remote_code: ["enable"]
+    tokenizer: *model
+    # Server-metrics slice duration; 1.0 is also the plugin default, pinned here
+    # so the value is visible rather than implied.
+    slice_duration: [1.0]
+    # disable, not auto: auto would inject --unsafe-override whenever
+    # benchmark_duration drops below 900, and 900 is exactly what we run.
+    unsafe_override: ["disable"]
+    extra_args:
+      # Flags with no field on the pinned agentx plugin, so they are passed raw.
+      # --scenario inferencex-agentx-mvp, --endpoint /v1/chat/completions and
+      # --endpoint-type chat are NOT here: the plugin hardcodes all three.
+      # --streaming comes from stream: enable above.
+      - "--warmup-requests-per-lane 10 --warmup-grace-period 1800 --stats-interval 30 --trace-idle-gap-cap-seconds 300"
+
+# A single operating point, not a sweep: every arm above is one element, and
+# btk_sweep asserts on any single-element parameter named in a rule.
+sweep_rule: {}

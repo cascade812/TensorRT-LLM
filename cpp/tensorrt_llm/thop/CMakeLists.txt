@@ -72,6 +72,7 @@ add_library(
   fp8RowwiseGemm.cpp
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
+  dsaKvCacheOffloadOp.cpp
   deepseekV4QNormOp.cpp
   deepseekV4BlockTableOp.cpp
   inverseRopeFp8QuantOp.cpp

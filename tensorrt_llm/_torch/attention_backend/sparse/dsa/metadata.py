@@ -180,6 +180,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         self.create_buffers_for_mla_rope_append(capture_graph=capture_graph)
         self.create_buffers_for_indexer(capture_graph=capture_graph)
+        from .kv_offload_prototype import create_metadata_buffers
+
+        create_metadata_buffers(self, capture_graph=capture_graph)
 
     def prepare(self):
         super().prepare()

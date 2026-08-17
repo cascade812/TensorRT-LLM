@@ -20,6 +20,7 @@ from tensorrt_llm._utils import get_sm_version, nvtx_range, nvtx_range_debug
 from tensorrt_llm.logger import logger
 
 from ..hooks import MLASparseHooks, register_mla_sparse_hooks
+from .kv_offload_prototype import mirror_appended_kv
 from .metadata import DSAtrtllmAttentionMetadata
 from .params import DSABackendForwardArgs
 
@@ -81,7 +82,7 @@ def forward_context_sparse_attn(
             q, compressed_kv, k_pe, position_ids, attn_metadata, output, latent_cache
         )
     if get_sm_version() >= 100:
-        return self.forward_absorption_context(
+        result = self.forward_absorption_context(
             q,
             compressed_kv,
             k_pe,
@@ -91,15 +92,18 @@ def forward_context_sparse_attn(
             latent_cache=latent_cache,
             sparse_backend_args=DSABackendForwardArgs(indexer_intermediates=indexer_intermediates),
         )
-    return forward_sparse_mla_kvcache_bf16(
-        self,
-        q,
-        latent_cache,
-        attn_metadata,
-        output,
-        indexer_intermediates,
-        is_generation=False,
-    )
+    else:
+        result = forward_sparse_mla_kvcache_bf16(
+            self,
+            q,
+            latent_cache,
+            attn_metadata,
+            output,
+            indexer_intermediates,
+            is_generation=False,
+        )
+    mirror_appended_kv(self.mqa, attn_metadata, position_ids, is_generation=False)
+    return result
 
 
 def forward_generation_sparse_attn(
@@ -114,7 +118,7 @@ def forward_generation_sparse_attn(
     indexer_intermediates: Optional[List[torch.Tensor]] = None,
 ) -> torch.Tensor:
     if get_sm_version() >= 100:
-        return self.forward_absorption_generation(
+        result = self.forward_absorption_generation(
             q,
             compressed_kv,
             k_pe,
@@ -124,15 +128,18 @@ def forward_generation_sparse_attn(
             latent_cache=latent_cache,
             sparse_backend_args=DSABackendForwardArgs(indexer_intermediates=indexer_intermediates),
         )
-    return forward_sparse_mla_kvcache_bf16(
-        self,
-        q,
-        latent_cache,
-        attn_metadata,
-        output,
-        indexer_intermediates,
-        is_generation=True,
-    )
+    else:
+        result = forward_sparse_mla_kvcache_bf16(
+            self,
+            q,
+            latent_cache,
+            attn_metadata,
+            output,
+            indexer_intermediates,
+            is_generation=True,
+        )
+    mirror_appended_kv(self.mqa, attn_metadata, position_ids, is_generation=True)
+    return result
 
 
 def forward_sparse_attn(
