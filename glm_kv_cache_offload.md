@@ -404,4 +404,144 @@ Summary: incompatible with any design that puts the host in the per-step loop (w
    before drawing a tail-latency conclusion. Full trial data and the comparison table are under
    `build/step3_results/job_2694682_staged_all_groups_subsets/`.
 
-Bottom line for the thread: the China team's skepticism was justified against the naive design (block-granular, no cache — that version genuinely doesn't fit in the compute window), but Allen's own data contains the evidence that a delta-fetching variant clears the bar with room to spare on GB-class hardware, in exactly the long-context regime GLM-5.2 is built for.
+**Persistent incremental-fetch prototype (2026-08-15):** The staged path's opt-in
+`TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_INCREMENTAL=1` mode now uses a persistent GPU working-set
+cache instead of ping-pong repacking. Each selected group layer and request owns `2 * TopK`
+fixed-address slots. A hit returns its existing (possibly non-contiguous) slot directly, with no
+GPU-to-GPU KV copy; a miss alone reads its 576 B row from the pinned host mirror. A device epoch
+marks the current TopK slots, a per-request CUB block scan builds the unmarked free-slot list in
+O(K), and misses claim that list in O(1). Since the current selection contains `H` hits, there are
+`2K - H` unmarked slots for only `K - H` misses, so the cache never evicts a row needed by the
+same attention selection.
+
+The row-to-slot table, tags, versions, epochs, free-list workspace, miss counters, output slot
+IDs, and KV values remain on device at graph-stable addresses. Mirroring publishes a per-host-row,
+per-layer version after a system fence, so physical-block reuse or a rewritten row invalidates the
+cached copy. Seven focused tests cover first fill, stable slot IDs on hits, partial churn,
+version invalidation, and CUDA-graph replay with changing device indices; the rebuilt AArch64/SM103
+libraries and all tests passed on GB300 (job 2698191).
+
+Job 2698210 then ran a matched 64k benchmark on one exclusive 4x GB300 node: TP4/EP4,
+batch/concurrency 4, OSL 256, all 19 complete groups, positions 2-4, and three trials per mode.
+Values below are medians of the three client-reported trial metrics:
+
+| mode | mean TPOT (ms) | median TPOT (ms) | mean E2E (s) | median E2E (s) | output tok/s |
+|---|---:|---:|---:|---:|---:|
+| paired baseline | 40.96 | 44.49 | 15.819 | 15.729 | 64.61 |
+| persistent miss-only | 44.74 | 48.98 | 16.628 | 16.640 | 61.45 |
+| delta | **+9.23%** | **+10.09%** | **+5.12%** | **+5.80%** | **-4.89%** |
+
+Nsight captured 150 steady graph steps on each of three worker timelines (450 samples per first-
+group stage). The complete miss-only pipeline includes epoch preparation, hit lookup, free-list
+construction, and the host fetch kernel:
+
+| launch layer -> target | fetch median / p90 (us) | pipeline median / p90 (us) | median pipeline overlap | fully hidden |
+|---|---:|---:|---:|---:|
+| 2 -> 3 | 97.808 / 112.384 | 117.184 / 132.067 | 60.62% | 0.00% |
+| 3 -> 4 | 70.496 / 84.346 | 87.824 / 101.827 | 100.00% | 97.56% |
+| 4 -> 5 | 66.816 / 79.014 | 84.688 / 96.816 | 100.00% | 97.33% |
+
+Across all 25,650 captured group-layer calls, median kernel times were 1.248 us to prepare the
+epoch, 4.192 us to find hits, 11.872 us to build free slots, and 99.456 us to fetch misses.
+Thus stages launched by layers 3 and 4 are essentially hidden, but the first stage is not: its
+median pipeline is 117.184 us against a 70.592 us compute window, leaving a 46.384 us median
+exposed tail. The GUI report, SQLite export, raw overlap CSV, and summaries are under
+`build/step3_results/job_2698210_persistent_64k/`.
+
+This remains deliberately **overhead-only**: attention still reads the authoritative paged GPU KV
+pool, so HBM is not yet reclaimed and the returned persistent slot IDs are not yet consumed by
+the attention kernel. The benchmark measures the cache-maintenance and miss-fetch schedule, not
+the final memory-saving attention integration.
+
+**Matched profiling clarification (2026-08-15):** Job 2701214 reran baseline, all-group
+full-refetch, and all-group persistent modes sequentially on the same exclusive 4x GB300 node,
+with three unprofiled trials per mode and separate 150-step Nsight captures. This controls for the
+large cross-job baseline variation that made the older +6.36% full-refetch result look better than
+the +10.09% persistent result:
+
+| mode | mean TPOT | median TPOT | mean E2E | median E2E |
+|---|---:|---:|---:|---:|
+| baseline | 40.91 ms | 44.57 ms | 15.781 s | 15.730 s |
+| full-refetch | 45.87 ms (**+12.12%**) | 49.84 ms (**+11.82%**) | 16.904 s (**+7.11%**) | 16.909 s (**+7.50%**) |
+| persistent miss-only | 44.76 ms (**+9.41%**) | 48.95 ms (**+9.83%**) | 16.651 s (**+5.52%**) | 16.681 s (**+6.04%**) |
+
+Thus persistent miss-only is 0.89 ms better in median TPOT and 228.5 ms better in median E2E
+than the matched full-refetch implementation. In the matched first group, full-refetch versus
+persistent miss-only fetch medians are 143.472 vs. 93.936 us for layer 3, 112.304 vs. 70.304 us
+for layer 4, and 93.008 vs. 65.424 us for layer 5.
+
+The earlier 61% versus 52% apparent overlap regression mixed two definitions: 52-54% measures
+only the final miss-fetch kernel after lookup/free-list work, while 61-62% measures the complete
+persistent pipeline from epoch preparation. Matched first-stage fetch-only overlap actually
+improves from 51.86% (full-refetch) to 54.41% (persistent); whole-pipeline overlap is 62.25%, and
+the exposed tail falls from 68.976 to 42.496 us. Both modes have 0% fully-hidden incidence for
+that first stage. Layers 4/5 remain essentially fully hidden.
+
+Across all groups, the fetch median falls from 131.680 to 104.240 us, but each persistent stage
+adds a 1.024 us graph memset plus 18.208 us median lookup/free-list pipeline work. There are 57
+stages per step, or about 1.10 ms of additional side-stream operation time, and the hit/free/fetch
+path launches 53 CTAs across four kernels versus one 16-CTA full-refetch kernel. Those kernels
+still contend with main-stream computation even when their event wait is hidden. Matched Nsight
+graph-step medians are 11.529 ms baseline, 14.680 ms full-refetch, and 13.332 ms persistent, so
+miss-only saves 1.348 ms/step versus full-refetch but remains 1.803 ms above baseline. Reports and
+raw analysis are under `build/step3_results/job_2701214_matched_fetch_compare_64k/`.
+
+Bottom line for the thread: persistent miss-only fetching removes ping-pong repacking and makes
+the layer-3 and layer-4 launches almost entirely hidden, but the first stage still exceeds its
+compute window by about 46 us at the median. The next performance target is therefore the first
+stage's fetch/window mismatch, followed by wiring the scattered working-set slots into attention
+to obtain actual HBM and concurrency benefits.
+
+## 7. Prototype variants and 64k overhead summary
+
+All three variants use the one-layer-ahead pipeline on 4x GB300 with TP4/EP4,
+batch/concurrency 4, ISL 65,536, OSL 256, and all 19 complete IndexShare groups. A transfer is
+launched on an auxiliary stream by the preceding layer, and the target layer waits only if that
+transfer has not finished. "Full-refetch" versus "miss-only" describes how many selected KV rows
+are read from host; both implementations are pipelined. Each value below is the median of three
+trial-level client metrics, expressed as overhead relative to the paired baseline from the same
+job.
+
+### 7.1 Pipelined full-refetch, Setup 1: group positions 2-4
+
+Setup 1 offloads all three shared positions in every group. Each decode step therefore launches
+three 576 B-per-row host gathers per group: layer 2 gathers layer 3's complete TopK, layer 3
+gathers layer 4's complete TopK, and layer 4 gathers layer 5's complete TopK. Every gather reads
+all 2,048 selected rows, regardless of reuse from the preceding decode step. The current matched
+implementation was measured in job 2701214.
+
+### 7.2 Pipelined full-refetch, Setup 2: group positions 3-4
+
+Setup 2 keeps the first shared position (position 2) GPU-resident and offloads only positions 3-4.
+It performs two full TopK gathers per group and avoids the layer 2 -> layer 3 transfer, which is
+the stage with the shortest overlap window and the largest exposed tail. This variant was measured
+in job 2694682.
+
+### 7.3 Miss-only pipelined refetch, Setup 1: group positions 2-4
+
+This variant has the same three-stage coverage as Setup 1, but replaces full TopK refetches with a
+persistent `2 * TopK` GPU working-set cache per request and group layer. Existing rows reuse their
+current, possibly non-contiguous GPU slots; only misses read 576 B rows from the pinned host
+mirror. Epoch preparation, hit lookup, free-slot construction, and the miss fetch remain in the
+same one-layer-ahead auxiliary-stream pipeline. This variant was measured in the matched job
+2701214.
+
+| prototype variant | mean TPOT overhead | median TPOT overhead | mean E2E overhead | median E2E overhead |
+|---|---:|---:|---:|---:|
+| Pipelined full-refetch, Setup 1 (positions 2-4, job 2701214) | **+12.12%** | **+11.82%** | **+7.11%** | **+7.50%** |
+| Pipelined full-refetch, Setup 2 (positions 3-4, job 2694682) | **+3.04%** | **+3.01%** | **+2.30%** | **+2.25%** |
+| Miss-only pipelined refetch, Setup 1 (positions 2-4, job 2701214) | **+9.41%** | **+9.83%** | **+5.52%** | **+6.04%** |
+
+The two Setup 1 rows are directly comparable because baseline, full-refetch, and miss-only modes
+ran sequentially on the same exclusive node in job 2701214. Miss-only reduces median TPOT
+overhead by 1.99 percentage points and median E2E overhead by 1.46 points relative to matched
+full-refetch. Setup 2 is cheaper primarily because it omits the difficult first transfer, not
+because it uses a different scheduling model.
+
+Setup 2 came from the earlier job 2694682 and must not be compared numerically with job 2701214
+without accounting for cross-job and code-revision variation. In that earlier job, its paired
+three-position Setup 1 measured +6.50% mean / +6.36% median TPOT overhead and +4.90% mean /
++4.50% median E2E overhead. The matched job 2701214 is the authoritative comparison between the
+current full-refetch and miss-only Setup 1 implementations. Detailed client results and Nsight
+reports are under `build/step3_results/job_2694682_staged_all_groups_subsets/` and
+`build/step3_results/job_2701214_matched_fetch_compare_64k/`.

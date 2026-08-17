@@ -27,13 +27,23 @@ namespace kernels
 {
 
 void invokeDsaKvCacheOffloadMirror(std::uint8_t const* sourcePool, std::int32_t const* globalIndices,
-    std::uint8_t* hostPool, std::int64_t numRows, std::int64_t numHostRows, std::int32_t hostRowBytes,
-    std::int32_t layerBytes, std::int32_t layerInGroup, std::int32_t strideFactor, std::int32_t tokensPerBlock,
-    std::int32_t layerOffset, cudaStream_t stream);
+    std::uint8_t* hostPool, std::int32_t* hostVersions, std::int64_t numRows, std::int64_t numHostRows,
+    std::int32_t hostRowBytes, std::int32_t layerBytes, std::int32_t layerInGroup, std::int32_t strideFactor,
+    std::int32_t tokensPerBlock, std::int32_t layerOffset, cudaStream_t stream);
 
 void invokeDsaKvCacheOffloadGather(std::uint8_t const* hostPool, std::int32_t const* globalIndices,
     std::uint8_t* output, std::int64_t numRows, std::int64_t numHostRows, std::int32_t hostRowBytes,
     std::int32_t layerBytes, std::int32_t layerInGroup, std::int32_t strideFactor, std::int32_t tokensPerBlock,
+    std::int32_t layerOffset, cudaStream_t stream);
+
+void invokeDsaKvCacheOffloadIncrementalGather(std::uint8_t const* hostPool,
+    std::int32_t const* globalIndices, std::int32_t const* hostVersions, std::int32_t* cacheKeys,
+    std::int32_t* cacheVersions, std::int32_t* rowToSlot, std::int32_t* epoch, std::int32_t* slotEpochs,
+    std::int32_t* freeSlots, std::int32_t* freeCounts, std::int32_t* allocationCounts,
+    std::uint8_t* cacheValues, std::int32_t* outputSlots, std::int32_t* missCount, std::int64_t numRows,
+    std::int64_t numHostRows, std::int32_t maxRequests, std::int32_t rowsPerRequest,
+    std::int32_t slotsPerRequest, std::int32_t hostRowBytes, std::int32_t layerBytes,
+    std::int32_t layerInGroup, std::int32_t strideFactor, std::int32_t tokensPerBlock,
     std::int32_t layerOffset, cudaStream_t stream);
 
 } // namespace kernels

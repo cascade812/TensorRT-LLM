@@ -3,20 +3,29 @@
 """Experimental GLM DSA KV-cache offload overhead prototype.
 
 This module intentionally measures transfer overhead without reclaiming HBM:
-the normal GPU KV cache remains authoritative while three shared layers after
-selected full-indexer layers are mirrored to pinned host memory. During decode,
-the full layer gathers the first shared layer's rows, and each of the first two
-shared layers gathers the following layer's rows. Each transfer runs on a
-stage-specific auxiliary stream while the preceding layer computes.
+the normal GPU KV cache remains authoritative while selected shared layers are
+mirrored to pinned host memory. During decode, transfers are pipelined one layer
+ahead on stage-specific auxiliary streams.
 
 Enable one group with
 TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_FULL_LAYER=<global layer>, or every complete
 local group with TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_FULL_LAYER=all. The prototype
 offloads all three shared positions by default. Set
 TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_GROUP_LAYERS=3,4 to keep the first shared
-position resident and offload only the last two. The prototype supports FP8
-latent KV, no speculative decoding, and a fresh fixed-batch run. It is not a
-user-facing configuration surface.
+position resident and offload only the last two.
+
+By default each transfer fully refetches TopK. Set
+TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_INCREMENTAL=1 to use a per-request, per-layer
+persistent working set. Hits reuse their existing GPU slots without copying;
+only misses fetch KV rows from the pinned host mirror. Host-row versions
+invalidate cached entries when a physical KV row is rewritten. All state and
+output slots have fixed addresses and mutate on device, so the path is
+CUDA-graph replayable.
+
+The prototype supports FP8 latent KV, no speculative decoding, and a fresh
+fixed-batch run. Attention still consumes the authoritative GPU KV cache; the
+working-set output is currently an overhead/correctness vehicle, not HBM
+reclamation or a user-facing configuration surface.
 """
 
 from __future__ import annotations
@@ -39,17 +48,34 @@ if TYPE_CHECKING:
 
 _PROTOTYPE_ENV = "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_FULL_LAYER"
 _GROUP_LAYERS_ENV = "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_GROUP_LAYERS"
+_INCREMENTAL_ENV = "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_INCREMENTAL"
 _MAX_HOST_GIB_ENV = "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_MAX_HOST_GIB"
 _NUM_SHARED_LAYERS = 3
+_WORKING_SET_CAPACITY_MULTIPLIER = 2
 _LATENT_BYTES = 576
 _HOST_ROW_BYTES = _NUM_SHARED_LAYERS * _LATENT_BYTES
 _DEFAULT_MAX_HOST_GIB = 3.5
+
+
+class _WorkingSet(NamedTuple):
+    keys: torch.Tensor
+    versions: torch.Tensor
+    row_to_slot: torch.Tensor
+    epochs: torch.Tensor
+    slot_epochs: torch.Tensor
+    free_slots: torch.Tensor
+    free_counts: torch.Tensor
+    allocation_counts: torch.Tensor
+    values: torch.Tensor
+    miss_counts: torch.Tensor
 
 
 class _OffloadGroup(NamedTuple):
     shared_layers: Tuple[int, int, int]
     offloaded_layer_indices: Tuple[int, ...]
     host_pool: torch.Tensor
+    host_versions: torch.Tensor
+    working_set: Optional[_WorkingSet]
 
 
 def _get_prototype_selector() -> Optional[Union[int, str]]:
@@ -70,6 +96,15 @@ def _get_prototype_selector() -> Optional[Union[int, str]]:
             f"{_PROTOTYPE_ENV} must be a non-negative integer or 'all', got {layer_idx}"
         )
     return layer_idx
+
+
+def _incremental_enabled() -> bool:
+    value = os.environ.get(_INCREMENTAL_ENV, "0").lower()
+    if value in ("0", "false", "no", "off"):
+        return False
+    if value in ("1", "true", "yes", "on"):
+        return True
+    raise ValueError(f"{_INCREMENTAL_ENV} must be a boolean value, got {value!r}")
 
 
 def _get_max_host_bytes() -> int:
@@ -165,12 +200,72 @@ def _select_full_layers(
     return (selector,)
 
 
+def _allocate_working_set(
+    max_batch_size: int,
+    rows_per_request: int,
+    host_rows: int,
+) -> _WorkingSet:
+    slots_per_request = _WORKING_SET_CAPACITY_MULTIPLIER * rows_per_request
+    cache_shape = (
+        _NUM_SHARED_LAYERS,
+        max_batch_size,
+        slots_per_request,
+    )
+    return _WorkingSet(
+        keys=torch.full(cache_shape, -1, dtype=torch.int32, device="cuda"),
+        versions=torch.full(cache_shape, -1, dtype=torch.int32, device="cuda"),
+        row_to_slot=torch.full(
+            (_NUM_SHARED_LAYERS, host_rows),
+            -1,
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        epochs=torch.full(
+            (_NUM_SHARED_LAYERS,),
+            -1,
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        slot_epochs=torch.full(
+            cache_shape,
+            -1,
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        free_slots=torch.empty(
+            cache_shape,
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        free_counts=torch.zeros(
+            (_NUM_SHARED_LAYERS, max_batch_size),
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        allocation_counts=torch.zeros(
+            (_NUM_SHARED_LAYERS, max_batch_size),
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        values=torch.empty(
+            (*cache_shape, _LATENT_BYTES),
+            dtype=torch.uint8,
+            device="cuda",
+        ),
+        miss_counts=torch.zeros(
+            (_NUM_SHARED_LAYERS,),
+            dtype=torch.int32,
+            device="cuda",
+        ),
+    )
+
+
 def configure_cache_manager(
     cache_manager: "DSACacheManager",
     sparse_attention_config,
     pretrained_config,
 ) -> None:
-    """Allocate pinned host mirrors for the selected overhead experiment."""
+    """Allocate host mirrors and optional incremental GPU working sets."""
     cache_manager.dsa_kv_offload_groups = {}
     cache_manager.dsa_kv_offload_shared_to_group = {}
 
@@ -196,6 +291,16 @@ def configure_cache_manager(
         pretrained_config,
     )
     offloaded_layer_indices = _get_offloaded_layer_indices()
+    incremental = _incremental_enabled()
+    rows_per_request = 0
+    if incremental:
+        sparse_params = sparse_attention_config.to_sparse_params(
+            pretrained_config=pretrained_config
+        )
+        rows_per_request = int(getattr(sparse_params, "index_topk", 0) or 0)
+        if rows_per_request <= 0:
+            raise ValueError(f"{_INCREMENTAL_ENV} requires a positive DSA index_topk")
+
     host_rows = cache_manager.blocks_in_primary_pool * cache_manager.tokens_per_block
     host_bytes_per_group = host_rows * _HOST_ROW_BYTES
     total_host_bytes = len(full_layers) * host_bytes_per_group
@@ -210,6 +315,7 @@ def configure_cache_manager(
 
     groups: Dict[int, _OffloadGroup] = {}
     shared_to_group: Dict[int, Tuple[int, int]] = {}
+    working_set_bytes = 0
     try:
         for full_layer in full_layers:
             host_pool = torch.empty(
@@ -218,10 +324,32 @@ def configure_cache_manager(
                 device="cpu",
                 pin_memory=True,
             )
+            host_versions = torch.zeros(
+                (host_rows, _NUM_SHARED_LAYERS),
+                dtype=torch.int32,
+                device="cuda",
+            )
+            working_set = (
+                _allocate_working_set(
+                    cache_manager.max_batch_size,
+                    rows_per_request,
+                    host_rows,
+                )
+                if incremental
+                else None
+            )
             shared_layers = _shared_layers(full_layer)
             groups[full_layer] = _OffloadGroup(
-                shared_layers, offloaded_layer_indices, host_pool
+                shared_layers=shared_layers,
+                offloaded_layer_indices=offloaded_layer_indices,
+                host_pool=host_pool,
+                host_versions=host_versions,
+                working_set=working_set,
             )
+            if working_set is not None:
+                working_set_bytes += sum(
+                    tensor.numel() * tensor.element_size() for tensor in working_set
+                )
             for layer_in_group in offloaded_layer_indices:
                 shared_layer = shared_layers[layer_in_group]
                 shared_to_group[shared_layer] = (full_layer, layer_in_group)
@@ -229,21 +357,23 @@ def configure_cache_manager(
         groups.clear()
         host_gib = total_host_bytes / (1 << 30)
         raise RuntimeError(
-            f"Unable to allocate {host_gib:.2f} GiB of pinned host pools for {_PROTOTYPE_ENV}"
+            f"Unable to allocate KV offload prototype pools ({host_gib:.2f} GiB pinned host)"
         ) from err
 
     cache_manager.dsa_kv_offload_groups = groups
     cache_manager.dsa_kv_offload_shared_to_group = shared_to_group
     logger.info(
         "[DSA KV offload prototype] %d group(s), full layers %s, "
-        "group layers %s, token-major host mirrors %.2f GiB total "
-        "(%.2f GiB/group, %d rows/group)",
+        "group layers %s, mode %s, token-major host mirrors %.2f GiB total "
+        "(%.2f GiB/group, %d rows/group), incremental GPU state %.2f GiB",
         len(groups),
         tuple(groups),
         tuple(layer_in_group + 2 for layer_in_group in offloaded_layer_indices),
+        "incremental" if incremental else "full-refetch",
         total_host_bytes / (1 << 30),
         host_bytes_per_group / (1 << 30),
         host_rows,
+        working_set_bytes / (1 << 30),
     )
 
 
@@ -251,8 +381,9 @@ def create_metadata_buffers(
     metadata: "DSAtrtllmAttentionMetadata",
     capture_graph: bool,
 ) -> None:
-    """Create fixed-address per-layer staging and synchronization objects."""
+    """Create fixed-address staging/slot buffers and synchronization objects."""
     metadata.dsa_kv_offload_staging = None
+    metadata.dsa_kv_offload_slots = None
     metadata.dsa_kv_offload_streams = ()
     metadata.dsa_kv_offload_start_events = ()
     metadata.dsa_kv_offload_events = ()
@@ -263,13 +394,23 @@ def create_metadata_buffers(
     max_rows = (
         metadata.max_num_sequences * (1 + metadata.max_draft_tokens) * metadata.num_sparse_topk
     )
-    metadata.dsa_kv_offload_staging = metadata.get_empty(
-        metadata.cuda_graph_buffers,
-        (_NUM_SHARED_LAYERS, max_rows, _LATENT_BYTES),
-        cache_name="dsa_kv_offload_staging",
-        dtype=torch.uint8,
-        capture_graph=capture_graph,
-    )
+    incremental = next(iter(groups.values())).working_set is not None
+    if incremental:
+        metadata.dsa_kv_offload_slots = metadata.get_empty(
+            metadata.cuda_graph_buffers,
+            (_NUM_SHARED_LAYERS, max_rows),
+            cache_name="dsa_kv_offload_slots",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+    else:
+        metadata.dsa_kv_offload_staging = metadata.get_empty(
+            metadata.cuda_graph_buffers,
+            (_NUM_SHARED_LAYERS, max_rows, _LATENT_BYTES),
+            cache_name="dsa_kv_offload_staging",
+            dtype=torch.uint8,
+            capture_graph=capture_graph,
+        )
     metadata.dsa_kv_offload_streams = tuple(
         torch.cuda.Stream() for _ in range(_NUM_SHARED_LAYERS)
     )
@@ -288,16 +429,13 @@ def _launch_gather(
     group: _OffloadGroup,
     layer_in_group: int,
 ) -> None:
-    """Gather one shared layer's selected rows on its auxiliary stream."""
-    staging = metadata.dsa_kv_offload_staging
+    """Fetch one shared layer's selected rows on its auxiliary stream."""
     streams = metadata.dsa_kv_offload_streams
     start_events = metadata.dsa_kv_offload_start_events
     events = metadata.dsa_kv_offload_events
-    assert staging is not None
     assert len(streams) == _NUM_SHARED_LAYERS
     assert len(start_events) == _NUM_SHARED_LAYERS
     assert len(events) == _NUM_SHARED_LAYERS
-    assert global_indices.numel() <= staging.shape[1]
 
     stream = streams[layer_in_group]
     start_event = start_events[layer_in_group]
@@ -305,15 +443,45 @@ def _launch_gather(
     start_event.record()
     with torch.cuda.stream(stream):
         stream.wait_event(start_event)
-        torch.ops.trtllm.dsa_kv_cache_offload_gather(
-            group.host_pool,
-            global_indices,
-            staging[layer_in_group, : global_indices.numel()],
-            metadata._cached_stride_factor,
-            metadata._cached_tokens_per_block,
-            backend.get_local_layer_idx(metadata),
-            layer_in_group,
-        )
+        working_set = group.working_set
+        if working_set is None:
+            staging = metadata.dsa_kv_offload_staging
+            assert staging is not None
+            assert global_indices.numel() <= staging.shape[1]
+            torch.ops.trtllm.dsa_kv_cache_offload_gather(
+                group.host_pool,
+                global_indices,
+                staging[layer_in_group, : global_indices.numel()],
+                metadata._cached_stride_factor,
+                metadata._cached_tokens_per_block,
+                backend.get_local_layer_idx(metadata),
+                layer_in_group,
+            )
+        else:
+            slots = metadata.dsa_kv_offload_slots
+            assert slots is not None
+            assert global_indices.numel() <= slots.shape[1]
+            torch.ops.trtllm.dsa_kv_cache_offload_incremental_gather(
+                group.host_pool,
+                global_indices,
+                group.host_versions,
+                working_set.keys[layer_in_group],
+                working_set.versions[layer_in_group],
+                working_set.row_to_slot[layer_in_group],
+                working_set.epochs[layer_in_group : layer_in_group + 1],
+                working_set.slot_epochs[layer_in_group],
+                working_set.free_slots[layer_in_group],
+                working_set.free_counts[layer_in_group],
+                working_set.allocation_counts[layer_in_group],
+                working_set.values[layer_in_group],
+                slots[layer_in_group, : global_indices.numel()],
+                working_set.miss_counts[layer_in_group : layer_in_group + 1],
+                metadata.num_sparse_topk,
+                metadata._cached_stride_factor,
+                metadata._cached_tokens_per_block,
+                backend.get_local_layer_idx(metadata),
+                layer_in_group,
+            )
         event.record()
 
 
@@ -407,6 +575,7 @@ def mirror_appended_kv(
         metadata._cached_pool_view,
         global_indices,
         group.host_pool,
+        group.host_versions,
         metadata._cached_stride_factor,
         metadata._cached_tokens_per_block,
         local_layer,

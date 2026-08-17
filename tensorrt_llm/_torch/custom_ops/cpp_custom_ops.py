@@ -1527,12 +1527,21 @@ def _register_fake():
         return torch.empty_like(token_indices)
 
     @torch.library.register_fake("trtllm::dsa_kv_cache_offload_mirror")
-    def _(source_pool, global_indices, host_pool, stride_factor,
+    def _(source_pool, global_indices, host_pool, host_versions, stride_factor,
           tokens_per_block, layer_offset, layer_in_group):
         pass
 
     @torch.library.register_fake("trtllm::dsa_kv_cache_offload_gather")
     def _(host_pool, global_indices, output, stride_factor, tokens_per_block,
+          layer_offset, layer_in_group):
+        pass
+
+    @torch.library.register_fake(
+            "trtllm::dsa_kv_cache_offload_incremental_gather")
+    def _(host_pool, global_indices, host_versions, cache_keys,
+          cache_versions, row_to_slot, epoch, slot_epochs, free_slots,
+          free_counts, allocation_counts, cache_values, output_slots,
+          miss_count, rows_per_request, stride_factor, tokens_per_block,
           layer_offset, layer_in_group):
         pass
 
