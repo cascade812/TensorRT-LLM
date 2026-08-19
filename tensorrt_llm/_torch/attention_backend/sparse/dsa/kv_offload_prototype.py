@@ -22,10 +22,12 @@ invalidate cached entries when a physical KV row is rewritten. All state and
 output slots have fixed addresses and mutate on device, so the path is
 CUDA-graph replayable.
 
-The prototype supports FP8 latent KV, no speculative decoding, and a fresh
-fixed-batch run. Attention still consumes the authoritative GPU KV cache; the
-working-set output is currently an overhead/correctness vehicle, not HBM
-reclamation or a user-facing configuration surface.
+The prototype supports FP8 latent KV, linear MTP speculative decoding, and a
+fresh fixed-batch run. An MTP target pass fetches TopK for all
+``1 + max_draft_len`` query positions per request. Attention still consumes
+the authoritative GPU KV cache; the working-set output is currently an
+overhead/correctness vehicle, not HBM reclamation or a user-facing
+configuration surface.
 """
 
 from __future__ import annotations
@@ -118,6 +120,21 @@ def _get_max_host_bytes() -> int:
     return int(max_host_gib * (1 << 30))
 
 
+def _get_max_draft_tokens(cache_manager: "DSACacheManager") -> int:
+    """Return the configured linear-MTP draft length, or zero."""
+    spec_config = cache_manager.spec_config
+    if spec_config is None:
+        return 0
+    if getattr(spec_config, "decoding_type", None) != "MTP" or getattr(
+        spec_config, "use_dynamic_tree", False
+    ):
+        raise ValueError(f"{_PROTOTYPE_ENV} only supports linear MTP speculative decoding")
+    max_draft_tokens = int(getattr(spec_config, "max_draft_len", 0) or 0)
+    if max_draft_tokens <= 0:
+        raise ValueError(f"{_PROTOTYPE_ENV} requires MTP max_draft_len to be positive")
+    return max_draft_tokens
+
+
 def _get_offloaded_layer_indices() -> Tuple[int, ...]:
     """Return zero-based shared-layer indices selected within each group."""
     value = os.environ.get(_GROUP_LAYERS_ENV, "2,3,4")
@@ -147,6 +164,7 @@ def _select_full_layers(
     cache_manager: "DSACacheManager",
     sparse_attention_config,
     pretrained_config,
+    allow_empty: bool = False,
 ) -> Tuple[int, ...]:
     local_layers = tuple(sorted(cache_manager.layer_offsets))
     local_layer_set = set(local_layers)
@@ -177,7 +195,7 @@ def _select_full_layers(
         full_layers = tuple(
             layer_idx for layer_idx in local_layers if is_complete_group(layer_idx)
         )
-        if not full_layers:
+        if not full_layers and not allow_empty:
             raise ValueError(f"{_PROTOTYPE_ENV}=all found no complete local IndexShare groups")
         return full_layers
 
@@ -202,10 +220,10 @@ def _select_full_layers(
 
 def _allocate_working_set(
     max_batch_size: int,
-    rows_per_request: int,
+    max_rows_per_request: int,
     host_rows: int,
 ) -> _WorkingSet:
-    slots_per_request = _WORKING_SET_CAPACITY_MULTIPLIER * rows_per_request
+    slots_per_request = _WORKING_SET_CAPACITY_MULTIPLIER * max_rows_per_request
     cache_shape = (
         _NUM_SHARED_LAYERS,
         max_batch_size,
@@ -274,8 +292,7 @@ def configure_cache_manager(
         return
     if pretrained_config is None:
         raise ValueError(f"{_PROTOTYPE_ENV} requires a pretrained model configuration")
-    if cache_manager.spec_config is not None:
-        raise ValueError(f"{_PROTOTYPE_ENV} does not support speculative decoding")
+    max_draft_tokens = _get_max_draft_tokens(cache_manager)
     if cache_manager.dtype != DataType.FP8:
         raise ValueError(f"{_PROTOTYPE_ENV} requires an FP8 latent KV cache")
     if cache_manager.head_dim != _LATENT_BYTES:
@@ -289,17 +306,25 @@ def configure_cache_manager(
         cache_manager,
         sparse_attention_config,
         pretrained_config,
+        allow_empty=max_draft_tokens > 0,
     )
+    if not full_layers:
+        logger.info(
+            "[DSA KV offload prototype] skipping the MTP draft cache manager; "
+            "it has no complete IndexShare groups"
+        )
+        return
     offloaded_layer_indices = _get_offloaded_layer_indices()
     incremental = _incremental_enabled()
-    rows_per_request = 0
+    max_rows_per_request = 0
     if incremental:
         sparse_params = sparse_attention_config.to_sparse_params(
             pretrained_config=pretrained_config
         )
-        rows_per_request = int(getattr(sparse_params, "index_topk", 0) or 0)
-        if rows_per_request <= 0:
+        index_topk = int(getattr(sparse_params, "index_topk", 0) or 0)
+        if index_topk <= 0:
             raise ValueError(f"{_INCREMENTAL_ENV} requires a positive DSA index_topk")
+        max_rows_per_request = (1 + max_draft_tokens) * index_topk
 
     host_rows = cache_manager.blocks_in_primary_pool * cache_manager.tokens_per_block
     host_bytes_per_group = host_rows * _HOST_ROW_BYTES
@@ -332,7 +357,7 @@ def configure_cache_manager(
             working_set = (
                 _allocate_working_set(
                     cache_manager.max_batch_size,
-                    rows_per_request,
+                    max_rows_per_request,
                     host_rows,
                 )
                 if incremental
@@ -364,12 +389,14 @@ def configure_cache_manager(
     cache_manager.dsa_kv_offload_shared_to_group = shared_to_group
     logger.info(
         "[DSA KV offload prototype] %d group(s), full layers %s, "
-        "group layers %s, mode %s, token-major host mirrors %.2f GiB total "
+        "group layers %s, mode %s, MTP draft length %d, "
+        "token-major host mirrors %.2f GiB total "
         "(%.2f GiB/group, %d rows/group), incremental GPU state %.2f GiB",
         len(groups),
         tuple(groups),
         tuple(layer_in_group + 2 for layer_in_group in offloaded_layer_indices),
         "incremental" if incremental else "full-refetch",
+        max_draft_tokens,
         total_host_bytes / (1 << 30),
         host_bytes_per_group / (1 << 30),
         host_rows,
@@ -391,9 +418,8 @@ def create_metadata_buffers(
     if not groups:
         return
 
-    max_rows = (
-        metadata.max_num_sequences * (1 + metadata.max_draft_tokens) * metadata.num_sparse_topk
-    )
+    max_draft_tokens = _get_max_draft_tokens(metadata.kv_cache_manager)
+    max_rows = metadata.max_num_sequences * (1 + max_draft_tokens) * metadata.num_sparse_topk
     incremental = next(iter(groups.values())).working_set is not None
     if incremental:
         metadata.dsa_kv_offload_slots = metadata.get_empty(
@@ -422,6 +448,19 @@ def create_metadata_buffers(
     )
 
 
+def _get_pool_index_params(
+    backend: "DSATrtllmAttention",
+    metadata: "DSAtrtllmAttentionMetadata",
+) -> Tuple[int, int]:
+    """Return the current layer's flattened-pool stride and offset."""
+    local_layer = backend.get_local_layer_idx(metadata)
+    page_index_scale, layer_offset = (
+        metadata.kv_cache_manager.get_primary_pool_page_index_params(local_layer)
+    )
+    stride_factor = page_index_scale * metadata._cached_tokens_per_block
+    return stride_factor, layer_offset
+
+
 def _launch_gather(
     backend: "DSATrtllmAttention",
     global_indices: torch.Tensor,
@@ -436,6 +475,7 @@ def _launch_gather(
     assert len(streams) == _NUM_SHARED_LAYERS
     assert len(start_events) == _NUM_SHARED_LAYERS
     assert len(events) == _NUM_SHARED_LAYERS
+    stride_factor, layer_offset = _get_pool_index_params(backend, metadata)
 
     stream = streams[layer_in_group]
     start_event = start_events[layer_in_group]
@@ -452,15 +492,22 @@ def _launch_gather(
                 group.host_pool,
                 global_indices,
                 staging[layer_in_group, : global_indices.numel()],
-                metadata._cached_stride_factor,
+                stride_factor,
                 metadata._cached_tokens_per_block,
-                backend.get_local_layer_idx(metadata),
+                layer_offset,
                 layer_in_group,
             )
         else:
             slots = metadata.dsa_kv_offload_slots
             assert slots is not None
             assert global_indices.numel() <= slots.shape[1]
+            if metadata.num_generations <= 0:
+                raise ValueError("DSA KV offload gather requires at least one generation request")
+            if global_indices.numel() % metadata.num_generations != 0:
+                raise ValueError(
+                    "DSA KV offload TopK rows must be evenly partitioned by generation request"
+                )
+            rows_per_request = global_indices.numel() // metadata.num_generations
             torch.ops.trtllm.dsa_kv_cache_offload_incremental_gather(
                 group.host_pool,
                 global_indices,
@@ -476,10 +523,10 @@ def _launch_gather(
                 working_set.values[layer_in_group],
                 slots[layer_in_group, : global_indices.numel()],
                 working_set.miss_counts[layer_in_group : layer_in_group + 1],
-                metadata.num_sparse_topk,
-                metadata._cached_stride_factor,
+                rows_per_request,
+                stride_factor,
                 metadata._cached_tokens_per_block,
-                backend.get_local_layer_idx(metadata),
+                layer_offset,
                 layer_in_group,
             )
         event.record()
@@ -561,23 +608,23 @@ def mirror_appended_kv(
 
     full_layer, layer_in_group = group_info
     group = cache_manager.dsa_kv_offload_groups[full_layer]
-    local_layer = backend.get_local_layer_idx(metadata)
+    stride_factor, layer_offset = _get_pool_index_params(backend, metadata)
     global_indices = torch.ops.trtllm.convert_req_index_to_global(
         req_idx,
         block_table,
         token_indices,
         metadata._cached_tokens_per_block,
         1,
-        metadata._cached_stride_factor,
-        local_layer,
+        stride_factor,
+        layer_offset,
     )
     torch.ops.trtllm.dsa_kv_cache_offload_mirror(
         metadata._cached_pool_view,
         global_indices,
         group.host_pool,
         group.host_versions,
-        metadata._cached_stride_factor,
+        stride_factor,
         metadata._cached_tokens_per_block,
-        local_layer,
+        layer_offset,
         layer_in_group,
     )

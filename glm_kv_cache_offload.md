@@ -545,3 +545,67 @@ three-position Setup 1 measured +6.50% mean / +6.36% median TPOT overhead and +4
 current full-refetch and miss-only Setup 1 implementations. Detailed client results and Nsight
 reports are under `build/step3_results/job_2694682_staged_all_groups_subsets/` and
 `build/step3_results/job_2701214_matched_fetch_compare_64k/`.
+
+## 8. Production MTP5 reevaluation at 64k
+
+The earlier matched job 2701214 did **not** enable MTP: its server configuration had
+`speculative_config=None`, and the client reported exactly 1.00 decoded token per iteration. The
+prototype now permits linear MTP, sizes its fixed staging/slot buffers and persistent working set
+for `(1 + max_draft_len) * TopK` rows per request, derives the actual rows per request for each
+MTP forward, and skips the draft-only KV cache manager because it has no complete four-layer
+IndexShare groups.
+
+Job 2717095 reran baseline, all-group pipelined full-refetch Setup 1, and all-group persistent
+miss-only Setup 1 sequentially on the same exclusive 4x GB300 node. The otherwise-matched setup
+was TP4/EP4, batch/concurrency 4, ISL 65,536, OSL 256, all 19 complete IndexShare groups, and
+`MTPDecodingConfig(max_draft_len=5)`. Each table value is the median of three trial-level client
+metrics. The MTP5 client reported roughly 3.0-3.3 median decoded tokens per target iteration.
+
+| mode | mean TPOT | median TPOT | mean E2E | median E2E |
+|---|---:|---:|---:|---:|
+| MTP5 baseline | 39.96 ms | 40.06 ms | 15.662 s | 15.898 s |
+| MTP5 full-refetch | 40.43 ms (**+1.18%**) | 42.48 ms (**+6.04%**) | 15.860 s (**+1.26%**) | 15.638 s (**-1.64%**) |
+| MTP5 persistent miss-only | 42.55 ms (**+6.48%**) | 44.72 ms (**+11.63%**) | 16.146 s (**+3.09%**) | 15.873 s (**-0.16%**) |
+
+Median E2E is noisy under MTP because acceptance length and per-request completion order vary;
+mean E2E and both TPOT columns show the expected ordering more reliably. Median-of-trials mean
+accepted-token counts were 3.34, 3.53, and 3.57 for baseline, full-refetch, and persistent,
+respectively, so the client-level percentages also include a small acceptance/scheduling
+confound even though this overhead-only prototype still reads attention KV from the original GPU
+pool.
+
+With batch 4 and MTP5, a full-refetch stage processes
+`4 * (1 + 5) * 2,048 * 576 B = 27 MiB`, exactly 6x the non-MTP 4.5 MiB. There are 57 stages per
+target iteration, so Setup 1 presents 1,539 MiB of host reads per rank before overlap. The
+persistent path sees the same 49,152 TopK candidates per stage but reads host data only for
+misses; its `2 * (1 + 5) * TopK` capacity costs 3.15 GiB of prototype GPU state per rank across
+19 groups.
+
+Nsight captured 150 target iterations on each of three worker timelines. The all-group medians
+show that MTP5 transfers are no longer hidden:
+
+| mode | launch -> target | fetch median / p90 (us) | pipeline median / p90 (us) | fetch overlap | pipeline overlap | exposed tail | fully hidden |
+|---|---|---:|---:|---:|---:|---:|---:|
+| full-refetch | full -> shared 1 | 276.768 / 296.707 | same | 77.44% | 77.44% | 63.008 us | 0.90% |
+| full-refetch | shared 1 -> shared 2 | 291.424 / 312.902 | same | 79.85% | 79.85% | 59.792 us | 0.07% |
+| full-refetch | shared 2 -> shared 3 | 292.432 / 334.518 | same | 78.41% | 78.41% | 63.232 us | 0.04% |
+| persistent | full -> shared 1 | 279.424 / 289.283 | 399.680 / 415.776 | 25.35% | 47.97% | 208.416 us | 0.00% |
+| persistent | shared 1 -> shared 2 | 279.648 / 294.816 | 387.232 / 407.168 | 35.13% | 54.07% | 178.432 us | 0.00% |
+| persistent | shared 2 -> shared 3 | 270.080 / 292.320 | 372.352 / 402.496 | 39.22% | 57.77% | 155.920 us | 0.01% |
+
+Across all stages, the full-refetch kernel median rose from 131.680 us without MTP to 286.976 us
+with MTP5. Persistent fetch rose from 104.240 to 277.888 us, while its free-slot scan rose from
+11.808 to 88.992 us because the per-request working set is 6x larger. The complete persistent
+pipeline is therefore 388.592 us at the median, even though its final miss-fetch kernel remains
+slightly faster than full-refetch.
+
+Summed exposed tails per target iteration are 4.327 ms for full-refetch and 10.174 ms for
+persistent. Corresponding median target-iteration intervals in the trace are 26.624 and 32.060
+ms. Therefore the original non-MTP conclusion that the later two stages are essentially hidden
+does **not** hold for production MTP5: the 6x candidate set makes all three stages visible, and
+the current persistent design is hurt especially by its enlarged free-slot scan and delayed
+miss-fetch launch.
+
+The full reports, SQLite exports, client/server logs, and configuration are archived in
+`build/step3_results/mtp5_eval_64k/artifacts.tar.gz`; the combined job log is
+`build/step3_results/mtp5_eval_64k/run.log`.

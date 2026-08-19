@@ -19,6 +19,7 @@ import torch
 import tensorrt_llm  # noqa: F401
 from tensorrt_llm._torch.attention_backend.sparse.dsa.kv_offload_prototype import (
     _get_offloaded_layer_indices,
+    _get_pool_index_params,
     _select_full_layers,
     configure_cache_manager,
 )
@@ -364,6 +365,31 @@ class _FakeSparseParams:
         self.is_full_indexer_layer = is_full_indexer_layer
 
 
+class _FakePoolIndexCacheManager:
+
+    def get_primary_pool_page_index_params(self, local_layer_idx: int):
+        return _NUM_LAYERS, local_layer_idx
+
+
+class _FakePoolIndexMetadata:
+    kv_cache_manager = _FakePoolIndexCacheManager()
+    _cached_tokens_per_block = _TOKENS_PER_BLOCK
+
+
+class _FakePoolIndexBackend:
+
+    def get_local_layer_idx(self, metadata):
+        del metadata
+        return _FULL_LAYER
+
+
+def test_dsa_kv_cache_offload_uses_cache_manager_page_index_params():
+    assert _get_pool_index_params(
+        _FakePoolIndexBackend(),
+        _FakePoolIndexMetadata(),
+    ) == (_STRIDE_FACTOR, _FULL_LAYER)
+
+
 class _FakeSparseAttentionConfig:
 
     def to_sparse_params(self, pretrained_config, layer_idx):
@@ -408,6 +434,12 @@ class _FakeIncrementalCacheManager:
     max_batch_size = 2
 
 
+class _FakeMTPConfig:
+    decoding_type = "MTP"
+    use_dynamic_tree = False
+    max_draft_len = 5
+
+
 class _FakeIncrementalSparseParams:
 
     def __init__(self, is_full_indexer_layer: bool):
@@ -444,3 +476,22 @@ def test_dsa_kv_cache_offload_configure_incremental_working_set(monkeypatch):
     assert group.working_set.free_counts.shape == (3, 2)
     assert group.working_set.allocation_counts.shape == (3, 2)
     assert group.working_set.values.shape == (3, 2, 4, 576)
+
+
+def test_dsa_kv_cache_offload_configure_incremental_mtp5_working_set(monkeypatch):
+    monkeypatch.setenv("TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_FULL_LAYER", "0")
+    monkeypatch.setenv("TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_INCREMENTAL", "1")
+    cache_manager = _FakeIncrementalCacheManager()
+    cache_manager.spec_config = _FakeMTPConfig()
+
+    configure_cache_manager(
+        cache_manager,
+        _FakeIncrementalSparseAttentionConfig(),
+        pretrained_config=object(),
+    )
+
+    group = cache_manager.dsa_kv_offload_groups[0]
+    assert group.working_set is not None
+    # Two working-set generations are retained for all 1 + 5 target rows.
+    assert group.working_set.keys.shape == (3, 2, 24)
+    assert group.working_set.values.shape == (3, 2, 24, 576)
