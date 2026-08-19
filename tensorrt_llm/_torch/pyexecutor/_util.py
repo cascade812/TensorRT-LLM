@@ -42,7 +42,7 @@ from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..hostfunc import set_low_latency_dispatch
-from ..model_config import ModelConfig
+from ..model_config import ModelConfig, _get_encoder_decoder_num_layers
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
@@ -3188,6 +3188,15 @@ _ATTN_MODULES = frozenset({
     "cross_attn_q",
     "cross_attn_k",
     "cross_attn_v",
+    "cross_attn_qkv",
+    "cross_attn_dense",
+})
+_CROSS_ATTN_MODULES = frozenset({
+    "cross_attn_q",
+    "cross_attn_k",
+    "cross_attn_v",
+    "cross_attn_qkv",
+    "cross_attn_dense",
 })
 _MLP_MODULES = frozenset({
     "mlp_h_to_4h",
@@ -3201,11 +3210,28 @@ def _compute_num_lora_modules(pretrained_config,
                               all_target_modules: list[str]) -> int:
     """Compute the total number of LoRA module-layer slots for cache sizing.
 
-    For models with per-layer block_configs (e.g. Nemotron-NAS / DeciLM),
-    layers with no_op or replace_with_linear attention/FFN cannot host LoRA
-    adapters, so they are excluded from the count.  For all other models,
-    falls back to the uniform num_hidden_layers x len(target_modules).
+    Encoder-decoder models count self-attention and MLP targets across both
+    stacks, while cross-attention targets occur only in decoder layers. For
+    models with per-layer block_configs (e.g. Nemotron-NAS / DeciLM), layers
+    with no_op or replace_with_linear attention/FFN cannot host LoRA adapters,
+    so they are excluded from the count. All other models use the uniform
+    num_hidden_layers x len(target_modules) count.
     """
+    if getattr(pretrained_config, "is_encoder_decoder", False):
+        num_encoder_layers, num_decoder_layers = \
+            _get_encoder_decoder_num_layers(pretrained_config)
+        cross_attn_modules = [
+            module for module in all_target_modules
+            if module in _CROSS_ATTN_MODULES
+        ]
+        non_cross_attn_modules = [
+            module for module in all_target_modules
+            if module not in _CROSS_ATTN_MODULES
+        ]
+        return ((num_encoder_layers + num_decoder_layers) *
+                len(non_cross_attn_modules) +
+                num_decoder_layers * len(cross_attn_modules))
+
     num_layers = pretrained_config.num_hidden_layers
     block_configs = getattr(pretrained_config, "block_configs", None)
 

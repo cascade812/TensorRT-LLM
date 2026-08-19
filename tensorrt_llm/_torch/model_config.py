@@ -67,6 +67,30 @@ _MINIMAX_M3_ARCHITECTURES = {
 }
 
 
+def _get_encoder_decoder_num_layers(
+        pretrained_config: transformers.PretrainedConfig) -> tuple[int, int]:
+    """Return encoder and decoder layer counts from an HF config."""
+    num_encoder_layers = getattr(pretrained_config, "encoder_layers", None)
+    if num_encoder_layers is None:
+        num_encoder_layers = getattr(pretrained_config, "num_layers", None)
+    if num_encoder_layers is None:
+        num_encoder_layers = getattr(pretrained_config, "num_hidden_layers",
+                                     None)
+
+    num_decoder_layers = getattr(pretrained_config, "decoder_layers", None)
+    if num_decoder_layers is None:
+        num_decoder_layers = getattr(pretrained_config, "num_decoder_layers",
+                                     None)
+
+    if num_encoder_layers is None or num_decoder_layers is None:
+        model_type = getattr(pretrained_config, "model_type", "unknown")
+        raise ValueError(
+            f"Failed to infer encoder and decoder layer counts for model: {model_type}"
+        )
+
+    return num_encoder_layers, num_decoder_layers
+
+
 def _is_lock_infra_error(exc: BaseException) -> bool:
     """Whether exc indicates broken lock infrastructure (not mere contention)."""
     if isinstance(exc, PermissionError):
@@ -1317,14 +1341,37 @@ class ModelConfig(Generic[TConfig]):
                                     attn_tp_size * attn_cp_size)
             model_config_cpp.set_num_kv_heads(num_kv_heads)
 
-        # For hybrid models (e.g., Nemotron-H with Mamba + Attention), LoRA can be applied
-        # to non-attention layers (e.g., Mamba in_proj/out_proj). Set num_lora_layers to
-        # total layers so the C++ LoRA validation accepts all layer indices.
-        if is_nemotron_hybrid(self.pretrained_config):
+        # LoRA layer IDs can span more layers than the decoder KV cache. Encoder-decoder
+        # models use both stacks, while hybrid models can apply LoRA to non-attention
+        # layers. Set the explicit count so C++ validation accepts every LoRA layer ID.
+        if self.is_encoder_decoder:
+            num_encoder_layers, num_decoder_layers = \
+                _get_encoder_decoder_num_layers(self.pretrained_config)
+            model_config_cpp.set_num_lora_layers(num_encoder_layers +
+                                                 num_decoder_layers)
+        elif is_nemotron_hybrid(self.pretrained_config):
             model_config_cpp.set_num_lora_layers(num_layers)
 
         mlp_hidden_size = None
-        if self.pretrained_config.intermediate_size is not None:
+        if self.is_encoder_decoder:
+            intermediate_size = getattr(self.pretrained_config, "d_ff", None)
+            if intermediate_size is None:
+                encoder_ffn_dim = getattr(self.pretrained_config,
+                                          "encoder_ffn_dim", None)
+                decoder_ffn_dim = getattr(self.pretrained_config,
+                                          "decoder_ffn_dim", None)
+                if encoder_ffn_dim != decoder_ffn_dim:
+                    raise ValueError(
+                        "Encoder and decoder FFN dimensions must match for "
+                        "encoder-decoder LoRA, but got "
+                        f"encoder_ffn_dim={encoder_ffn_dim} and "
+                        f"decoder_ffn_dim={decoder_ffn_dim}")
+                intermediate_size = encoder_ffn_dim
+            if intermediate_size is not None:
+                mlp_hidden_size = ceil_div(intermediate_size,
+                                           self.mapping.tp_size)
+        elif getattr(self.pretrained_config, "intermediate_size",
+                     None) is not None:
             mlp_hidden_size = ceil_div(self.pretrained_config.intermediate_size,
                                        self.mapping.tp_size)
         else:
@@ -1347,14 +1394,26 @@ class ModelConfig(Generic[TConfig]):
             )
 
         # For kv cache size calculation: set size_per_head
-        head_dim_names = ["head_size", "head_dim"]
         head_size = None
-        for head_dim_name in head_dim_names:
-            if hasattr(self.pretrained_config, head_dim_name):
-                value = getattr(self.pretrained_config, head_dim_name)
-                if value is not None:
-                    head_size = value
-                    break
+        if self.is_encoder_decoder:
+            head_size = getattr(self.pretrained_config, "d_kv", None)
+            if head_size is None:
+                d_model = getattr(self.pretrained_config, "d_model", None)
+                if d_model is not None:
+                    config_num_heads = self.pretrained_config.num_attention_heads
+                    if d_model % config_num_heads != 0:
+                        raise ValueError(
+                            f"d_model ({d_model}) must be divisible by "
+                            f"num_attention_heads ({config_num_heads})")
+                    head_size = d_model // config_num_heads
+        else:
+            head_dim_names = ["head_size", "head_dim"]
+            for head_dim_name in head_dim_names:
+                if hasattr(self.pretrained_config, head_dim_name):
+                    value = getattr(self.pretrained_config, head_dim_name)
+                    if value is not None:
+                        head_size = value
+                        break
 
         if head_size is None:
             assert hidden_size % num_heads == 0, (

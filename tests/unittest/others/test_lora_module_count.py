@@ -46,7 +46,39 @@ def _make_pretrained_config(num_hidden_layers, block_configs=None):
     return cfg
 
 
+def _make_encoder_decoder_config(num_encoder_layers, num_decoder_layers):
+    return SimpleNamespace(
+        is_encoder_decoder=True,
+        num_hidden_layers=num_encoder_layers,
+        num_decoder_layers=num_decoder_layers,
+    )
+
+
 class TestComputeNumLoraModules(unittest.TestCase):
+    def test_encoder_decoder_modules_count_both_stacks(self):
+        """Self-attention and MLP modules appear in both stacks."""
+        config = _make_encoder_decoder_config(6, 8)
+        modules = ["attn_q", "attn_v", "mlp_h_to_4h"]
+        self.assertEqual(_compute_num_lora_modules(config, modules), (6 + 8) * 3)
+
+    def test_encoder_decoder_cross_attention_modules_count_decoder_only(self):
+        """Every cross-attention module is present only in decoder layers."""
+        config = _make_encoder_decoder_config(6, 8)
+        modules = [
+            "cross_attn_qkv",
+            "cross_attn_q",
+            "cross_attn_k",
+            "cross_attn_v",
+            "cross_attn_dense",
+        ]
+        self.assertEqual(_compute_num_lora_modules(config, modules), 8 * 5)
+
+    def test_encoder_decoder_mixed_module_count(self):
+        config = _make_encoder_decoder_config(6, 8)
+        modules = ["attn_q", "mlp_h_to_4h", "cross_attn_q", "cross_attn_dense"]
+        expected = (6 + 8) * 2 + 8 * 2
+        self.assertEqual(_compute_num_lora_modules(config, modules), expected)
+
     def test_uniform_model_no_block_configs(self):
         """Standard model without block_configs uses num_layers x num_modules."""
         config = _make_pretrained_config(32)

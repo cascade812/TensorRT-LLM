@@ -196,6 +196,14 @@ def validate_encoder_decoder_tp_scope(model_config: ModelConfig) -> None:
             f"attn_backend='{model_config.attn_backend}'.")
 
 
+def validate_encoder_decoder_lora_support(model_config: ModelConfig) -> None:
+    """Reject encoder-decoder LoRA until its compute paths are implemented."""
+    if model_config.is_encoder_decoder and model_config.lora_config is not None:
+        raise NotImplementedError(
+            "LoRA is not supported for encoder-decoder models in the PyTorch "
+            "backend yet. Remove lora_config to run the model without LoRA.")
+
+
 def initialize_dummy_weights(
     model: torch.nn.Module,
     low: float = -1e-3,
@@ -1438,6 +1446,7 @@ class ModelLoader:
                 f"AllReduce pre-allocation will be skipped.")
 
         validate_encoder_decoder_tp_scope(config)
+        validate_encoder_decoder_lora_support(config)
         validate_encoder_decoder_kv_cache_config(config,
                                                  self.llm_args.kv_cache_config)
         validate_and_set_kv_cache_quant(config,

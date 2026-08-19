@@ -4,11 +4,13 @@ import types
 
 import pytest
 import torch
+from transformers import BartConfig, T5Config, WhisperConfig
 
 from tensorrt_llm._torch.model_config import _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT, ModelConfig
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     validate_and_set_kv_cache_quant,
     validate_encoder_decoder_kv_cache_config,
+    validate_encoder_decoder_lora_support,
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -103,6 +105,94 @@ def test_get_bindings_model_config_attention_dp_attn_tp_override(
     # tp_size-dependent value (uses mapping.tp_size, not attn_tp_size).
     assert bindings_cfg.mlp_hidden_size == ceil_div(cfg.intermediate_size, mapping.tp_size)
     assert bindings_cfg.tokens_per_block == tokens_per_block
+
+
+@pytest.mark.parametrize(
+    "pretrained_config,expected_mlp_hidden_size,expected_head_size,expected_lora_layers",
+    [
+        pytest.param(
+            T5Config(
+                architectures=["T5ForConditionalGeneration"],
+                d_model=512,
+                d_kv=64,
+                d_ff=1024,
+                num_heads=6,
+                num_layers=8,
+                num_decoder_layers=4,
+                dtype=torch.float16,
+            ),
+            1024,
+            64,
+            12,
+            id="flan-t5-small",
+        ),
+        pytest.param(
+            BartConfig(
+                architectures=["BartForConditionalGeneration"],
+                d_model=768,
+                encoder_attention_heads=12,
+                decoder_attention_heads=12,
+                encoder_ffn_dim=3072,
+                decoder_ffn_dim=3072,
+                encoder_layers=6,
+                decoder_layers=7,
+                dtype=torch.float16,
+            ),
+            3072,
+            64,
+            13,
+            id="bart",
+        ),
+        pytest.param(
+            WhisperConfig(
+                architectures=["WhisperForConditionalGeneration"],
+                d_model=384,
+                encoder_attention_heads=6,
+                decoder_attention_heads=6,
+                encoder_ffn_dim=1536,
+                decoder_ffn_dim=1536,
+                encoder_layers=4,
+                decoder_layers=6,
+                dtype=torch.float16,
+            ),
+            1536,
+            64,
+            10,
+            id="whisper",
+        ),
+    ],
+)
+def test_get_bindings_model_config_encoder_decoder_dimensions(
+    pretrained_config,
+    expected_mlp_hidden_size,
+    expected_head_size,
+    expected_lora_layers,
+):
+    model_config = ModelConfig(pretrained_config=pretrained_config)
+
+    bindings_cfg = model_config.get_bindings_model_config(tokens_per_block=32)
+
+    assert bindings_cfg.mlp_hidden_size == expected_mlp_hidden_size
+    assert bindings_cfg.size_per_head == expected_head_size
+    assert bindings_cfg.num_lora_layers() == expected_lora_layers
+
+
+def test_get_bindings_model_config_rejects_asymmetric_encoder_decoder_ffn():
+    pretrained_config = BartConfig(
+        architectures=["BartForConditionalGeneration"],
+        d_model=768,
+        encoder_attention_heads=12,
+        decoder_attention_heads=12,
+        encoder_ffn_dim=3072,
+        decoder_ffn_dim=4096,
+        encoder_layers=6,
+        decoder_layers=6,
+        dtype=torch.float16,
+    )
+    model_config = ModelConfig(pretrained_config=pretrained_config)
+
+    with pytest.raises(ValueError, match="Encoder and decoder FFN dimensions must match"):
+        model_config.get_bindings_model_config(tokens_per_block=32)
 
 
 def _make_model_config_with_kv_quant(kv_cache_quant_algo):
@@ -239,6 +329,19 @@ def test_model_config_sets_is_encoder_decoder_from_pretrained_config():
     )
 
     assert model_config.is_encoder_decoder is True
+
+
+def test_validate_encoder_decoder_lora_support_rejects_lora():
+    model_config = ModelConfig(
+        pretrained_config=make_pretrained_config(
+            head_dim=4,
+            is_encoder_decoder=True,
+        ),
+        lora_config=object(),
+    )
+
+    with pytest.raises(NotImplementedError, match="LoRA is not supported for encoder-decoder"):
+        validate_encoder_decoder_lora_support(model_config)
 
 
 def test_validate_encoder_decoder_kv_cache_config_accepts_v1_enc_dec():
