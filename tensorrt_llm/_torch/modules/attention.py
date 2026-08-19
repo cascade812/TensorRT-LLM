@@ -394,6 +394,7 @@ class Attention(nn.Module):
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
         rope_fusion: Optional[bool] = None,
         layer_idx: Optional[int] = None,
+        lora_layer_idx: Optional[int] = None,
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
@@ -418,6 +419,7 @@ class Attention(nn.Module):
             pos_embd_params (Optional[PositionalEmbeddingParams]): The positional embedding parameters.
             rope_fusion (Optional[bool]): Whether to fuse RoPE into the attention OP and skip applying unfused RoPE. If None, whether to fuse is decided by the capability of the attention backend.
             layer_idx (Optional[int]): The layer index.
+            lora_layer_idx (Optional[int]): The layer index used for LoRA lookups. Defaults to layer_idx.
             dtype (torch.dtype): The data type.
             dense_bias (Optional[bool]): Whether to use bias in the output projection layer.
             config (Optional[ModelConfig]): The model configuration.
@@ -429,6 +431,8 @@ class Attention(nn.Module):
         """
         super().__init__()
         self.layer_idx = layer_idx
+        self.lora_layer_idx = (layer_idx
+                               if lora_layer_idx is None else lora_layer_idx)
         self.layer_idx_str = str(layer_idx)
 
         self.register_to_config = False
@@ -1052,12 +1056,12 @@ class Attention(nn.Module):
 
         if bool(lora_params):
             qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
-                                              self.layer_idx)
+                                              self.lora_layer_idx)
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
             qkv_lora = self.fused_qkv_lora(hidden_states, lora_params,
-                                           self.layer_idx)
+                                           self.lora_layer_idx)
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
@@ -1114,11 +1118,9 @@ class Attention(nn.Module):
             if sparse_output is not None:
                 return sparse_output
 
-        attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
-                                                  attn_metadata,
-                                                  all_reduce_params,
-                                                  self.mapping, self.mapping_o,
-                                                  self.layer_idx, lora_params)
+        attn_output = _helix_cp_output_projection(
+            self.o_proj, attn_output, attn_metadata, all_reduce_params,
+            self.mapping, self.mapping_o, self.lora_layer_idx, lora_params)
         return attn_output
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],

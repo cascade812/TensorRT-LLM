@@ -31,6 +31,7 @@ class GatedMLP(nn.Module):
         overridden_tp_size: Optional[int] = None,
         reduce_output: bool = True,
         layer_idx: Optional[int] = None,
+        lora_layer_idx: Optional[int] = None,
         use_cute_dsl_blockscaling_mm: bool = False,
         disable_deep_gemm: bool = False,
         use_custom_cublas_mm: bool = False,
@@ -42,6 +43,8 @@ class GatedMLP(nn.Module):
 
         super().__init__()
         self.layer_idx = layer_idx
+        self.lora_layer_idx = (layer_idx
+                               if lora_layer_idx is None else lora_layer_idx)
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.activation = activation
@@ -347,7 +350,7 @@ class GatedMLP(nn.Module):
         lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         assert lora_params is not None
-        assert self.layer_idx is not None, "layer_idx is required for lora"
+        assert self.lora_layer_idx is not None, "layer_idx is required for lora"
         if self._uneven_tp_blocks_lora:
             raise NotImplementedError(
                 "LoRA is not supported with uneven TP for GatedMLP "
@@ -355,12 +358,13 @@ class GatedMLP(nn.Module):
 
         h1 = self.gate_up_proj(x)
 
-        h1_lora = self.splitted_gate_up_lora(x, lora_params, self.layer_idx)
+        h1_lora = self.splitted_gate_up_lora(x, lora_params,
+                                             self.lora_layer_idx)
 
         if h1_lora is not None:
             h1 = h1 + h1_lora
 
-        h1_lora = self.fused_gate_up_lora(x, lora_params, self.layer_idx)
+        h1_lora = self.fused_gate_up_lora(x, lora_params, self.lora_layer_idx)
         if h1_lora is not None:
             h1 = h1 + h1_lora
 
@@ -368,6 +372,6 @@ class GatedMLP(nn.Module):
         output = self.down_proj(h2,
                                 all_reduce_params=final_all_reduce_params,
                                 lora_params=lora_params,
-                                layer_idx=self.layer_idx)
+                                layer_idx=self.lora_layer_idx)
 
         return output

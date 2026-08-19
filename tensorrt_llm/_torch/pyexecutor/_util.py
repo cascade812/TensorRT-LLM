@@ -2717,9 +2717,11 @@ def create_py_executor_instance(
         # dataclass to avoid ad-hoc getattr + TP-division blocks per model type.
         from tensorrt_llm.bindings import LoraModule
 
+        pretrained_config = model_engine.model.model_config.pretrained_config
+
         if len(lora_config.lora_dir) == 1:
             # Route to appropriate loader based on checkpoint source
-            load_torch_lora(lora_config)
+            load_torch_lora(lora_config, pretrained_config)
         else:
             assert len(lora_config.lora_target_modules
                        ) >= 1, "Expecting at least one lora target module"
@@ -2742,8 +2744,6 @@ def create_py_executor_instance(
         else:
             # all layers have the same number of KV heads
             num_kv_attention_heads = num_kv_attention_heads_per_layer[0]
-
-        pretrained_config = model_engine.model.model_config.pretrained_config
 
         # Derive shared expert intermediate size from the LoRA adapter
         # weights, which are the source of truth for dimension validation.
@@ -2851,11 +2851,14 @@ def create_py_executor_instance(
             world_config=world_config,
             execution_stream=execution_stream,
             lora_target_modules=target_modules,
+            pretrained_config=pretrained_config,
         )
         resources[ResourceManagerType.PEFT_CACHE_MANAGER] = peft_cache_manager
         model_engine.set_lora_model_config(
-            target_modules, lora_config.trtllm_modules_to_hf_modules,
-            lora_config.swap_gate_up_proj_lora_b_weight)
+            target_modules,
+            lora_config.trtllm_modules_to_hf_modules,
+            lora_config.swap_gate_up_proj_lora_b_weight,
+            pretrained_config=pretrained_config)
         if isinstance(model_engine, PyTorchModelEngine):
             model_engine._init_cuda_graph_lora_manager(lora_config)
 

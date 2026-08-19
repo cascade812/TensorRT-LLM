@@ -2693,7 +2693,8 @@ class PeftCacheManager(BaseResourceManager):
                  model_config: ModelConfigCpp,
                  world_config: WorldConfig | None = None,
                  execution_stream: Optional[torch.cuda.Stream] = None,
-                 lora_target_modules: Optional[List[str]] = None):
+                 lora_target_modules: Optional[List[str]] = None,
+                 pretrained_config=None):
         import tensorrt_llm.bindings as _tb
 
         peft_cache_config = peft_cache_config._to_pybind()
@@ -2729,12 +2730,23 @@ class PeftCacheManager(BaseResourceManager):
                                         world_config=world_config,
                                         buffer_manager=buffer_manager)
         self._lora_config = lora_config
-        self._lora_model_config = LoraModelConfig(
-            lora_target_modules if lora_target_modules is not None else
-            lora_config.lora_target_modules,
-            lora_config.trtllm_modules_to_hf_modules, model_config.hidden_size,
-            binding_to_str_dtype(model_config.data_type),
-            lora_config.swap_gate_up_proj_lora_b_weight)
+        lora_hidden_size = getattr(
+            pretrained_config,
+            "hidden_size",
+            getattr(pretrained_config, "d_model", model_config.hidden_size),
+        )
+        self._lora_model_config = LoraModelConfig.from_pretrained_config(
+            lora_target_modules=(lora_target_modules
+                                 if lora_target_modules is not None else
+                                 lora_config.lora_target_modules),
+            trtllm_modules_to_hf_modules=(
+                lora_config.trtllm_modules_to_hf_modules),
+            hidden_size=lora_hidden_size,
+            dtype=binding_to_str_dtype(model_config.data_type),
+            swap_gate_up_proj_lora_b_weight=(
+                lora_config.swap_gate_up_proj_lora_b_weight),
+            pretrained_config=pretrained_config,
+        )
         mapping = Mapping(
             world_size=world_config.size,
             rank=world_config.rank,

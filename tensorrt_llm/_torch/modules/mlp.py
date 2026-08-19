@@ -26,6 +26,7 @@ class MLP(nn.Module):
         dtype: Optional[torch.dtype] = None,
         config: Optional[ModelConfig] = None,
         layer_idx: Optional[int] = None,
+        lora_layer_idx: Optional[int] = None,
         reduce_output: bool = True,
         overridden_tp_size: Optional[int] = None,
         lora_up_module_type: LoraModuleType = LoraModuleType.MLP_H_TO_4H,
@@ -34,6 +35,8 @@ class MLP(nn.Module):
     ):
         super().__init__()
         self.layer_idx = layer_idx
+        self.lora_layer_idx = (layer_idx
+                               if lora_layer_idx is None else lora_layer_idx)
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.activation = activation
@@ -270,14 +273,14 @@ class MLP(nn.Module):
 
         x_up = self.up_proj(x)
 
-        assert self.layer_idx is not None, "layer_idx is required for lora"
-        x_up_lora = self.up_lora(x, lora_params, self.layer_idx)
+        assert self.lora_layer_idx is not None, "layer_idx is required for lora"
+        x_up_lora = self.up_lora(x, lora_params, self.lora_layer_idx)
         if x_up_lora is not None:
             x_up = x_up + x_up_lora
 
         x_act = self.activation(x_up)
         x_down = self.down_proj(x_act,
                                 lora_params=lora_params,
-                                layer_idx=self.layer_idx)
+                                layer_idx=self.lora_layer_idx)
 
         return x_down

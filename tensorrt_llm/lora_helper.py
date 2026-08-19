@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -65,6 +65,46 @@ def get_default_trtllm_modules_to_hf_modules():
         "moe_latent_fc1": "fc1_latent_proj",
         "moe_latent_fc2": "fc2_latent_proj",
     }
+
+
+def get_enc_dec_trtllm_modules_to_hf_modules(model_type: str) -> Dict[str, str]:
+    """Return the qualified HF module mapping for an encoder-decoder model.
+
+    Encoder and decoder self-attention projections have the same leaf names,
+    while decoder cross-attention projections use a second set of those names.
+    Qualified names keep those modules distinct during adapter conversion.
+    """
+    normalized_model_type = model_type.lower().replace("-", "_")
+    if normalized_model_type in {"t5", "mt5", "umt5", "longt5"}:
+        return {
+            "attn_q": "SelfAttention.q",
+            "attn_k": "SelfAttention.k",
+            "attn_v": "SelfAttention.v",
+            "attn_dense": "SelfAttention.o",
+            "mlp_h_to_4h": "DenseReluDense.wi",
+            "mlp_gate": "DenseReluDense.wi_1",
+            "mlp_4h_to_h": "DenseReluDense.wo",
+            "cross_attn_q": "EncDecAttention.q",
+            "cross_attn_k": "EncDecAttention.k",
+            "cross_attn_v": "EncDecAttention.v",
+            "cross_attn_dense": "EncDecAttention.o",
+        }
+    if normalized_model_type in {"bart", "mbart", "whisper"}:
+        return {
+            "attn_q": "self_attn.q_proj",
+            "attn_k": "self_attn.k_proj",
+            "attn_v": "self_attn.v_proj",
+            "attn_dense": "self_attn.out_proj",
+            "mlp_h_to_4h": "fc1",
+            "mlp_4h_to_h": "fc2",
+            "cross_attn_q": "encoder_attn.q_proj",
+            "cross_attn_k": "encoder_attn.k_proj",
+            "cross_attn_v": "encoder_attn.v_proj",
+            "cross_attn_dense": "encoder_attn.out_proj",
+        }
+    raise ValueError(
+        f"Encoder-decoder LoRA loading does not support model type '{model_type}'. "
+        "Supported model types are T5, BART, and Whisper.")
 
 
 class LoraConfig(StrictBaseModel):

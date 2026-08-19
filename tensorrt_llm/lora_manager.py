@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import io
 import itertools
 import json
@@ -21,6 +36,7 @@ from ._utils import release_gc, str_dtype_to_torch, torch_to_numpy
 from .lora_helper import (
     LoraConfig,
     get_default_trtllm_modules_to_hf_modules,
+    get_enc_dec_trtllm_modules_to_hf_modules,
     get_missing_qkv_modules_from_lora_modules,
 )
 from .mapping import Mapping
@@ -105,6 +121,127 @@ def get_all_nemo_lora_weights(
 HF_LORA_PATTERN = re.compile(
     r"(.*)\.(\d+)\.(\w+)\.(\w+|\w+\.\w+|(\w+)\.(\d+)\.(\w+))\.(?:lora_(?:(A|B)\.weight|(magnitude)_vector)|weight_(m_wdecomp).weight)"
 )
+
+_ENC_DEC_LORA_SUFFIX = (
+    r"(?:lora_(?:(A|B)\.weight|(magnitude)_vector)|"
+    r"weight_(m_wdecomp)\.weight)"
+)
+_T5_LORA_PATTERN = re.compile(
+    r".*\.(encoder|decoder)\.block\.(\d+)\.layer\.(\d+)\."
+    r"(SelfAttention|EncDecAttention|DenseReluDense)\."
+    r"(q|k|v|o|wi|wi_0|wi_1|wo)\." + _ENC_DEC_LORA_SUFFIX + r"$"
+)
+_BART_WHISPER_LORA_PATTERN = re.compile(
+    r".*\.(encoder|decoder)\.layers\.(\d+)\."
+    r"(?:(self_attn|encoder_attn)\.)?"
+    r"(q_proj|k_proj|v_proj|out_proj|fc1|fc2)\." + _ENC_DEC_LORA_SUFFIX + r"$"
+)
+
+
+def _normalize_enc_dec_model_type(model_type: str) -> str:
+    normalized_model_type = model_type.lower().replace("-", "_")
+    if normalized_model_type in {"t5", "mt5", "umt5", "longt5"}:
+        return "t5"
+    if normalized_model_type in {"bart", "mbart"}:
+        return "bart"
+    if normalized_model_type == "whisper":
+        return "whisper"
+    raise ValueError(
+        f"Encoder-decoder LoRA loading does not support model type '{model_type}'. "
+        "Supported model types are T5, BART, and Whisper."
+    )
+
+
+def _parse_enc_dec_hf_lora_key(key: str, model_type: str) -> Tuple[str, int, str, str]:
+    """Parse an encoder-decoder HF PEFT key.
+
+    Returns ``(component, local_layer_idx, qualified_module, direction)``.
+    The T5 pattern deliberately captures ``block.{i}`` as the transformer
+    layer and ignores ``layer.{j}``, which is only the T5 sublayer index.
+    """
+    normalized_model_type = _normalize_enc_dec_model_type(model_type)
+    pattern = _T5_LORA_PATTERN if normalized_model_type == "t5" else _BART_WHISPER_LORA_PATTERN
+    match = pattern.match(key)
+    if match is None:
+        raise KeyError(
+            f"Unsupported encoder-decoder LoRA weight '{key}' for model type "
+            f"'{model_type}'. Every adapter tensor must map to a supported "
+            "encoder, decoder, or cross-attention module."
+        )
+
+    component = match.group(1)
+    layer_idx = int(match.group(2))
+    if normalized_model_type == "t5":
+        module_prefix = match.group(4)
+        module_name = match.group(5)
+        direction_group = 6
+    else:
+        module_prefix = match.group(3)
+        module_name = match.group(4)
+        direction_group = 5
+
+    if module_prefix in {"EncDecAttention", "encoder_attn"} and component != "decoder":
+        raise KeyError(
+            f"Unsupported cross-attention LoRA weight '{key}': cross-attention "
+            "modules must belong to the decoder."
+        )
+    if module_prefix == "DenseReluDense" and module_name == "wi_0":
+        module_name = "wi"
+    hf_module = f"{module_prefix}.{module_name}" if module_prefix is not None else module_name
+    direction = "in" if match.group(direction_group) == "A" else "out"
+    if match.group(direction_group) is None:
+        direction = "magnitude"
+    return component, layer_idx, hf_module, direction
+
+
+def get_all_hf_lora_weights_enc_dec(
+    lora_weights: Dict[str, torch.Tensor],
+    hf_modules: Set[str],
+    model_type: str,
+    num_encoder_layers: int,
+    num_decoder_layers: Optional[int] = None,
+) -> Dict[int, Dict[str, Dict[str, torch.Tensor]]]:
+    """Organize encoder-decoder HF weights in the unified LoRA layer space."""
+    all_weights = defaultdict(lambda: defaultdict(dict))
+    for component, layer_offset in (("encoder", 0), ("decoder", num_encoder_layers)):
+        for key, weights in lora_weights.items():
+            key_component, layer_idx, hf_module, direction = _parse_enc_dec_hf_lora_key(
+                key, model_type
+            )
+            if key_component != component:
+                continue
+            component_num_layers = (
+                num_encoder_layers if component == "encoder" else num_decoder_layers
+            )
+            if component_num_layers is not None and not (0 <= layer_idx < component_num_layers):
+                raise ValueError(
+                    f"LoRA weight '{key}' refers to {component} layer {layer_idx}, "
+                    f"but the model has {component_num_layers} {component} layers."
+                )
+            if hf_module not in hf_modules:
+                raise KeyError(
+                    f"Unsupported encoder-decoder LoRA module '{hf_module}' in "
+                    f"weight '{key}' for model type '{model_type}'."
+                )
+            global_layer_idx = layer_offset + layer_idx
+            all_weights[global_layer_idx][hf_module][direction] = weights
+    return all_weights
+
+
+def get_hf_target_modules_enc_dec(
+    lora_weights: Dict[str, torch.Tensor], hf_modules: Set[str], model_type: str
+) -> Set[str]:
+    """Return every supported HF module targeted by an enc-dec adapter."""
+    target_modules = set()
+    for key in lora_weights:
+        _, _, hf_module, _ = _parse_enc_dec_hf_lora_key(key, model_type)
+        if hf_module not in hf_modules:
+            raise KeyError(
+                f"Unsupported encoder-decoder LoRA module '{hf_module}' in "
+                f"weight '{key}' for model type '{model_type}'."
+            )
+        target_modules.add(hf_module)
+    return target_modules
 
 
 def iterate_hf_lora(
@@ -259,10 +396,90 @@ def norm_dora_magnitude(
 @dataclass
 class LoraModelConfig:
     lora_target_modules: list[str]
-    trtllm_modules_to_hf_modules: dict[str, str]
+    trtllm_modules_to_hf_modules: dict[str, Union[str, List[str]]]
     hidden_size: int
     dtype: str
     swap_gate_up_proj_lora_b_weight: bool = True
+    is_encoder_decoder: bool = False
+    model_type: Optional[str] = None
+    num_encoder_layers: int = 0
+    num_decoder_layers: int = 0
+    num_attention_heads: Optional[int] = None
+    num_key_value_heads: Optional[int] = None
+    head_size: Optional[int] = None
+
+    @classmethod
+    def from_pretrained_config(
+        cls,
+        *,
+        lora_target_modules: list[str],
+        trtllm_modules_to_hf_modules: dict[str, Union[str, List[str]]],
+        hidden_size: int,
+        dtype: str,
+        swap_gate_up_proj_lora_b_weight: bool,
+        pretrained_config=None,
+    ) -> "LoraModelConfig":
+        """Build the internal LoRA metadata needed by the adapter loader."""
+        if hidden_size is None:
+            hidden_size = getattr(pretrained_config, "d_model", None)
+        if hidden_size is None:
+            raise ValueError("Failed to infer the hidden size for LoRA loading")
+        is_encoder_decoder = bool(getattr(pretrained_config, "is_encoder_decoder", False))
+        num_encoder_layers = 0
+        num_decoder_layers = 0
+        if is_encoder_decoder:
+            num_encoder_layers = getattr(pretrained_config, "encoder_layers", None)
+            if num_encoder_layers is None:
+                num_encoder_layers = getattr(pretrained_config, "num_layers", None)
+            if num_encoder_layers is None:
+                num_encoder_layers = getattr(pretrained_config, "num_hidden_layers", None)
+            num_decoder_layers = getattr(pretrained_config, "decoder_layers", None)
+            if num_decoder_layers is None:
+                num_decoder_layers = getattr(pretrained_config, "num_decoder_layers", None)
+            if num_encoder_layers is None or num_decoder_layers is None:
+                raise ValueError(
+                    "Failed to infer encoder and decoder layer counts for "
+                    f"encoder-decoder LoRA model '{getattr(pretrained_config, 'model_type', 'unknown')}'."
+                )
+
+        num_attention_heads = getattr(pretrained_config, "num_attention_heads", None)
+        num_key_value_heads = getattr(pretrained_config, "num_key_value_heads", num_attention_heads)
+        if isinstance(num_key_value_heads, (list, tuple)):
+            num_key_value_heads = max(num_key_value_heads)
+        head_size = getattr(pretrained_config, "d_kv", None)
+        if head_size is None:
+            head_size = getattr(pretrained_config, "head_dim", None)
+        if (
+            head_size is None
+            and num_attention_heads is not None
+            and hidden_size % num_attention_heads == 0
+        ):
+            head_size = hidden_size // num_attention_heads
+
+        return cls(
+            lora_target_modules=lora_target_modules,
+            trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
+            hidden_size=hidden_size,
+            dtype=dtype,
+            swap_gate_up_proj_lora_b_weight=swap_gate_up_proj_lora_b_weight,
+            is_encoder_decoder=is_encoder_decoder,
+            model_type=getattr(pretrained_config, "model_type", None),
+            num_encoder_layers=num_encoder_layers,
+            num_decoder_layers=num_decoder_layers,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
+            head_size=head_size,
+        )
+
+    def attention_output_size(self, lora_module: str) -> int:
+        """Return the unsharded output width for a Q, K, or V projection."""
+        if self.num_attention_heads is None or self.head_size is None:
+            return self.hidden_size
+        if lora_module.endswith(("_k", "_v")):
+            num_heads = self.num_key_value_heads or self.num_attention_heads
+        else:
+            num_heads = self.num_attention_heads
+        return num_heads * self.head_size
 
 
 class HfLoraLoader:
@@ -272,6 +489,7 @@ class HfLoraLoader:
         self.lm_head = None
         self.embed_tokens = None
         self.vocab_size = 0
+        self.modules_to_save = []
 
         if len(lora_dirs) == 0:
             return
@@ -290,28 +508,42 @@ class HfLoraLoader:
         lora_dir = lora_dirs[0]
         with open(f"{lora_dir}/adapter_config.json") as f:
             adapter_config = json.load(f)
+        self.modules_to_save = adapter_config.get("modules_to_save") or []
 
         model_path = get_model_path(lora_dir, "adapter_model")
         if model_path is None:
             raise ValueError(f"adapter_model file does not exist in {lora_dir}")
         lora_weight = load_state_dict(model_path)
         self.lora_weight = lora_weight
-        if adapter_config.get("modules_to_save") is not None:
-            if "lm_head" in adapter_config["modules_to_save"]:
+        if self.modules_to_save:
+            if "lm_head" in self.modules_to_save:
                 self.lm_head = lora_weight["base_model.model.lm_head.weight"]
                 self.vocab_size = self.lm_head.shape[0]
 
-            if "embed_tokens" in adapter_config["modules_to_save"]:
+            if "embed_tokens" in self.modules_to_save:
                 self.embed_tokens = lora_weight["base_model.model.model.embed_tokens.weight"]
 
-    def get_target_modules(self, trtllm_modules_to_hf_modules):
+    def get_target_modules(
+        self,
+        trtllm_modules_to_hf_modules,
+        *,
+        is_encoder_decoder: bool = False,
+        model_type: Optional[str] = None,
+    ):
         hf_modules_to_trtllm_modules = invert_module_mapping(trtllm_modules_to_hf_modules)
         lora_target_modules = set()
         if self.is_valid:
-            hf_target_modules = get_hf_target_modules(
-                self.lora_weight,
-                hf_modules=set(hf_modules_to_trtllm_modules.keys()),
-            )
+            hf_modules = set(hf_modules_to_trtllm_modules.keys())
+            if is_encoder_decoder:
+                assert model_type is not None
+                hf_target_modules = get_hf_target_modules_enc_dec(
+                    self.lora_weight, hf_modules=hf_modules, model_type=model_type
+                )
+            else:
+                hf_target_modules = get_hf_target_modules(
+                    self.lora_weight,
+                    hf_modules=hf_modules,
+                )
             for m in hf_target_modules:
                 trtllm_module = hf_modules_to_trtllm_modules[m]
                 lora_target_modules.add(trtllm_module)
@@ -425,13 +657,55 @@ class NemoLoraLoader:
         return self.lora_target_modules
 
 
-def load_torch_hf_lora(lora_config: LoraConfig):
+def load_torch_hf_lora_enc_dec(lora_config: LoraConfig, pretrained_config) -> None:
+    """Populate LoRA configuration from an encoder-decoder HF adapter."""
+    model_type = getattr(pretrained_config, "model_type", None)
+    if model_type is None:
+        raise ValueError("Encoder-decoder LoRA loading requires a model_type")
+
+    standard_mapping = get_enc_dec_trtllm_modules_to_hf_modules(model_type)
+    if lora_config.trtllm_modules_to_hf_modules:
+        standard_mapping.update(lora_config.trtllm_modules_to_hf_modules)
+    lora_config.trtllm_modules_to_hf_modules = standard_mapping
+
+    assert len(lora_config.lora_dir) == 1, "Expecting only a single lora dir"
+    adapter_config_path = Path(lora_config.lora_dir[0]) / "adapter_config.json"
+    with adapter_config_path.open("r") as adapter_config_file:
+        adapter_config = json.load(adapter_config_file)
+    modules_to_save = adapter_config.get("modules_to_save") or []
+    if modules_to_save:
+        raise ValueError(
+            f"Encoder-decoder LoRA does not support modules_to_save; found {modules_to_save}."
+        )
+    lora_loader = HfLoraLoader(lora_config.lora_dir)
+
+    if len(lora_config.lora_target_modules) == 0:
+        lora_config.lora_target_modules = lora_loader.get_target_modules(
+            standard_mapping,
+            is_encoder_decoder=True,
+            model_type=model_type,
+        )
+    if len(lora_config.lora_target_modules) == 0:
+        raise ValueError(
+            "lora_target_modules is empty. Please specify lora_target_modules "
+            "or provide lora_dir to infer lora_target_modules."
+        )
+
+    missing_qkv_modules = LoraManager.get_missing_qkv_modules(lora_config.lora_target_modules)
+    lora_config.lora_target_modules.extend(missing_qkv_modules)
+
+
+def load_torch_hf_lora(lora_config: LoraConfig, pretrained_config=None):
     """Load an HF LoRA checkpoint for the PyTorch workflow.
 
     Populates lora_config (trtllm_modules_to_hf_modules and inferred
     lora_target_modules) from the HF adapter directory. The actual weights are
     loaded later by LoraManager when requests arrive with LoRA UIDs.
     """
+    if getattr(pretrained_config, "is_encoder_decoder", False):
+        load_torch_hf_lora_enc_dec(lora_config, pretrained_config)
+        return
+
     if not lora_config.trtllm_modules_to_hf_modules:
         lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules()
 
@@ -497,7 +771,7 @@ def load_torch_nemo_lora(lora_config: LoraConfig):
         )
 
 
-def load_torch_lora(lora_config: LoraConfig):
+def load_torch_lora(lora_config: LoraConfig, pretrained_config=None):
     """Load LoRA checkpoint for PyTorch workflow.
 
     This function routes to the appropriate loader based on lora_ckpt_source.
@@ -511,7 +785,7 @@ def load_torch_lora(lora_config: LoraConfig):
     if lora_config.lora_ckpt_source == "nemo":
         load_torch_nemo_lora(lora_config)
     elif lora_config.lora_ckpt_source == "hf":
-        load_torch_hf_lora(lora_config)
+        load_torch_hf_lora(lora_config, pretrained_config)
     else:
         raise ValueError(
             f"Unsupported lora_ckpt_source: {lora_config.lora_ckpt_source}. "
@@ -883,6 +1157,13 @@ class LoraManager(object):
         for model_dir in new_model_dirs:
             with open(f"{model_dir}/adapter_config.json", "r") as f:
                 config = json.load(f)
+                if getattr(model_config, "is_encoder_decoder", False) and config.get(
+                    "modules_to_save"
+                ):
+                    raise ValueError(
+                        "Encoder-decoder LoRA does not support modules_to_save; "
+                        f"found {config['modules_to_save']} in {model_dir}."
+                    )
                 lora_hf_configs.append(config)
 
         self.lora_target_modules = model_config.lora_target_modules
@@ -978,9 +1259,38 @@ class LoraManager(object):
             if lora_model is None:
                 raise ValueError(f"Failed to load adapter_model from {model_dir}")
             lora_model = preprocess_lora_weights(lora_model, model_config)
-            all_weights = get_all_hf_lora_weights(lora_model, hf_modules, component)
+            if getattr(model_config, "is_encoder_decoder", False):
+                if component is not None:
+                    raise ValueError(
+                        "The encoder-decoder LoRA loader always loads both components; "
+                        "the component argument is not supported."
+                    )
+                if model_config.model_type is None:
+                    raise ValueError("Encoder-decoder LoRA loading requires the base model type.")
+                all_weights = get_all_hf_lora_weights_enc_dec(
+                    lora_model,
+                    hf_modules,
+                    model_config.model_type,
+                    model_config.num_encoder_layers,
+                    model_config.num_decoder_layers,
+                )
+            else:
+                all_weights = get_all_hf_lora_weights(lora_model, hf_modules, component)
             rank = int(hf_config["r"])
             rs_lora = bool(hf_config.get("use_rslora", False))
+
+            if not all_weights:
+                raise ValueError(
+                    f"No supported LoRA weights were found in adapter directory {model_dir}."
+                )
+            adapter_target_modules = {
+                hf_modules_to_trtllm_modules[hf_module]
+                for layer_weights in all_weights.values()
+                for hf_module in layer_weights
+            }
+            missing_qkv_modules = get_missing_qkv_modules_from_lora_modules(
+                list(adapter_target_modules)
+            )
 
             self._lora_uid_to_low_ranks[uid] = {}
             self._lora_weights_pointers_list[uid] = {}
@@ -989,18 +1299,36 @@ class LoraManager(object):
                 self._lora_uid_to_low_ranks[uid][layer_idx] = {}
                 self._lora_weights_pointers_list[uid][layer_idx] = {}
 
-                for lora_module in self.missing_qkv_modules:
+                for lora_module in missing_qkv_modules:
+                    if (
+                        getattr(model_config, "is_encoder_decoder", False)
+                        and lora_module.startswith("cross_attn_")
+                        and layer_idx < model_config.num_encoder_layers
+                    ):
+                        continue
                     hf_module = model_config.trtllm_modules_to_hf_modules[lora_module]
                     if isinstance(hf_module, list):
                         hf_module = hf_module[0]
+                    attention_output_size = getattr(model_config, "attention_output_size", None)
+                    output_size = (
+                        attention_output_size(lora_module)
+                        if attention_output_size is not None
+                        else model_config.hidden_size
+                    )
                     layer_weights[hf_module] = {
                         "in": torch.zeros(rank, model_config.hidden_size),
-                        "out": torch.zeros(model_config.hidden_size, rank),
+                        "out": torch.zeros(output_size, rank),
                     }
 
                 for hf_module, module_weights in layer_weights.items():
                     lora_module = hf_modules_to_trtllm_modules[hf_module]
                     if lora_module not in self.lora_target_modules:
+                        if getattr(model_config, "is_encoder_decoder", False):
+                            raise ValueError(
+                                f"Encoder-decoder LoRA module '{lora_module}' from "
+                                f"'{hf_module}' is not enabled in target modules "
+                                f"{self.lora_target_modules}."
+                            )
                         warnings.warn(
                             f"LoRA module '{lora_module}' not in target modules {self.lora_target_modules}, skipping."
                         )

@@ -969,13 +969,17 @@ class PyTorchModelEngine(ModelEngine):
     def set_lora_model_config(self,
                               lora_target_modules: list[str],
                               trtllm_modules_to_hf_modules: dict[str, str],
-                              swap_gate_up_proj_lora_b_weight: bool = True):
-        self.lora_model_config = LoraModelConfig(
+                              swap_gate_up_proj_lora_b_weight: bool = True,
+                              pretrained_config=None):
+        hidden_size = getattr(self.model.config, "hidden_size",
+                              getattr(self.model.config, "d_model", None))
+        self.lora_model_config = LoraModelConfig.from_pretrained_config(
             lora_target_modules=lora_target_modules,
             trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
-            hidden_size=self.model.config.hidden_size,
+            hidden_size=hidden_size,
             dtype=torch_dtype_to_str(self.model.config.torch_dtype),
-            swap_gate_up_proj_lora_b_weight=swap_gate_up_proj_lora_b_weight)
+            swap_gate_up_proj_lora_b_weight=swap_gate_up_proj_lora_b_weight,
+            pretrained_config=pretrained_config)
 
     def _init_cuda_graph_lora_manager(self, lora_config: LoraConfig):
         """Initialize CUDA Graph LoRA manager with model configuration."""
