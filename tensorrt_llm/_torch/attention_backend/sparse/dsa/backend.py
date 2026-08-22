@@ -131,7 +131,17 @@ class DSATrtllmAttention(TrtllmAttention):
         )
 
         if is_generation:
-            advance_gather_pipeline(self, topk_indices_global, metadata)
+            offload_staging = advance_gather_pipeline(
+                self, topk_indices, topk_indices_global, metadata
+            )
+            if offload_staging is not None:
+                # This offloaded layer's decode attention reads the staged
+                # host-gathered rows instead of the paged pool: hand the
+                # staging base through the aux-pool seam and return indices
+                # remapped into it (iota for valid rows, -1 for padding).
+                staging_indices, staging_pool_ptr = offload_staging
+                forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = staging_pool_ptr
+                return staging_indices, None
 
         return topk_indices_global, None
 

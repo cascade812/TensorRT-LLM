@@ -20,6 +20,7 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include <limits>
+#include <optional>
 
 namespace th = torch;
 namespace tk = tensorrt_llm::kernels;
@@ -96,8 +97,8 @@ void dsaKvCacheOffloadMirror(th::Tensor const& sourcePool, th::Tensor const& glo
 }
 
 void dsaKvCacheOffloadGather(th::Tensor const& hostPool, th::Tensor const& globalIndices, th::Tensor& output,
-    std::int64_t strideFactor, std::int64_t tokensPerBlock, std::int64_t layerOffset,
-    std::int64_t layerInGroup)
+    std::optional<th::Tensor> remapIndices, std::int64_t strideFactor, std::int64_t tokensPerBlock,
+    std::int64_t layerOffset, std::int64_t layerInGroup)
 {
     validateCommon(hostPool, globalIndices);
     TORCH_CHECK(output.is_cuda() && output.device() == globalIndices.device() && output.scalar_type() == th::kUInt8
@@ -108,14 +109,60 @@ void dsaKvCacheOffloadGather(th::Tensor const& hostPool, th::Tensor const& globa
     TORCH_CHECK(output.size(0) >= globalIndices.numel() && output.size(1) == layerBytes,
         "output must have at least one layer-width row per global index");
     TORCH_CHECK(strideFactor > 0 && tokensPerBlock > 0, "stride_factor and tokens_per_block must be positive");
+    std::int32_t* remapPtr = nullptr;
+    if (remapIndices.has_value())
+    {
+        validateCudaInt32(remapIndices.value(), globalIndices.device(), "remap_indices");
+        TORCH_CHECK(remapIndices.value().numel() >= globalIndices.numel(),
+            "remap_indices must have at least one entry per global index");
+        remapPtr = remapIndices.value().data_ptr<std::int32_t>();
+    }
 
     c10::cuda::CUDAGuard const deviceGuard(globalIndices.device());
     auto const stream = at::cuda::getCurrentCUDAStream(globalIndices.get_device()).stream();
     tk::invokeDsaKvCacheOffloadGather(hostPool.data_ptr<std::uint8_t>(), globalIndices.data_ptr<std::int32_t>(),
-        output.data_ptr<std::uint8_t>(), globalIndices.numel(), hostPool.size(0),
+        output.data_ptr<std::uint8_t>(), remapPtr, globalIndices.numel(), hostPool.size(0),
         static_cast<std::int32_t>(hostPool.size(1)), static_cast<std::int32_t>(layerBytes),
         static_cast<std::int32_t>(layerInGroup), static_cast<std::int32_t>(strideFactor),
         static_cast<std::int32_t>(tokensPerBlock), static_cast<std::int32_t>(layerOffset), stream);
+}
+
+void dsaKvCacheOffloadPatch(th::Tensor const& sourcePool, th::Tensor const& topkLocal,
+    th::Tensor const& globalIndices, th::Tensor const& kvLens, th::Tensor const& reqIdx, th::Tensor& staging,
+    std::int64_t qLenPerReq)
+{
+    TORCH_CHECK(globalIndices.is_cuda() && globalIndices.scalar_type() == th::kInt32 && globalIndices.is_contiguous(),
+        "global_indices must be a contiguous CUDA int32 tensor");
+    TORCH_CHECK(sourcePool.is_cuda() && sourcePool.device() == globalIndices.device() && sourcePool.element_size() == 1
+            && sourcePool.is_contiguous(),
+        "source_pool must be a contiguous one-byte CUDA tensor on the global_indices device");
+    validateCudaInt32(topkLocal, globalIndices.device(), "topk_local");
+    validateCudaInt32(kvLens, globalIndices.device(), "kv_lens");
+    validateCudaInt32(reqIdx, globalIndices.device(), "req_idx");
+    TORCH_CHECK(staging.is_cuda() && staging.device() == globalIndices.device()
+            && staging.scalar_type() == th::kUInt8 && staging.dim() == 2 && staging.is_contiguous(),
+        "staging must be a contiguous rank-2 CUDA uint8 tensor on the global_indices device");
+    TORCH_CHECK(topkLocal.dim() == 2 && topkLocal.numel() == globalIndices.numel(),
+        "topk_local must be [num_tokens, rows_per_token] matching global_indices");
+    std::int64_t const numTokens = topkLocal.size(0);
+    std::int64_t const rowsPerToken = topkLocal.size(1);
+    TORCH_CHECK(rowsPerToken > 0 && rowsPerToken <= std::numeric_limits<std::int32_t>::max(),
+        "rows_per_token must be a positive int32 value");
+    TORCH_CHECK(reqIdx.numel() >= numTokens, "req_idx must have one entry per token");
+    TORCH_CHECK(qLenPerReq > 0, "q_len_per_req must be positive");
+    std::int64_t const layerBytes = staging.size(1);
+    TORCH_CHECK(staging.size(0) >= globalIndices.numel(), "staging must have one row per global index");
+    TORCH_CHECK(sourcePool.numel() % layerBytes == 0, "source_pool size must be a multiple of layer bytes");
+    TORCH_CHECK(kvLens.numel() <= std::numeric_limits<std::int32_t>::max(), "kv_lens exceeds int32");
+
+    c10::cuda::CUDAGuard const deviceGuard(globalIndices.device());
+    auto const stream = at::cuda::getCurrentCUDAStream(globalIndices.get_device()).stream();
+    tk::invokeDsaKvCacheOffloadPatch(reinterpret_cast<std::uint8_t const*>(sourcePool.data_ptr()),
+        topkLocal.data_ptr<std::int32_t>(), globalIndices.data_ptr<std::int32_t>(),
+        kvLens.data_ptr<std::int32_t>(), reqIdx.data_ptr<std::int32_t>(), staging.data_ptr<std::uint8_t>(),
+        globalIndices.numel(), sourcePool.numel() / layerBytes, static_cast<std::int32_t>(rowsPerToken),
+        static_cast<std::int32_t>(kvLens.numel()), static_cast<std::int32_t>(qLenPerReq),
+        static_cast<std::int32_t>(layerBytes), stream);
 }
 
 void dsaKvCacheOffloadIncrementalGather(th::Tensor const& hostPool, th::Tensor const& globalIndices,
@@ -203,7 +250,11 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int layer_in_group) -> ()");
     m.def(
         "dsa_kv_cache_offload_gather(Tensor host_pool, Tensor global_indices, Tensor(a!) output, "
-        "int stride_factor, int tokens_per_block, int layer_offset, int layer_in_group) -> ()");
+        "Tensor(b!)? remap_indices, int stride_factor, int tokens_per_block, int layer_offset, "
+        "int layer_in_group) -> ()");
+    m.def(
+        "dsa_kv_cache_offload_patch(Tensor source_pool, Tensor topk_local, Tensor global_indices, "
+        "Tensor kv_lens, Tensor req_idx, Tensor(a!) staging, int q_len_per_req) -> ()");
     m.def(
         "dsa_kv_cache_offload_incremental_gather(Tensor host_pool, Tensor global_indices, Tensor host_versions, "
         "Tensor(a!) cache_keys, Tensor(b!) cache_versions, Tensor(c!) row_to_slot, Tensor(d!) epoch, "
@@ -217,6 +268,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("dsa_kv_cache_offload_mirror", &tensorrt_llm::torch_ext::dsaKvCacheOffloadMirror);
     m.impl("dsa_kv_cache_offload_gather", &tensorrt_llm::torch_ext::dsaKvCacheOffloadGather);
+    m.impl("dsa_kv_cache_offload_patch", &tensorrt_llm::torch_ext::dsaKvCacheOffloadPatch);
     m.impl("dsa_kv_cache_offload_incremental_gather",
         &tensorrt_llm::torch_ext::dsaKvCacheOffloadIncrementalGather);
 }

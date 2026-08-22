@@ -32,9 +32,14 @@ void invokeDsaKvCacheOffloadMirror(std::uint8_t const* sourcePool, std::int32_t 
     std::int32_t tokensPerBlock, std::int32_t layerOffset, cudaStream_t stream);
 
 void invokeDsaKvCacheOffloadGather(std::uint8_t const* hostPool, std::int32_t const* globalIndices,
-    std::uint8_t* output, std::int64_t numRows, std::int64_t numHostRows, std::int32_t hostRowBytes,
-    std::int32_t layerBytes, std::int32_t layerInGroup, std::int32_t strideFactor, std::int32_t tokensPerBlock,
-    std::int32_t layerOffset, cudaStream_t stream);
+    std::uint8_t* output, std::int32_t* remapIndices, std::int64_t numRows, std::int64_t numHostRows,
+    std::int32_t hostRowBytes, std::int32_t layerBytes, std::int32_t layerInGroup, std::int32_t strideFactor,
+    std::int32_t tokensPerBlock, std::int32_t layerOffset, cudaStream_t stream);
+
+void invokeDsaKvCacheOffloadPatch(std::uint8_t const* sourcePool, std::int32_t const* topkLocal,
+    std::int32_t const* globalIndices, std::int32_t const* kvLens, std::int32_t const* reqIdx, std::uint8_t* staging,
+    std::int64_t numRows, std::int64_t numPoolRows, std::int32_t rowsPerToken, std::int32_t numSeqs,
+    std::int32_t qLenPerReq, std::int32_t layerBytes, cudaStream_t stream);
 
 void invokeDsaKvCacheOffloadIncrementalGather(std::uint8_t const* hostPool,
     std::int32_t const* globalIndices, std::int32_t const* hostVersions, std::int32_t* cacheKeys,

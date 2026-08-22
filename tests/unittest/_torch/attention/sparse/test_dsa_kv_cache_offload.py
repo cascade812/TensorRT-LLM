@@ -14,6 +14,7 @@
 # limitations under the License.
 """Tests for the experimental DSA host-cache transfer operators."""
 
+import pytest
 import torch
 
 import tensorrt_llm  # noqa: F401
@@ -197,10 +198,12 @@ def test_dsa_kv_cache_offload_mirror_and_gather():
             dtype=torch.uint8,
             device="cuda",
         )
+        remap = torch.full((len(coordinates) + 1,), -7, dtype=torch.int32, device="cuda")
         torch.ops.trtllm.dsa_kv_cache_offload_gather(
             host_pool,
             full_indices,
             output,
+            remap,
             _STRIDE_FACTOR,
             _TOKENS_PER_BLOCK,
             _FULL_LAYER,
@@ -210,7 +213,35 @@ def test_dsa_kv_cache_offload_mirror_and_gather():
         expected = _expected_layer_rows(source, coordinates, layer)
         torch.testing.assert_close(output[:-1], expected)
         torch.testing.assert_close(output[-1], torch.zeros_like(output[-1]))
+        # Valid rows remap to their staging position; the padded -1 stays -1.
+        assert remap.tolist() == [0, 1, -1]
         assert host_versions[:, layer_in_group].sum().item() == len(coordinates)
+
+
+def test_dsa_kv_cache_offload_gather_without_remap():
+    source = _make_source()
+    host_pool, host_versions = _make_host_state()
+    coordinates = [(0, 1), (1, 3)]
+    _mirror_group(source, host_pool, host_versions, coordinates)
+
+    full_indices = torch.tensor(
+        [_global_index(block, _FULL_LAYER, token) for block, token in coordinates],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    output = torch.empty((len(coordinates), _LAYER_BYTES), dtype=torch.uint8, device="cuda")
+    torch.ops.trtllm.dsa_kv_cache_offload_gather(
+        host_pool,
+        full_indices,
+        output,
+        None,
+        _STRIDE_FACTOR,
+        _TOKENS_PER_BLOCK,
+        _FULL_LAYER,
+        0,
+    )
+    expected = _expected_layer_rows(source, coordinates, _SHARED_LAYERS[0])
+    torch.testing.assert_close(output, expected)
 
 
 def test_dsa_kv_cache_offload_gather_cuda_graph_replay():
@@ -226,6 +257,7 @@ def test_dsa_kv_cache_offload_gather_cuda_graph_replay():
         dtype=torch.uint8,
         device="cuda",
     )
+    remap = torch.full((len(_SHARED_LAYERS), 1), -7, dtype=torch.int32, device="cuda")
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         for layer_in_group in range(len(_SHARED_LAYERS)):
@@ -233,19 +265,106 @@ def test_dsa_kv_cache_offload_gather_cuda_graph_replay():
                 host_pool,
                 static_indices,
                 output[layer_in_group],
+                remap[layer_in_group],
                 _STRIDE_FACTOR,
                 _TOKENS_PER_BLOCK,
                 _FULL_LAYER,
                 layer_in_group,
             )
 
+    graph.replay()
+    torch.cuda.synchronize()
+    assert remap.flatten().tolist() == [-1] * len(_SHARED_LAYERS)
+
     for coordinates_index, (block, token) in enumerate(coordinates):
         static_indices.fill_(_global_index(block, _FULL_LAYER, token))
         graph.replay()
         torch.cuda.synchronize()
+        assert remap.flatten().tolist() == [0] * len(_SHARED_LAYERS)
         for layer_in_group, layer in enumerate(_SHARED_LAYERS):
             expected = _expected_layer_rows(source, coordinates, layer)[coordinates_index]
             torch.testing.assert_close(output[layer_in_group, 0], expected)
+
+
+def test_dsa_kv_cache_offload_patch_overwrites_current_step_rows():
+    source = _make_source()
+    layer = _SHARED_LAYERS[0]
+    # Two decode requests (q_len 1), K = 3 selections each. Request 0 has
+    # kv_len 3 (threshold 2), request 1 has kv_len 6 (threshold 5).
+    topk_local = torch.tensor(
+        [[0, 2, -1], [1, 5, 4]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    global_indices = torch.tensor(
+        [
+            [_global_index(0, layer, 0), _global_index(0, layer, 2), -1],
+            # Request 1's block table maps position blocks [1, 0].
+            [_global_index(1, layer, 1), _global_index(0, layer, 1), _global_index(0, layer, 0)],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    kv_lens = torch.tensor([3, 6], dtype=torch.int32, device="cuda")
+    req_idx = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    staging = torch.full((6, _LAYER_BYTES), 0xAB, dtype=torch.uint8, device="cuda")
+
+    torch.ops.trtllm.dsa_kv_cache_offload_patch(
+        source,
+        topk_local,
+        global_indices,
+        kv_lens,
+        req_idx,
+        staging,
+        1,
+    )
+
+    sentinel = torch.full((_LAYER_BYTES,), 0xAB, dtype=torch.uint8, device="cuda")
+    # Fresh selections (position >= kv_len - q_len) are patched from the pool.
+    torch.testing.assert_close(staging[1], source[_global_index(0, layer, 2)])
+    torch.testing.assert_close(staging[4], source[_global_index(0, layer, 1)])
+    # Stale selections and padding stay untouched.
+    for row in (0, 2, 3, 5):
+        torch.testing.assert_close(staging[row], sentinel)
+
+
+def test_dsa_kv_cache_offload_patch_multi_token_step():
+    source = _make_source()
+    layer = _SHARED_LAYERS[1]
+    # One request with two query positions this step (MTP-style q_len 2):
+    # kv_len 4 makes positions 2 and 3 current-step.
+    topk_local = torch.tensor(
+        [[2, 0], [3, 2]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    global_indices = torch.tensor(
+        [
+            [_global_index(0, layer, 2), _global_index(0, layer, 0)],
+            [_global_index(0, layer, 3), _global_index(0, layer, 2)],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    kv_lens = torch.tensor([4], dtype=torch.int32, device="cuda")
+    req_idx = torch.tensor([0, 0], dtype=torch.int32, device="cuda")
+    staging = torch.full((4, _LAYER_BYTES), 0xAB, dtype=torch.uint8, device="cuda")
+
+    torch.ops.trtllm.dsa_kv_cache_offload_patch(
+        source,
+        topk_local,
+        global_indices,
+        kv_lens,
+        req_idx,
+        staging,
+        2,
+    )
+
+    sentinel = torch.full((_LAYER_BYTES,), 0xAB, dtype=torch.uint8, device="cuda")
+    torch.testing.assert_close(staging[0], source[_global_index(0, layer, 2)])
+    torch.testing.assert_close(staging[2], source[_global_index(0, layer, 3)])
+    torch.testing.assert_close(staging[3], source[_global_index(0, layer, 2)])
+    torch.testing.assert_close(staging[1], sentinel)
 
 
 def test_dsa_kv_cache_offload_incremental_hits_misses_and_invalidation():
@@ -457,6 +576,7 @@ class _FakeIncrementalSparseAttentionConfig:
 def test_dsa_kv_cache_offload_configure_incremental_working_set(monkeypatch):
     monkeypatch.setenv("TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_FULL_LAYER", "0")
     monkeypatch.setenv("TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_INCREMENTAL", "1")
+    monkeypatch.delenv("TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_CONSUME", raising=False)
     cache_manager = _FakeIncrementalCacheManager()
 
     configure_cache_manager(
@@ -481,6 +601,7 @@ def test_dsa_kv_cache_offload_configure_incremental_working_set(monkeypatch):
 def test_dsa_kv_cache_offload_configure_incremental_mtp5_working_set(monkeypatch):
     monkeypatch.setenv("TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_FULL_LAYER", "0")
     monkeypatch.setenv("TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_INCREMENTAL", "1")
+    monkeypatch.delenv("TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_CONSUME", raising=False)
     cache_manager = _FakeIncrementalCacheManager()
     cache_manager.spec_config = _FakeMTPConfig()
 
@@ -495,3 +616,18 @@ def test_dsa_kv_cache_offload_configure_incremental_mtp5_working_set(monkeypatch
     # Two working-set generations are retained for all 1 + 5 target rows.
     assert group.working_set.keys.shape == (3, 2, 24)
     assert group.working_set.values.shape == (3, 2, 24, 576)
+    # Incremental mode silently downgrades the default-on consume mode.
+    assert cache_manager.dsa_kv_offload_consume is False
+
+
+def test_dsa_kv_cache_offload_consume_rejected_with_incremental(monkeypatch):
+    monkeypatch.setenv("TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_FULL_LAYER", "0")
+    monkeypatch.setenv("TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_INCREMENTAL", "1")
+    monkeypatch.setenv("TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_CONSUME", "1")
+
+    with pytest.raises(ValueError, match="CONSUME"):
+        configure_cache_manager(
+            _FakeIncrementalCacheManager(),
+            _FakeIncrementalSparseAttentionConfig(),
+            pretrained_config=object(),
+        )

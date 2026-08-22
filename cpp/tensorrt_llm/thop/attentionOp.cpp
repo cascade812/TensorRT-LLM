@@ -786,6 +786,15 @@ public:
                             = reinterpret_cast<char*>(aux_kv_cache_pool_ptr.value());
                     }
                 }
+                else if (aux_kv_cache_pool_ptr.has_value())
+                {
+                    // Static token sparse (DSA) with an auxiliary pool: the caller
+                    // remapped sparse_attn_indices into this buffer (e.g. the DSA
+                    // KV-offload staging holding rows gathered from host memory),
+                    // so attention must read it instead of the paged pool.
+                    op.mRuntimeSparseAttentionParams.sparse_kv_cache_pool
+                        = reinterpret_cast<char*>(aux_kv_cache_pool_ptr.value());
+                }
                 else
                 {
                     op.mRuntimeSparseAttentionParams.sparse_kv_cache_pool = kvCachePool;

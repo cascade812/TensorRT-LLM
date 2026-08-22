@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cub/cub.cuh>
+#include <limits>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -93,9 +94,10 @@ __global__ void dsaKvCacheOffloadMirrorKernel(std::uint8_t const* __restrict__ s
 }
 
 __global__ void dsaKvCacheOffloadGatherKernel(std::uint8_t const* __restrict__ hostPool,
-    std::int32_t const* __restrict__ globalIndices, std::uint8_t* __restrict__ output, std::int64_t numRows,
-    std::int32_t hostRowGrains, std::int32_t layerGrains, std::int32_t layerInGroup, std::int32_t strideFactor,
-    std::int32_t tokensPerBlock, std::int32_t layerOffset, std::int64_t numHostRows)
+    std::int32_t const* __restrict__ globalIndices, std::uint8_t* __restrict__ output,
+    std::int32_t* __restrict__ remapIndices, std::int64_t numRows, std::int32_t hostRowGrains,
+    std::int32_t layerGrains, std::int32_t layerInGroup, std::int32_t strideFactor, std::int32_t tokensPerBlock,
+    std::int32_t layerOffset, std::int64_t numHostRows)
 {
     auto const warp = static_cast<std::int64_t>(blockIdx.x) * kWarpsPerBlock + threadIdx.x / kWarpSize;
     auto const lane = threadIdx.x % kWarpSize;
@@ -109,6 +111,13 @@ __global__ void dsaKvCacheOffloadGatherKernel(std::uint8_t const* __restrict__ h
         auto* destinationRow = destination + row * layerGrains;
         std::int64_t const hostRow
             = globalIndex < 0 ? -1 : getHostRow(globalIndex, strideFactor, tokensPerBlock, layerOffset, numHostRows);
+        // Staging rows are laid out in selection order, so the attention-facing
+        // remap is the identity for valid rows and -1 for padded/invalid ones
+        // (matching convert_req_index_to_global's -1 convention).
+        if (remapIndices != nullptr && lane == 0)
+        {
+            remapIndices[row] = hostRow < 0 ? -1 : static_cast<std::int32_t>(row);
+        }
         if (hostRow < 0)
         {
             for (std::int32_t grain = lane; grain < layerGrains; grain += kWarpSize)
@@ -119,6 +128,49 @@ __global__ void dsaKvCacheOffloadGatherKernel(std::uint8_t const* __restrict__ h
         }
         auto const* sourceRow
             = source + hostRow * hostRowGrains + static_cast<std::int64_t>(layerInGroup) * layerGrains;
+        for (std::int32_t grain = lane; grain < layerGrains; grain += kWarpSize)
+        {
+            destinationRow[grain] = sourceRow[grain];
+        }
+    }
+}
+
+// Overwrites staging rows whose selection points at a token appended in the
+// current step: the host gather was launched before this layer's rope-append
+// wrote those rows to the (GPU) pool, so their staged bytes are stale. A
+// selection at logical position p of generation request r is current-step iff
+// p >= kvLens[r] - qLenPerReq.
+__global__ void dsaKvCacheOffloadPatchKernel(std::uint8_t const* __restrict__ sourcePool,
+    std::int32_t const* __restrict__ topkLocal, std::int32_t const* __restrict__ globalIndices,
+    std::int32_t const* __restrict__ kvLens, std::int32_t const* __restrict__ reqIdx,
+    std::uint8_t* __restrict__ staging, std::int64_t numRows, std::int64_t numPoolRows, std::int32_t rowsPerToken,
+    std::int32_t numSeqs, std::int32_t qLenPerReq, std::int32_t layerGrains)
+{
+    auto const warp = static_cast<std::int64_t>(blockIdx.x) * kWarpsPerBlock + threadIdx.x / kWarpSize;
+    auto const lane = threadIdx.x % kWarpSize;
+    auto const numWarps = static_cast<std::int64_t>(gridDim.x) * kWarpsPerBlock;
+    auto const* source = reinterpret_cast<uint4 const*>(sourcePool);
+    auto* destination = reinterpret_cast<uint4*>(staging);
+
+    for (std::int64_t row = warp; row < numRows; row += numWarps)
+    {
+        std::int32_t const position = topkLocal[row];
+        std::int32_t const globalIndex = globalIndices[row];
+        if (position < 0 || globalIndex < 0 || globalIndex >= numPoolRows)
+        {
+            continue;
+        }
+        std::int32_t const request = reqIdx[row / rowsPerToken];
+        if (request < 0 || request >= numSeqs)
+        {
+            continue;
+        }
+        if (position < kvLens[request] - qLenPerReq)
+        {
+            continue;
+        }
+        auto const* sourceRow = source + static_cast<std::int64_t>(globalIndex) * layerGrains;
+        auto* destinationRow = destination + row * layerGrains;
         for (std::int32_t grain = lane; grain < layerGrains; grain += kWarpSize)
         {
             destinationRow[grain] = sourceRow[grain];
@@ -346,9 +398,9 @@ void invokeDsaKvCacheOffloadMirror(std::uint8_t const* sourcePool, std::int32_t 
 }
 
 void invokeDsaKvCacheOffloadGather(std::uint8_t const* hostPool, std::int32_t const* globalIndices,
-    std::uint8_t* output, std::int64_t numRows, std::int64_t numHostRows, std::int32_t hostRowBytes,
-    std::int32_t layerBytes, std::int32_t layerInGroup, std::int32_t strideFactor, std::int32_t tokensPerBlock,
-    std::int32_t layerOffset, cudaStream_t stream)
+    std::uint8_t* output, std::int32_t* remapIndices, std::int64_t numRows, std::int64_t numHostRows,
+    std::int32_t hostRowBytes, std::int32_t layerBytes, std::int32_t layerInGroup, std::int32_t strideFactor,
+    std::int32_t tokensPerBlock, std::int32_t layerOffset, cudaStream_t stream)
 {
     if (numRows == 0)
     {
@@ -357,10 +409,30 @@ void invokeDsaKvCacheOffloadGather(std::uint8_t const* hostPool, std::int32_t co
     constexpr std::int32_t kVectorBytes = sizeof(uint4);
     TLLM_CHECK_WITH_INFO(hostRowBytes % kVectorBytes == 0, "host row bytes must be 16-byte aligned");
     TLLM_CHECK_WITH_INFO(layerBytes % kVectorBytes == 0, "layer bytes must be 16-byte aligned");
+    TLLM_CHECK_WITH_INFO(remapIndices == nullptr || numRows <= std::numeric_limits<std::int32_t>::max(),
+        "remap indices require an int32 row count");
     auto const blocks = std::min<std::int64_t>((numRows + kWarpsPerBlock - 1) / kWarpsPerBlock, kGatherGridLimit);
     dsaKvCacheOffloadGatherKernel<<<static_cast<std::uint32_t>(blocks), kThreadsPerBlock, 0, stream>>>(hostPool,
-        globalIndices, output, numRows, hostRowBytes / kVectorBytes, layerBytes / kVectorBytes, layerInGroup,
-        strideFactor, tokensPerBlock, layerOffset, numHostRows);
+        globalIndices, output, remapIndices, numRows, hostRowBytes / kVectorBytes, layerBytes / kVectorBytes,
+        layerInGroup, strideFactor, tokensPerBlock, layerOffset, numHostRows);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+void invokeDsaKvCacheOffloadPatch(std::uint8_t const* sourcePool, std::int32_t const* topkLocal,
+    std::int32_t const* globalIndices, std::int32_t const* kvLens, std::int32_t const* reqIdx, std::uint8_t* staging,
+    std::int64_t numRows, std::int64_t numPoolRows, std::int32_t rowsPerToken, std::int32_t numSeqs,
+    std::int32_t qLenPerReq, std::int32_t layerBytes, cudaStream_t stream)
+{
+    if (numRows == 0)
+    {
+        return;
+    }
+    constexpr std::int32_t kVectorBytes = sizeof(uint4);
+    TLLM_CHECK_WITH_INFO(layerBytes % kVectorBytes == 0, "layer bytes must be 16-byte aligned");
+    auto const blocks = std::min<std::int64_t>((numRows + kWarpsPerBlock - 1) / kWarpsPerBlock, kGatherGridLimit);
+    dsaKvCacheOffloadPatchKernel<<<static_cast<std::uint32_t>(blocks), kThreadsPerBlock, 0, stream>>>(sourcePool,
+        topkLocal, globalIndices, kvLens, reqIdx, staging, numRows, numPoolRows, rowsPerToken, numSeqs, qLenPerReq,
+        layerBytes / kVectorBytes);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 

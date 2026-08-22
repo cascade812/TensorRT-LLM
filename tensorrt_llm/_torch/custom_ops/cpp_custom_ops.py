@@ -1572,8 +1572,13 @@ def _register_fake():
         pass
 
     @torch.library.register_fake("trtllm::dsa_kv_cache_offload_gather")
-    def _(host_pool, global_indices, output, stride_factor, tokens_per_block,
-          layer_offset, layer_in_group):
+    def _(host_pool, global_indices, output, remap_indices, stride_factor,
+          tokens_per_block, layer_offset, layer_in_group):
+        pass
+
+    @torch.library.register_fake("trtllm::dsa_kv_cache_offload_patch")
+    def _(source_pool, topk_local, global_indices, kv_lens, req_idx, staging,
+          q_len_per_req):
         pass
 
     @torch.library.register_fake(

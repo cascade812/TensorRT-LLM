@@ -35,6 +35,9 @@ from tensorrt_llm._torch.attention_backend.interface import (
     RopeParams,
 )
 from tensorrt_llm._torch.attention_backend.sparse.dsa import DSABackendForwardArgs, DSACacheManager
+from tensorrt_llm._torch.attention_backend.sparse.dsa.kv_offload_prototype import (
+    mirror_appended_kv,
+)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -1029,6 +1032,493 @@ def _run_test_for_backend(
         print(f"Test for sparse MLA in {backend_name} backend passed")
     finally:
         kv_cache_manager.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# DSA KV-offload prototype: IndexShare group, consume-mode bit-exactness.
+#
+# Builds a (full, S1, S2, S3) IndexShare stack — the GLM-5.2 group shape — and
+# runs identical context + decode steps twice: once GPU-resident (baseline)
+# and once with the KV-offload prototype consuming host-gathered staging rows
+# for the offloaded shared layers. The staged rows are byte-identical inputs
+# to the same attention kernel, so outputs must match the baseline bitwise
+# (modulo kernel-scheduling nondeterminism, which is measured from a repeated
+# baseline run).
+# ---------------------------------------------------------------------------
+
+_OFFLOAD_NUM_LAYERS = 4
+_OFFLOAD_ENV_NAMES = (
+    "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_FULL_LAYER",
+    "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_GROUP_LAYERS",
+    "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_INCREMENTAL",
+    "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_CONSUME",
+    "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_MAX_HOST_GIB",
+)
+
+
+def _make_offload_layer_inputs(scenario, context_lens, gen_seq_len_q, num_steps, device):
+    """Pre-generate per-layer ctx/gen inputs shared (via clones) by all runs."""
+    kv_lora_rank = scenario.kv_lora_rank
+    qk_rope_head_dim = scenario.qk_rope_head_dim
+    num_heads = scenario.num_heads
+    head_dim = kv_lora_rank + qk_rope_head_dim
+    dtype = scenario.dtype
+
+    def _rand(*shape):
+        return torch.empty(shape, dtype=dtype, device=device).uniform_(-1, 1)
+
+    total_ctx_tokens = sum(context_lens)
+    gen_tokens = len(context_lens) * gen_seq_len_q
+    inputs_per_layer = []
+    for _ in range(_OFFLOAD_NUM_LAYERS):
+        ctx_q = _rand(total_ctx_tokens, num_heads, kv_lora_rank)
+        ctx_q_pe = _rand(total_ctx_tokens, num_heads, qk_rope_head_dim)
+        gen_q_list = [_rand(gen_tokens, num_heads, kv_lora_rank) for _ in range(num_steps)]
+        gen_q_pe_list = [
+            _rand(gen_tokens, num_heads, qk_rope_head_dim) for _ in range(num_steps)
+        ]
+        inputs_per_layer.append(
+            {
+                "ctx_compressed_kv": _rand(total_ctx_tokens, kv_lora_rank),
+                "ctx_k_pe": _rand(total_ctx_tokens, qk_rope_head_dim),
+                "ctx_q_pe": ctx_q_pe,
+                "ctx_fused_q": torch.cat([ctx_q, ctx_q_pe], dim=-1).view(
+                    -1, num_heads * head_dim
+                ),
+                "gen_compressed_kv_list": [
+                    _rand(gen_tokens, kv_lora_rank) for _ in range(num_steps)
+                ],
+                "gen_k_pe_list": [_rand(gen_tokens, qk_rope_head_dim) for _ in range(num_steps)],
+                "gen_q_pe_list": gen_q_pe_list,
+                "gen_fused_q_list": [
+                    torch.cat([gen_q_list[i], gen_q_pe_list[i]], dim=-1).view(
+                        -1, num_heads * head_dim
+                    )
+                    for i in range(num_steps)
+                ],
+            }
+        )
+    return inputs_per_layer
+
+
+def _run_index_share_dsa_case(
+    scenario,
+    context_lens,
+    gen_seq_len_q,
+    num_steps,
+    inputs_per_layer,
+    ctx_topk,
+    gen_topk_list,
+    check_reference,
+):
+    """Run a (full, S1, S2, S3) IndexShare DSA stack end to end.
+
+    Returns ({(step, layer): output}, offload_engaged). The KV-offload
+    prototype configures itself from the environment at cache-manager
+    construction time, so the caller controls offload on/off via env vars.
+    The module-level host-mirror hook is invoked manually because this
+    harness drives the attention backend directly.
+    """
+    device = torch.device("cuda")
+    num_heads = scenario.num_heads
+    kv_lora_rank = scenario.kv_lora_rank
+    qk_rope_head_dim = scenario.qk_rope_head_dim
+    qk_nope_head_dim = scenario.qk_nope_head_dim
+    v_head_dim = scenario.v_head_dim
+    head_dim = kv_lora_rank + qk_rope_head_dim
+    kv_cache_tokens_per_block = scenario.kv_cache_tokens_per_block
+    kv_cache_dtype = scenario.kv_cache_dtype
+
+    sparse_config = DeepSeekSparseAttentionConfig(
+        index_n_heads=64,
+        index_head_dim=128,
+        index_topk=SPARSE_TOPK,
+        skip_indexer_for_short_seqs=False,
+    )
+    # Layer 0 runs the full indexer; layers 1-3 reuse its top-k (IndexShare).
+    pretrained_config = SimpleNamespace(
+        rms_norm_eps=1e-6,
+        num_hidden_layers=_OFFLOAD_NUM_LAYERS,
+        index_topk_pattern="FSSS",
+    )
+    AttentionCls = get_attention_backend("TRTLLM", sparse_config)
+
+    rope_config = RopeConfig()
+    rope_cos_sin = (
+        torch.tensor(
+            RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+                rope_config.max_position_embeddings,
+                rope_config.qk_rope_head_dim,
+                rope_config.rope_theta,
+                rope_config.rope_scaling["factor"],
+                rope_config.rope_scaling["original_max_position_embeddings"],
+                rope_config.rope_scaling["beta_fast"],
+                rope_config.rope_scaling["beta_slow"],
+                rope_config.rope_scaling["mscale"],
+                rope_config.rope_scaling["mscale_all_dim"],
+            )[1],
+            dtype=torch.float32,
+            device=device,
+        )
+        .reshape(rope_config.max_position_embeddings, -1, 2)
+        .transpose(-2, -1)
+    )
+
+    pos_embd_params = PositionalEmbeddingParams(
+        type=PositionEmbeddingType.yarn,
+        rope=RopeParams.from_config(rope_config),
+        is_neox=False,
+    )
+    mla_params = MLAParams(
+        q_lora_rank=scenario.q_lora_rank,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        qk_nope_head_dim=qk_nope_head_dim,
+        v_head_dim=v_head_dim,
+        rope_append=True,
+        predicted_tokens_per_seq=1,
+    )
+
+    def yarn_get_mscale(scale=1, mscale=1):
+        if scale <= 1:
+            return 1.0
+        return 0.1 * mscale * math.log(scale) + 1.0
+
+    mscale = yarn_get_mscale(pos_embd_params.rope.scale, pos_embd_params.rope.mscale_all_dim)
+    q_scaling = 1.0 / (mscale * mscale)
+
+    assert kv_cache_dtype == torch.float8_e4m3fn, "KV offload consume requires an FP8 KV cache"
+    quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8.value)
+
+    layers = [
+        AttentionCls(
+            layer_idx=layer_idx,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            num_kv_heads=1,
+            quant_config=quant_config,
+            q_scaling=q_scaling,
+            pos_embd_params=pos_embd_params,
+            mla_params=mla_params,
+            sparse_params=sparse_config.to_sparse_params(
+                pretrained_config=pretrained_config, layer_idx=layer_idx
+            ),
+            sparse_attention_config=sparse_config,
+        )
+        for layer_idx in range(_OFFLOAD_NUM_LAYERS)
+    ]
+    assert layers[0].indexer is not None
+    assert all(layer.indexer is None for layer in layers[1:])
+
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    num_requests = len(context_lens)
+    max_seq_len = max(context_lens) + (num_steps + 1) * gen_seq_len_q
+    max_tokens = (
+        (max_seq_len + kv_cache_tokens_per_block - 1)
+        // kv_cache_tokens_per_block
+        * kv_cache_tokens_per_block
+        * num_requests
+    )
+    model_config = ModelConfig(
+        mapping=mapping,
+        sparse_attention_config=sparse_config,
+        pretrained_config=pretrained_config,
+    )
+    kv_cache_manager = DSACacheManager(
+        KvCacheConfig(max_tokens=max_tokens, enable_block_reuse=False),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
+        num_layers=_OFFLOAD_NUM_LAYERS,
+        num_kv_heads=1,
+        head_dim=head_dim,
+        tokens_per_block=kv_cache_tokens_per_block,
+        max_seq_len=max_seq_len,
+        max_batch_size=num_requests,
+        mapping=mapping,
+        dtype=str_dtype_to_binding(torch_dtype_to_str(kv_cache_dtype)),
+        sparse_attn_config=sparse_config,
+        model_config=model_config,
+        pretrained_config=pretrained_config,
+    )
+    offload_engaged = bool(kv_cache_manager.dsa_kv_offload_groups) and bool(
+        getattr(kv_cache_manager, "dsa_kv_offload_consume", False)
+    )
+    if gen_seq_len_q > 1:
+        # Production reaches multi-token generation steps only through MTP,
+        # whose spec_config sizes the offload prototype's staging buffers
+        # ((1 + max_draft_len) rows per request). Mimic that here; set after
+        # construction so the C++ pool setup does not add spec layers.
+        kv_cache_manager.spec_config = SimpleNamespace(
+            decoding_type="MTP",
+            use_dynamic_tree=False,
+            max_draft_len=gen_seq_len_q - 1,
+        )
+    sparse_metadata_params = sparse_config.to_sparse_metadata_params(
+        pretrained_config=pretrained_config
+    )
+    ctx_position_ids = torch.cat(
+        [torch.arange(ctx_len, dtype=torch.int32, device=device) for ctx_len in context_lens]
+    )
+    atol, rtol = accuracy_dict[kv_cache_dtype]
+
+    outputs = {}
+    try:
+        request_ids = list(range(num_requests))
+        kv_cache_manager.add_dummy_requests(request_ids, context_lens)
+
+        attn_metadata = AttentionCls.Metadata(
+            seq_lens=torch.tensor(context_lens, dtype=torch.int),
+            request_ids=request_ids,
+            max_num_requests=num_requests,
+            num_contexts=num_requests,
+            prompt_lens=context_lens,
+            max_num_tokens=sum(context_lens),
+            kv_cache_manager=kv_cache_manager,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[0 for _ in context_lens],
+            ),
+            mapping=mapping,
+            sparse_metadata_params=sparse_metadata_params,
+        )
+        attn_metadata.prepare()
+
+        latent_cache_ref_list = [None] * _OFFLOAD_NUM_LAYERS
+        cached_lens = None
+        gen_position_ids = None
+        for step in range(num_steps + 1):
+            if step > 0:
+                _allocate_kv_cache_for_generation(kv_cache_manager, request_ids, gen_seq_len_q)
+                cached_lens = [ctx_len + (step - 1) * gen_seq_len_q for ctx_len in context_lens]
+                attn_metadata = AttentionCls.Metadata(
+                    seq_lens=torch.tensor([gen_seq_len_q] * num_requests, dtype=torch.int),
+                    request_ids=request_ids,
+                    max_num_requests=num_requests,
+                    num_contexts=0,
+                    prompt_lens=context_lens,
+                    max_num_tokens=num_requests * gen_seq_len_q,
+                    kv_cache_manager=kv_cache_manager,
+                    kv_cache_params=KVCacheParams(
+                        use_cache=True,
+                        num_cached_tokens_per_seq=cached_lens,
+                    ),
+                    mapping=mapping,
+                    sparse_metadata_params=sparse_metadata_params,
+                )
+                attn_metadata.prepare()
+                gen_position_ids = torch.cat(
+                    [
+                        cached_len + torch.arange(gen_seq_len_q, dtype=torch.int32, device=device)
+                        for cached_len in cached_lens
+                    ]
+                )
+            for layer_idx in range(_OFFLOAD_NUM_LAYERS):
+                inputs = inputs_per_layer[layer_idx]
+                if step == 0:
+                    topk_indices = ctx_topk
+                    if layers[layer_idx].indexer is not None:
+                        layers[layer_idx].indexer.forward_from_projected = Mock(
+                            return_value=topk_indices
+                        )
+                    compressed_kv = inputs["ctx_compressed_kv"]
+                    k_pe = inputs["ctx_k_pe"]
+                    result = layers[layer_idx].forward(
+                        inputs["ctx_fused_q"].clone(),
+                        None,
+                        None,
+                        attn_metadata,
+                        attention_input_type=AttentionInputType.context_only,
+                        latent_cache=torch.cat([compressed_kv, k_pe], dim=-1),
+                        q_pe=inputs["ctx_q_pe"].clone(),
+                        sparse_backend_args=DSABackendForwardArgs(indexer_intermediates=[]),
+                    )
+                    mirror_appended_kv(
+                        layers[layer_idx], attn_metadata, ctx_position_ids, is_generation=False
+                    )
+                    if check_reference:
+                        k_pe_ref = _rotate_k_pe_for_ctx(k_pe, rope_cos_sin, context_lens)
+                        latent_cache_ref = torch.cat([compressed_kv, k_pe_ref], dim=-1)
+                        fused_q_rot = _rotate_fused_q_for_ctx(
+                            inputs["ctx_fused_q"],
+                            rope_cos_sin,
+                            context_lens,
+                            num_heads,
+                            kv_lora_rank,
+                            qk_rope_head_dim,
+                        )
+                        ref_result = calculate_ref_result_ctx_sparse(
+                            fused_q_rot,
+                            latent_cache_ref,
+                            context_lens,
+                            num_heads,
+                            kv_lora_rank,
+                            v_head_dim,
+                            qk_nope_head_dim,
+                            qk_rope_head_dim,
+                            q_scaling,
+                            topk_indices=topk_indices,
+                        )
+                        assert torch.allclose(result, ref_result, atol=atol, rtol=rtol), (
+                            f"context result mismatch vs reference at layer {layer_idx}"
+                        )
+                        latent_cache_ref_list[layer_idx] = latent_cache_ref
+                else:
+                    fused_q = inputs["gen_fused_q_list"][step - 1].clone()
+                    q_pe = inputs["gen_q_pe_list"][step - 1].clone()
+                    compressed_kv = inputs["gen_compressed_kv_list"][step - 1]
+                    k_pe = inputs["gen_k_pe_list"][step - 1]
+                    latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
+
+                    num_tokens = fused_q.size(0)
+                    num_seqs = attn_metadata.kv_lens_cuda_runtime.size(0)
+                    cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
+                    cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
+                    fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=device)
+                    mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=device)
+                    mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=device)
+                    quant_q_buffer = torch.empty(
+                        num_tokens, num_heads * head_dim, dtype=torch.uint8, device=device
+                    )
+                    layers[layer_idx].mla_rope_generation(
+                        fused_q,
+                        q_pe,
+                        latent_cache,
+                        attn_metadata,
+                        cu_q_seqlens,
+                        cu_kv_seqlens,
+                        fmha_scheduler_counter,
+                        mla_bmm1_scale,
+                        mla_bmm2_scale,
+                        quant_q_buffer,
+                    )
+                    topk_indices = gen_topk_list[step - 1]
+                    if layers[layer_idx].indexer is not None:
+                        layers[layer_idx].indexer.forward_from_projected = Mock(
+                            return_value=topk_indices
+                        )
+                    result = layers[layer_idx].forward(
+                        fused_q,
+                        None,
+                        None,
+                        attn_metadata,
+                        attention_input_type=AttentionInputType.generation_only,
+                        latent_cache=latent_cache,
+                        q_pe=q_pe,
+                        cu_q_seqlens=cu_q_seqlens,
+                        cu_kv_seqlens=cu_kv_seqlens,
+                        fmha_scheduler_counter=fmha_scheduler_counter,
+                        mla_bmm1_scale=mla_bmm1_scale,
+                        mla_bmm2_scale=mla_bmm2_scale,
+                        quant_q_buffer=quant_q_buffer,
+                        sparse_backend_args=DSABackendForwardArgs(indexer_intermediates=[]),
+                    )
+                    mirror_appended_kv(
+                        layers[layer_idx], attn_metadata, gen_position_ids, is_generation=True
+                    )
+                    if check_reference:
+                        ref_result, latent_cache_ref = calculate_ref_result_gen(
+                            fused_q,
+                            q_pe,
+                            compressed_kv,
+                            k_pe,
+                            latent_cache_ref_list[layer_idx],
+                            rope_cos_sin,
+                            num_heads,
+                            kv_lora_rank,
+                            v_head_dim,
+                            qk_nope_head_dim,
+                            qk_rope_head_dim,
+                            cached_lens,
+                            q_scaling,
+                            topk_indices=topk_indices,
+                        )
+                        latent_cache_ref_list[layer_idx] = latent_cache_ref
+                        assert torch.allclose(result, ref_result, atol=atol, rtol=rtol), (
+                            f"generation result mismatch vs reference at "
+                            f"step {step} layer {layer_idx}"
+                        )
+                outputs[(step, layer_idx)] = result.clone()
+        torch.cuda.synchronize()
+    finally:
+        kv_cache_manager.shutdown()
+    return outputs, offload_engaged
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("offload_group_layers", ["2,3,4", "3,4"])
+@pytest.mark.parametrize("gen_seq_len_q", [1, 4], ids=lambda x: f"gen_q{x}")
+def test_dsa_kv_offload_consume_matches_gpu_resident(
+    monkeypatch, offload_group_layers, gen_seq_len_q
+):
+    """Offloaded shared layers attending from host-gathered staging rows must
+    reproduce the GPU-resident baseline bit-for-bit (same inputs, same top-k).
+    """
+    device = torch.device("cuda")
+    context_lens = [192, 320]
+    num_steps = 3
+    scenario = Scenario(
+        kv_cache_dtype=torch.float8_e4m3fn,
+        num_layers=_OFFLOAD_NUM_LAYERS,
+        kv_cache_tokens_per_block=tokens_per_block,
+    )
+
+    torch.manual_seed(123)
+    inputs_per_layer = _make_offload_layer_inputs(
+        scenario, context_lens, gen_seq_len_q, num_steps, device
+    )
+    ctx_topk = _build_sparse_topk_indices_context(context_lens, SPARSE_TOPK, device)
+    # Selections include the current step's own positions, so the staging
+    # patch kernel is exercised on every generation step.
+    gen_topk_list = [
+        _build_sparse_topk_indices_generation(
+            [ctx_len + step * gen_seq_len_q for ctx_len in context_lens],
+            gen_seq_len_q,
+            SPARSE_TOPK,
+            device,
+        )
+        for step in range(num_steps)
+    ]
+
+    def _run(check_reference):
+        return _run_index_share_dsa_case(
+            scenario,
+            context_lens,
+            gen_seq_len_q,
+            num_steps,
+            inputs_per_layer,
+            ctx_topk,
+            gen_topk_list,
+            check_reference,
+        )
+
+    for name in _OFFLOAD_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    baseline, engaged = _run(check_reference=True)
+    assert not engaged
+    baseline_repeat, _ = _run(check_reference=False)
+
+    monkeypatch.setenv("TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_FULL_LAYER", "0")
+    monkeypatch.setenv("TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_GROUP_LAYERS", offload_group_layers)
+    monkeypatch.setenv("TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_CONSUME", "1")
+    offload, engaged = _run(check_reference=True)
+    assert engaged, "KV offload prototype did not engage; the test would be vacuous"
+
+    # Kernel scheduling may in principle be nondeterministic; measure the
+    # baseline's run-to-run noise and demand bit-equality when it is zero.
+    noise = max((baseline[key] - baseline_repeat[key]).abs().max().item() for key in baseline)
+    for key in sorted(baseline):
+        if noise == 0.0:
+            assert torch.equal(offload[key], baseline[key]), (
+                f"offload output differs bitwise from the GPU-resident baseline "
+                f"at (step, layer)={key}"
+            )
+        else:
+            torch.testing.assert_close(
+                offload[key],
+                baseline[key],
+                atol=4 * noise + 1e-6,
+                rtol=0.0,
+                msg=f"(step, layer)={key}",
+            )
 
 
 if __name__ == "__main__":

@@ -1,11 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Experimental GLM DSA KV-cache offload overhead prototype.
+"""Experimental GLM DSA KV-cache offload prototype.
 
-This module intentionally measures transfer overhead without reclaiming HBM:
-the normal GPU KV cache remains authoritative while selected shared layers are
-mirrored to pinned host memory. During decode, transfers are pipelined one layer
-ahead on stage-specific auxiliary streams.
+The GPU KV cache remains allocated and dual-written (prefill and the
+current-step append still target it), while selected shared layers are
+mirrored to pinned host memory. During decode, transfers are pipelined one
+layer ahead on stage-specific auxiliary streams.
+
+In the default full-refetch **consume** mode (SM100+), decode attention for
+offloaded shared layers no longer reads the paged GPU pool: the staged rows
+gathered from the host mirror are handed to the attention op through
+``aux_kv_cache_pool_ptr`` together with remapped iota/-1 indices, and a patch
+kernel overwrites staging rows selected from the current step (which the
+host-side gather could not have seen) from the paged pool. This makes the
+host copy the authoritative decode read path for offloaded layers — the
+correctness milestone for reclaiming their HBM, which still requires the
+KV-cache-manager pool split (see glm_kv_offload_production_plan.md, Phase 1).
+Set TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_CONSUME=0 to restore the overhead-only
+behavior where the staging output is discarded.
 
 Enable one group with
 TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_FULL_LAYER=<global layer>, or every complete
@@ -18,16 +30,15 @@ By default each transfer fully refetches TopK. Set
 TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_INCREMENTAL=1 to use a per-request, per-layer
 persistent working set. Hits reuse their existing GPU slots without copying;
 only misses fetch KV rows from the pinned host mirror. Host-row versions
-invalidate cached entries when a physical KV row is rewritten. All state and
+invalidate cached entries when a physical KV row is rewritten. The
+incremental working set is still an overhead/correctness vehicle only:
+consume mode is full-refetch-specific and is disabled with it. All state and
 output slots have fixed addresses and mutate on device, so the path is
 CUDA-graph replayable.
 
 The prototype supports FP8 latent KV, linear MTP speculative decoding, and a
 fresh fixed-batch run. An MTP target pass fetches TopK for all
-``1 + max_draft_len`` query positions per request. Attention still consumes
-the authoritative GPU KV cache; the working-set output is currently an
-overhead/correctness vehicle, not HBM reclamation or a user-facing
-configuration surface.
+``1 + max_draft_len`` query positions per request.
 """
 
 from __future__ import annotations
@@ -37,6 +48,7 @@ from typing import TYPE_CHECKING, Dict, NamedTuple, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
 
@@ -51,6 +63,7 @@ if TYPE_CHECKING:
 _PROTOTYPE_ENV = "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_FULL_LAYER"
 _GROUP_LAYERS_ENV = "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_GROUP_LAYERS"
 _INCREMENTAL_ENV = "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_INCREMENTAL"
+_CONSUME_ENV = "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_CONSUME"
 _MAX_HOST_GIB_ENV = "TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_MAX_HOST_GIB"
 _NUM_SHARED_LAYERS = 3
 _WORKING_SET_CAPACITY_MULTIPLIER = 2
@@ -100,13 +113,43 @@ def _get_prototype_selector() -> Optional[Union[int, str]]:
     return layer_idx
 
 
-def _incremental_enabled() -> bool:
-    value = os.environ.get(_INCREMENTAL_ENV, "0").lower()
+def _parse_bool_env(name: str, default: str) -> bool:
+    value = os.environ.get(name, default).lower()
     if value in ("0", "false", "no", "off"):
         return False
     if value in ("1", "true", "yes", "on"):
         return True
-    raise ValueError(f"{_INCREMENTAL_ENV} must be a boolean value, got {value!r}")
+    raise ValueError(f"{name} must be a boolean value, got {value!r}")
+
+
+def _incremental_enabled() -> bool:
+    return _parse_bool_env(_INCREMENTAL_ENV, "0")
+
+
+def _consume_enabled(incremental: bool) -> bool:
+    """Whether decode attention consumes the staged host rows (default on).
+
+    Consume mode is full-refetch-specific and needs the SM100+ trtllm-gen
+    sparse MLA path (the aux-pool seam). When the default-on value collides
+    with either constraint it is silently downgraded to overhead-only mode;
+    an explicit TRTLLM_DSA_KV_OFFLOAD_PROTOTYPE_CONSUME=1 raises instead.
+    """
+    explicit = _CONSUME_ENV in os.environ
+    if not _parse_bool_env(_CONSUME_ENV, "1"):
+        return False
+    if incremental:
+        if explicit:
+            raise ValueError(f"{_CONSUME_ENV} is not supported with {_INCREMENTAL_ENV}")
+        return False
+    if get_sm_version() < 100:
+        if explicit:
+            raise ValueError(f"{_CONSUME_ENV} requires SM100+ (trtllm-gen sparse MLA)")
+        logger.info(
+            "[DSA KV offload prototype] staging-consuming attention needs SM100+; "
+            "falling back to overhead-only mode"
+        )
+        return False
+    return True
 
 
 def _get_max_host_bytes() -> int:
@@ -286,6 +329,7 @@ def configure_cache_manager(
     """Allocate host mirrors and optional incremental GPU working sets."""
     cache_manager.dsa_kv_offload_groups = {}
     cache_manager.dsa_kv_offload_shared_to_group = {}
+    cache_manager.dsa_kv_offload_consume = False
 
     selector = _get_prototype_selector()
     if selector is None or cache_manager.is_estimating_kv_cache:
@@ -316,6 +360,7 @@ def configure_cache_manager(
         return
     offloaded_layer_indices = _get_offloaded_layer_indices()
     incremental = _incremental_enabled()
+    consume = _consume_enabled(incremental)
     max_rows_per_request = 0
     if incremental:
         sparse_params = sparse_attention_config.to_sparse_params(
@@ -387,6 +432,13 @@ def configure_cache_manager(
 
     cache_manager.dsa_kv_offload_groups = groups
     cache_manager.dsa_kv_offload_shared_to_group = shared_to_group
+    cache_manager.dsa_kv_offload_consume = consume
+    if incremental:
+        mode = "incremental"
+    elif consume:
+        mode = "full-refetch (attention consumes staged host rows)"
+    else:
+        mode = "full-refetch (overhead-only, staging discarded)"
     logger.info(
         "[DSA KV offload prototype] %d group(s), full layers %s, "
         "group layers %s, mode %s, MTP draft length %d, "
@@ -395,7 +447,7 @@ def configure_cache_manager(
         len(groups),
         tuple(groups),
         tuple(layer_in_group + 2 for layer_in_group in offloaded_layer_indices),
-        "incremental" if incremental else "full-refetch",
+        mode,
         max_draft_tokens,
         total_host_bytes / (1 << 30),
         host_bytes_per_group / (1 << 30),
@@ -410,6 +462,7 @@ def create_metadata_buffers(
 ) -> None:
     """Create fixed-address staging/slot buffers and synchronization objects."""
     metadata.dsa_kv_offload_staging = None
+    metadata.dsa_kv_offload_remap = None
     metadata.dsa_kv_offload_slots = None
     metadata.dsa_kv_offload_streams = ()
     metadata.dsa_kv_offload_start_events = ()
@@ -437,6 +490,14 @@ def create_metadata_buffers(
             dtype=torch.uint8,
             capture_graph=capture_graph,
         )
+        if getattr(metadata.kv_cache_manager, "dsa_kv_offload_consume", False):
+            metadata.dsa_kv_offload_remap = metadata.get_empty(
+                metadata.cuda_graph_buffers,
+                (_NUM_SHARED_LAYERS, max_rows),
+                cache_name="dsa_kv_offload_remap",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
     metadata.dsa_kv_offload_streams = tuple(
         torch.cuda.Stream() for _ in range(_NUM_SHARED_LAYERS)
     )
@@ -488,10 +549,15 @@ def _launch_gather(
             staging = metadata.dsa_kv_offload_staging
             assert staging is not None
             assert global_indices.numel() <= staging.shape[1]
+            remap = metadata.dsa_kv_offload_remap
+            remap_slice = (
+                remap[layer_in_group, : global_indices.numel()] if remap is not None else None
+            )
             torch.ops.trtllm.dsa_kv_cache_offload_gather(
                 group.host_pool,
                 global_indices,
                 staging[layer_in_group, : global_indices.numel()],
+                remap_slice,
                 stride_factor,
                 metadata._cached_tokens_per_block,
                 layer_offset,
@@ -532,12 +598,59 @@ def _launch_gather(
         event.record()
 
 
-def advance_gather_pipeline(
-    backend: "DSATrtllmAttention",
+def _patch_and_stage(
+    topk_indices: torch.Tensor,
     global_indices: torch.Tensor,
     metadata: "DSAtrtllmAttentionMetadata",
-) -> None:
-    """Wait for this layer's rows, then prefetch the following shared layer."""
+    layer_in_group: int,
+) -> Tuple[torch.Tensor, int]:
+    """Fix current-step staging rows from the paged pool and return the
+    (remapped indices, staging base pointer) pair attention consumes."""
+    staging = metadata.dsa_kv_offload_staging
+    remap = metadata.dsa_kv_offload_remap
+    assert staging is not None and remap is not None
+    if not topk_indices.is_contiguous():
+        raise ValueError("DSA KV offload consume requires contiguous TopK indices")
+    num_tokens, rows_per_token = topk_indices.shape
+    num_rows = num_tokens * rows_per_token
+    assert global_indices.numel() == num_rows
+    if metadata.num_generations <= 0:
+        raise ValueError("DSA KV offload consume requires at least one generation request")
+    if num_tokens % metadata.num_generations != 0:
+        raise ValueError("DSA KV offload TopK rows must be evenly partitioned by generation request")
+    q_len_per_req = num_tokens // metadata.num_generations
+
+    # The gather ran before this layer's rope-append wrote the current step's
+    # rows into the paged pool (mla_rope_generation precedes attention on the
+    # main stream), so staged bytes for current-step selections are stale.
+    # Over-patching is benign: for already-appended tokens the pool and host
+    # mirror hold identical bytes.
+    staging_rows = staging[layer_in_group]
+    torch.ops.trtllm.dsa_kv_cache_offload_patch(
+        metadata._cached_pool_view,
+        topk_indices,
+        global_indices,
+        metadata.kv_lens_cuda[metadata.num_contexts : metadata.num_seqs],
+        metadata._cached_req_idx_gen,
+        staging_rows[:num_rows],
+        q_len_per_req,
+    )
+    remapped = remap[layer_in_group, :num_rows].view(num_tokens, rows_per_token)
+    return remapped, staging_rows.data_ptr()
+
+
+def advance_gather_pipeline(
+    backend: "DSATrtllmAttention",
+    topk_indices: torch.Tensor,
+    global_indices: torch.Tensor,
+    metadata: "DSAtrtllmAttentionMetadata",
+) -> Optional[Tuple[torch.Tensor, int]]:
+    """Wait for this layer's rows, then prefetch the following shared layer.
+
+    In consume mode, returns (remapped staging indices, staging base pointer)
+    for offloaded shared layers so attention reads the host-gathered rows;
+    returns None whenever attention should keep reading the paged pool.
+    """
     cache_manager = metadata.kv_cache_manager
     groups = getattr(cache_manager, "dsa_kv_offload_groups", {})
     group = groups.get(backend.layer_idx)
@@ -549,13 +662,13 @@ def advance_gather_pipeline(
             group,
             layer_in_group=group.offloaded_layer_indices[0],
         )
-        return
+        return None
 
     group_info = getattr(cache_manager, "dsa_kv_offload_shared_to_group", {}).get(
         backend.layer_idx
     )
     if group_info is None:
-        return
+        return None
 
     full_layer, layer_in_group = group_info
     events = metadata.dsa_kv_offload_events
@@ -574,6 +687,10 @@ def advance_gather_pipeline(
             group,
             next_layer_in_group,
         )
+
+    if not getattr(cache_manager, "dsa_kv_offload_consume", False):
+        return None
+    return _patch_and_stage(topk_indices, global_indices, metadata, layer_in_group)
 
 
 def mirror_appended_kv(
