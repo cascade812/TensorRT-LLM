@@ -23,6 +23,8 @@
 #include "kv_cache_manager_v2/movingAverage.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/pendingStats.h"
+#include "kv_cache_manager_v2/sparseCache.h"
+#include "kv_cache_manager_v2/sparseCacheKernels.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 
@@ -40,6 +42,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 
 // Forward declarations.
 class Batch;
+
 class KvCacheIntrospection;
 class KvCacheManager;
 class StorageManager;
@@ -155,56 +158,6 @@ private:
     std::optional<std::vector<WeakPtr<CommittedPage>>> mPageRefs;
 };
 
-// Independent host metadata for one request's layer group and beam. Events retain copy readiness,
-// not storage ownership: use the indices only while the request is active and its version matches.
-class PageStorageSnapshot
-{
-public:
-    uint64_t version() const noexcept
-    {
-        return mVersion;
-    }
-
-    std::optional<int> row() const noexcept
-    {
-        return mRow;
-    }
-
-    std::vector<int> const& basePageIndices() const noexcept
-    {
-        return mBasePageIndices;
-    }
-
-    // A missing level accompanies BAD_PAGE_INDEX. Valid indices address slots in the indicated level.
-    std::vector<std::optional<CacheLevel>> const& cacheLevels() const noexcept
-    {
-        return mCacheLevels;
-    }
-
-    // Contiguous complete sparse history on host; stops at the first missing or GPU mapping.
-    int eligibleHistoryBlocks() const noexcept
-    {
-        return mEligibleHistoryBlocks;
-    }
-
-    std::vector<CachedCudaEvent> const& readyEvents() const noexcept
-    {
-        return mReadyEvents;
-    }
-
-    // Queue copy-completion dependencies without blocking the CPU or publishing device metadata.
-    void waitReady(CudaStream stream) const;
-
-private:
-    friend class KvCache;
-    uint64_t mVersion = 0;
-    std::optional<int> mRow;
-    std::vector<int> mBasePageIndices;
-    std::vector<std::optional<CacheLevel>> mCacheLevels;
-    int mEligibleHistoryBlocks = 0;
-    std::vector<CachedCudaEvent> mReadyEvents;
-};
-
 // Availability at the claimed prefix, indexed by LayerGroupId. OPTIONAL
 // candidates are held until the first successful resume or close.
 // Describes the initial prefix claim, not subsequent request progress.
@@ -261,23 +214,22 @@ public:
 
     // Resume: check utilization and lock active pages at their required storage levels.
     // Optionally sets a new CUDA stream; if nullopt, uses the existing one.
-    // isDecoding defaults to the current phase. A cache starts in prefill and cannot return to it
-    // after decode admission. Set true when admitting a suspended request directly to decode.
     // Returns false if utilization too high or out of memory.
-    bool resume(std::optional<CUstream> stream = std::nullopt, std::optional<bool> isDecoding = std::nullopt,
+    //
+    // Refused while the cache belongs to a Batch: locking pages writes through the bound
+    // Span, which is the Batch's staged row, so a member is resumed before it joins.
+    bool resume(std::optional<CUstream> stream = std::nullopt,
         std::optional<std::vector<LifeCycleId>> optionalReuseGroups = std::nullopt);
 
-    // Enter decode only after prefill has submitted its final KV accesses. Offloads complete sparse
-    // history, deferring pages still needed on GPU by another owner. Retries deferred pages even
-    // with an unchanged watermark. Returns false on host OOM.
-    bool enterDecode();
-
-    bool isDecoding() const noexcept
-    {
-        return mIsDecoding;
-    }
-
     // Suspend: detach from CUDA stream, unlock pages → PageHolder.
+    //
+    // Refused while the cache belongs to a Batch, for the same reason as resume(): the page
+    // unlocks write kBadPageIndex through the bound Span, which is the Batch's staged row.
+    //
+    // Returns the sparse cache arena lease, which **discards whatever the GPU cache held**.
+    // A lease comes back with every entry free, so a unit whose only copy was in a cell can
+    // no longer be addressed: call Batch::flushSparseUnits() first for anything worth
+    // keeping.
     void suspend();
 
     // Close: release all blocks back to KvCacheManager.
@@ -304,36 +256,22 @@ public:
     // Returns true on success, false when the resize ran out of pages and was rolled back.
     bool resize(std::optional<int> capacity, std::optional<int> historyLength = std::nullopt);
 
+    // ---- Sparse history cache ----------------------------------------------
+
+    //! Bound on capacity - history_length: how far capacity may outrun the watermark.
+    //!
+    //! Derived, not declared. The cache holds a whole selection plus every unit still in
+    //! flight, so whatever the reservation has above the selection width is the in-flight
+    //! headroom, and that headroom in tokens is this bound. Size it through
+    //! BufferConfig::maxCachedUnits.
+    //!
+    //! nullopt when no sparse buffer has a cache, where a bound on in-flight blocks
+    //! describes nothing. The smallest bound across sparse life cycles when several differ.
+    [[nodiscard]] std::optional<int> maxInputLength() const;
+
     // Convenience: set only capacity or history length.
     void setCapacity(int capacity);
     void setHistoryLength(int historyLength);
-
-    //! Internal explicit demotion of complete, locked sparse history. Takes the manager's exclusive lock.
-    //! Duplicate pages and pages already in host history are ignored. Does not advance history length.
-    //! Caller must ensure every owner has finished the execution phase that requires these pages on GPU.
-    void offloadSparsePages(std::vector<SharedPtr<Page>> const& pages);
-
-    // CPU-side invalidation for page indices, levels, readiness, eligibility and row/buffer bindings.
-    // Several changes leave one pending refresh. Acknowledging an older version never clears it.
-    uint64_t pageStorageVersion() const;
-    bool pageStorageDirty() const;
-    // Acknowledge only after refreshing every group/beam from snapshots of this same version.
-    bool acknowledgePageStorage(uint64_t version);
-
-    // Associate a consumer's stable row with this request; nullopt detaches it. Every bind
-    // requires a refresh, including reuse of the same row number by a new consumer. Close detaches it.
-    // Batch members must use Batch::add/remove instead of rebinding directly.
-    void bindPageStorageRow(std::optional<int> row);
-    std::optional<int> pageStorageRow() const;
-
-    // Copies raw indices (no expansion or BAD-to-zero conversion) and readiness under the API lock.
-    // Eligibility is zero for prefill, inactive requests and non-sparse layer groups.
-    PageStorageSnapshot getPageStorageSnapshot(LayerGroupId lgId, BeamIndex beamIdx = kDefaultBeamIndex) const;
-
-    // Call after submitting reads on another stream, before mutating/suspending/closing this cache.
-    // Joins those reads into the request stream so its normal unlock/commit fences protect storage.
-    // Snapshot acquisition, read submission and this call belong to the request's owning thread.
-    void recordPageStorageRead(CudaStream stream);
 
     // ---- Committing tokens -------------------------------------------------
 
@@ -355,7 +293,7 @@ public:
     // Get base page indices (slot_id) for beamIdx × layerGroupId.
     // Returns a non-owning Span into the page-index buffer (owned by this KvCache, or by the
     // caller when set via setBasePageIndexBuf). The span is valid until the next resize(),
-    // setBasePageIndexBuf() or close(); its contents are also rewritten by suspend()/resume() and offload.
+    // setBasePageIndexBuf() or close(); its contents are also rewritten by suspend()/resume().
     Span<int const> getBasePageIndices(LayerGroupId lgId, BeamIndex beamIdx = kDefaultBeamIndex) const;
 
     // Get aggregated (slot-level) page indices for one layer group + beam.
@@ -367,6 +305,11 @@ public:
     // Zero-copy page index buffer: copy current base indices into [buf, buf+len)
     // and arrange that future updateBasePageIndex calls write there too.
     // Pass buf=nullptr / len=0 to revert to the internal vector.
+    //
+    // Refused while this cache belongs to a Batch: membership binds every layer group to a
+    // row of the Batch's table, and a second buffer would take the writes with it, leaving
+    // that row holding whatever it held when the cache joined. Remove it from the Batch
+    // first, or let the Batch be the one holding the buffer worth writing to.
     void setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t* buf, int len);
 
     // ---- Introspection -----------------------------------------------------
@@ -374,6 +317,16 @@ public:
     Status status() const noexcept
     {
         return mStatus;
+    }
+
+    // Row this cache occupies in its Batch, or -1 when it belongs to none.
+    //
+    // Also the answer to who owns its page index buffers: a member's are the Batch's rows,
+    // so setBasePageIndexBuf refuses while it is seated -- including for the Batch, which
+    // ends the membership before handing the indices back.
+    int batchRow() const noexcept
+    {
+        return mBatchRow;
     }
 
     CommitState commitState() const noexcept
@@ -465,7 +418,7 @@ public:
     // Plan dropping SWA blocks needed only by the next conversation turn.
     //
     // The plan covers committed pages in each SWA life cycle's current attention
-    // window. Sparse history, full-attention, and attention-sink blocks are excluded because
+    // window. Full-attention and attention-sink blocks are excluded because
     // later turns may still need them. An SSM life cycle contributes its final block. Must be
     // called after stopCommitting(). Returns nullptr without creating a plan if
     // any required SWA page is unavailable. Mirrors Python's
@@ -507,9 +460,21 @@ public:
 
     CUstream cudaStream() const;
 
+    // A member runs on its Batch's stream. Letting it move would leave the Batch's
+    // transfers and the member's own work ordered against different streams, which is
+    // exactly what a Batch exists to prevent.
+    void setCudaStream(CUstream stream)
+    {
+        if (mBatch != nullptr)
+        {
+            throw LogicError("A KvCache in a Batch runs on the Batch's stream; remove it first to move it");
+        }
+        _setCudaStream(stream);
+    }
+
     // Mirrors Python's cuda_stream setter: if already on a stream AND active,
     // make the new stream wait for the old one before switching (cross-stream sync).
-    void setCudaStream(CUstream stream)
+    void _setCudaStream(CUstream stream)
     {
         if (mCudaStream.has_value())
         {
@@ -594,37 +559,54 @@ public:
     // Whether the given page index mode is supported (SHARED requires no scratch slots).
     bool supportsIndexMode(PageIndexMode mode) const;
 
+    // The same question for one life cycle, which is where the scratch slots actually live.
+    // The overload above collapses them, so one life cycle's scratch makes it answer false
+    // for every other.
+    bool supportsIndexMode(PageIndexMode mode, LifeCycleId lcId) const;
+
     // ---- Internal callbacks (called by SharedPageLock) ----------------------
 
-    // Caller holds the manager's exclusive API lock, including when updating another owner's table.
     int updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc, int value);
 
     std::optional<RequestIdType> id; // opaque identifier (mirrors Python's id field)
 
 private:
     friend class KvCacheIntrospection;
-    friend class UniqPageLock;
     friend class Batch;
     friend std::vector<SharedPageLock> batchedLockPages(
         KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
-
-    void onPageStorageChanged() noexcept;
 
     // Activate: lock active pages at their required levels. mCudaStream must already be set.
     // Internal — called by resume(). Not public (mirrors Python where activate() doesn't exist).
     void activate();
 
-    // Release active locks and scratch slots without recording a scheduler suspension.
-    void _deactivate();
+    // Cache pages this request needs for one life cycle: history entries plus one per
+    // in-flight unit, converted to pages. Zero when the life cycle has no fetch path.
+    //! Cache cells one sparse buffer needs: the history it caches plus every in-flight
+    //! unit, which holds its only copy until a flush reaches it.
+    //!
+    //! This is also the number of slots to reserve. The two coincide because a life cycle's
+    //! buffers of one size coalesce into that pool's slot, so reserving this many slots
+    //! yields exactly this many cells per buffer.
+    [[nodiscard]] int _sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const;
 
-    // Prefill and writable pages require GPU storage. Decode keeps cold sparse history on host.
-    CacheLevel _lockLevel(Page const& page, BlockOrdinal ordinal) const;
+    //! One sparse buffer of a life cycle, in the order SparseCacheView indexes them.
+    struct SparseBufferRef
+    {
+        BufferId id;
+        SelectionUnitLayout layout;
+    };
 
-    // Offload GPU pages in the supplied complete-history range and retry deferred history.
-    // Pages stay on GPU until they belong to every live owner's complete decode history.
-    // The candidate watermark is visible only under the exclusive API lock until offload succeeds.
-    void _offloadSparseHistory(HalfOpenRange<BlockOrdinal> range, int historyLength);
-    void _publishHistoryLength(int historyLength);
+    [[nodiscard]] std::vector<SparseBufferRef> _sparseBuffers(LifeCycleId lifeCycle) const;
+
+    //! Write the cells holding units [fromUnits, toUnits) back to their host pages, on this
+    //! request's stream. Enqueues and returns: stream order is what guarantees a later fetch
+    //! reads the written-back page, and a copy that fails is a broken invariant, not a
+    //! recoverable condition.
+
+    // Whether any life cycle has a configured sparse fetch path, and so whether
+    // max_input_length is required.
+    [[nodiscard]] bool _hasSparseCache() const;
 
     // Internal helpers.
     // Turn the per-block cache levels observed while holding the matched pages into logical token
@@ -663,7 +645,6 @@ private:
         BeamIndex beamIdx;
         LifeCycleId lcId;
         SharedPtr<PageHolder> holder;
-        CacheLevel cacheLevel;
     };
 
     // Unlock stale SWA blocks. Returns backup holders for rollback.
@@ -684,6 +665,7 @@ private:
     std::vector<ActivePage> _activePages() const;
     SharedPtr<Page> _page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycleId lcId) const;
 
+    bool _shortcutSetCapacity(int capacity);
     bool _shortcutSetHistoryLength(int historyLength);
     bool _shouldRecordManagerStats() const;
     bool _shouldRecordRequestStats() const;
@@ -762,7 +744,8 @@ private:
     void _recoverExcessScratchSlots(TypedVec<LifeCycleId, std::vector<ScratchSlotLock>>& excess);
 
     // Release all scratch slots back to storage.
-    void _freeScratchSlots();
+    // Release every GPU slot this request reserves: SWA scratch and sparse history cache.
+    void _freeReservedGpuSlots();
 
     // Whether any lifecycle would require scratch blocks at the current state.
     bool _wouldUseSwaScratchBlocks() const;
@@ -784,9 +767,6 @@ private:
     BeamIndex mBeamWidth;
     int mCapacity;
     int mHistoryLength;
-    bool mIsDecoding = false;
-    // Retry by scanning current blocks; deferred work does not retain pages or other requests.
-    bool mHasDeferredSparseOffload = false;
     std::optional<int> mExpectedPromptLength;
     bool mGenerationAllocReady = false;
 
@@ -796,10 +776,11 @@ private:
     using LifeCyclePageIndexBuffers = TypedVec<LifeCycleId, PageIndexBuf>;
     using BeamPageIndexBuffers = TypedVec<BeamIndex, LifeCyclePageIndexBuffers>;
     BeamPageIndexBuffers mBasePageIndices;
-    Batch* mPageStorageBatch = nullptr; // Non-owning; both destructors detach membership.
-    uint64_t mPageStorageVersion = 0;
-    bool mPageStorageDirty = true;
-    std::optional<int> mPageStorageRow;
+
+    // Set while this cache is a Batch member; the Batch clears both on removal and the
+    // destructor detaches, so a dropped request cannot leave a row pointing at it.
+    Batch* mBatch = nullptr;
+    int mBatchRow = -1;
 
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
     std::vector<FuncGuard<std::function<void()>>> mPartialCopyRetentionHolds;
@@ -822,7 +803,6 @@ private:
     // SSM pages: [beamIdx][lcId] — always initialized (empty entries = monostate).
     BeamBlockPages mSsmBlocks;
     bool mNeverResumed = true;
-    bool mHasResumed = false; // Successful admission, independent of completed deferred copies.
 
     PendingStats mPendingStats;
 
@@ -837,6 +817,16 @@ private:
     // SWA scratch slot support.
     bool mEnableSwaScratchReuse = false;
     TypedVec<LifeCycleId, std::vector<ScratchSlotLock>> mScratchSlots;
+
+    // This request's lease on its sparse cache cells, by life cycle, together with the
+    // device-resident residency, recency and write-back scratch describing them. Taken at
+    // resume(), returned at suspend() and close(). Empty unless a sparse buffer of that
+    // life cycle has its fetch path configured.
+    //
+    // One member rather than two: the cells and the metadata that describes them have the
+    // same lifetime by construction, and with a flat arena the lease is a base index rather
+    // than a list of scattered slots.
+    TypedVec<LifeCycleId, SparseCacheLease> mSparseCache;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

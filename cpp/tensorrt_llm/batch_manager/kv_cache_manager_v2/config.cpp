@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <set>
 #include <stdexcept>
+#include <type_traits>
 #include <variant>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -67,6 +68,14 @@ void KVCacheManagerConfig::validate() const
         std::visit([](auto const& cfg) { cfg.validate(); }, tier);
     }
 
+    // Zero would ask for host-backed pools with no room for a single slot, which is a
+    // configuration error rather than a way to turn them off: whether a pool is host-backed
+    // is a property of the buffer, declared in the layer config.
+    if (hostSparsePoolQuota.has_value() && *hostSparsePoolQuota == 0)
+    {
+        throw AssertionError("KVCacheManagerConfig: host_sparse_pool_quota must be positive when set");
+    }
+
     // Check for duplicate layer ids.
     std::set<LayerId> seenLayerIds;
     for (auto const& layer : layers)
@@ -81,16 +90,29 @@ void KVCacheManagerConfig::validate() const
                 }
                 for (auto const& buf : cfg.buffers)
                 {
-                    if (buf.isSparse && (cacheTiers.size() < 2 || cacheTierOf(cacheTiers[1]) != CacheTier::HOST_MEM))
-                    {
-                        throw std::invalid_argument("Sparse buffers require cache level 1 to use HOST_MEM");
-                    }
                     if (buf.tokensPerBlockOverride.has_value()
                         && (*buf.tokensPerBlockOverride <= 0 || tokensPerBlock % *buf.tokensPerBlockOverride != 0))
                     {
                         throw AssertionError(
                             "KVCacheManagerConfig: tokensPerBlockOverride must be a divisor of "
                             "tokensPerBlock");
+                    }
+                }
+                if constexpr (std::is_same_v<std::decay_t<decltype(cfg)>, AttentionLayerConfig>)
+                {
+                    if (cfg.sparseCache.has_value())
+                    {
+                        cfg.sparseCache->validate(tokensPerBlock);
+                        int const unitsPerPage = cfg.sparseCache->unitsPerPage(tokensPerBlock);
+                        for (auto const& buf : cfg.buffers)
+                        {
+                            // Checked here rather than at the first fetch: a deployment that
+                            // only finds out mid-step has already begun serving.
+                            if (buf.isSparse)
+                            {
+                                buf.sparseLayout(unitsPerPage);
+                            }
+                        }
                     }
                 }
             },

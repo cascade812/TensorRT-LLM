@@ -76,9 +76,16 @@ public:
     //! return only once the whole range is committed, which is what an owner
     //! that hands out raw pointers without any further bookkeeping needs.
     //!
-    //! Pass false only when every reader of this range calls waitUsable() with
-    //! the offset it is about to touch. Reaching past the watermark faults, so
-    //! a reader that skips it fails loudly rather than reading zeros.
+    //! Pass false only when the range is covered by a waitUsable() somewhere
+    //! above. One wait where the memory is handed out is what that takes, not a
+    //! wait per read: once a byte is backed it stays backed, so an owner that
+    //! waits before publishing a sub-range has already covered every later read
+    //! of it. Reaching past the watermark faults, so a range that nothing waits
+    //! for fails loudly rather than reading zeros.
+    //!
+    //! Do not add a second wait on the read path to be safe. It cannot find an
+    //! unbacked byte the handout wait would have missed, and on a hot path it
+    //! costs an atomic load per access for nothing.
     HostMem(size_t vmSize, size_t initialSize, HostMemBackingOptions const& options = {}, bool waitForFill = true);
 
     //! Reserves exactly as much as it commits, for an allocation that never

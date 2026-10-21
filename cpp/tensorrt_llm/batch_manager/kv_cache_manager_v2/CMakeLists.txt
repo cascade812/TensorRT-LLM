@@ -39,7 +39,6 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
 endif()
 
 set(KV_CACHE_MANAGER_V2_SRCS
-    kv_cache_manager_v2/batch.cpp
     kv_cache_manager_v2/common.cpp
     kv_cache_manager_v2/config.cpp
     kv_cache_manager_v2/lifeCycleRegistry.cpp
@@ -65,6 +64,10 @@ set(KV_CACHE_MANAGER_V2_SRCS
     kv_cache_manager_v2/page.cpp
     kv_cache_manager_v2/storageManager.cpp
     kv_cache_manager_v2/introspection.cpp
+    kv_cache_manager_v2/batch.cpp
+    kv_cache_manager_v2/sparseCache.cpp
+    kv_cache_manager_v2/sparseCacheKernels.cu
+    kv_cache_manager_v2/indexConversionKernels.cu
     kv_cache_manager_v2/kvCache.cpp
     kv_cache_manager_v2/kvCacheManager.cpp
     ${SHA256_SRCS})

@@ -29,6 +29,7 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -290,6 +291,12 @@ public:
     //! vmSize is the address space reserved up front, and so the bound on every
     //! later resize. Reserving it all at once is what keeps the base address
     //! fixed, as it does for GpuSlotPool.
+    //!
+    //! The backing memory is committed on a worker thread, so a slot may exist
+    //! before it is backed. Closing that gap is the owning pool group's job: it
+    //! calls waitSlotUsable() before returning a slot from allocate(), which is
+    //! the single point every later use of that slot passes through. Readers of
+    //! slotAddress() must not wait again -- see HostMem's constructor.
     HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, HostMemBackingOptions const& options);
 
     SlotCount numSlots() const noexcept override;
@@ -302,7 +309,16 @@ public:
     //! Blocks until `slot` is backed by physical memory.
     //!
     //! Rethrows the fill worker's exception if the fill failed.
+    //!
+    //! For the owning pool group's allocate() to call, once per slot handed out.
+    //! Calling it anywhere else is redundant: backing is permanent, so a slot
+    //! that passed this check at handout stays usable for as long as it is held.
     void waitSlotUsable(SlotId slot) const;
+
+    [[nodiscard]] HostMem const* hostMem() const noexcept
+    {
+        return &mHostMem;
+    }
 
 private:
     //! Declared before mHostMem: alignedSize() reads it while building mHostMem.
@@ -348,6 +364,21 @@ class PoolGroupBase
 public:
     explicit PoolGroupBase(SlotCount numSlots);
     virtual ~PoolGroupBase();
+
+    //! What this pool group's memory actually is.
+    //!
+    //! A property of the pool group rather than of its level, because groups of one level
+    //! can differ in medium. A GPU-tier group reports GPU_MEM even when some of its pools
+    //! are host-backed; isSparse(PoolIndex) names those, and anything choosing a copy
+    //! implementation must ask per pool rather than per group.
+    [[nodiscard]] virtual CacheTier cacheTier() const noexcept = 0;
+
+    //! Whether this pool's pages are host memory rather than this tier's own medium.
+    //! True only for a sparse pool of the GPU tier.
+    [[nodiscard]] virtual bool isSparse(PoolIndex) const noexcept
+    {
+        return false;
+    }
 
     PoolIndex numPools() const noexcept
     {
@@ -401,6 +432,36 @@ public:
         return total;
     }
 
+    //! The part of roundedNumBytes that is host memory: the sparse pools alone. The
+    //! complement of denseNumBytes.
+    size_t sparseNumBytes(size_t granularity) const noexcept
+    {
+        size_t total = 0;
+        for (PoolIndex pool{0}; pool < mPools.size(); ++pool)
+        {
+            if (isSparse(pool))
+            {
+                total += roundUp(mPools.at(pool)->numBytes(), granularity);
+            }
+        }
+        return total;
+    }
+
+    //! The part of roundedNumBytes this tier's quota pays for: the dense pools. Sparse
+    //! pools are host memory and are not counted.
+    size_t denseNumBytes(size_t granularity) const noexcept
+    {
+        size_t total = 0;
+        for (PoolIndex pool{0}; pool < mPools.size(); ++pool)
+        {
+            if (!isSparse(pool))
+            {
+                total += roundUp(mPools.at(pool)->numBytes(), granularity);
+            }
+        }
+        return total;
+    }
+
 protected:
     // Mirrors Python _get_num_slots_from_pools: min(p.num_slots for p in pools).
     SlotCount getNumSlotsFromPools() const noexcept;
@@ -416,8 +477,49 @@ protected:
 class GpuPoolGroup : public PoolGroupBase
 {
 public:
-    GpuPoolGroup(
-        SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, PooledPhysMemAllocator& physMemAllocator);
+    //! `sparsity`, when given, marks the pools to allocate from host memory instead of
+    //! device memory. They hold a sparse buffer's pages: ordinary hot pages that are read
+    //! through the sparse GPU cache rather than directly, so they are device-mapped but do
+    //! not consume the tier's device budget.
+    //!
+    //! The group still reports GPU_MEM. Migration never reads the hot side's tier -- the
+    //! codec path keeps only the cold side's -- and host memory is device-accessible, so a
+    //! mixed group needs no second tier.
+    GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
+        PooledPhysMemAllocator& physMemAllocator, TypedVec<PoolIndex, bool> sparsity = {});
+
+    [[nodiscard]] CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::GPU_MEM;
+    }
+
+    [[nodiscard]] bool isSparse(PoolIndex poolIndex) const noexcept override
+    {
+        return poolIndex < mSparsity.size() && mSparsity[poolIndex];
+    }
+
+    //! The host allocation behind a sparse pool, or nullptr for a device-backed one.
+    [[nodiscard]] HostMem const* hostMem(PoolIndex poolIndex) const;
+
+    //! Sparse pools are host memory committed progressively on a background thread, so
+    //! both entry points block until the slots they return are usable, as HostPoolGroup
+    //! does. A group with no sparse pool has nothing to wait for.
+    //!
+    //! These two are the whole of this group's fill synchronization. Nothing downstream
+    //! of them -- not slotAddress(), not the device mapping the sparse cache reads the
+    //! pages through -- needs to wait again, and adding a wait there would only pay for
+    //! a check that cannot fail.
+    Slot allocate() override;
+    std::vector<Slot> allocateMultiple(SlotCount numSlots) override;
+
+private:
+    //! Blocks until every sparse pool backs the byte range ending just past `slot`.
+    void waitSlotUsable(SlotId slot) const;
+
+    //! One flag per pool.
+    TypedVec<PoolIndex, bool> mSparsity;
+    //! Whether any pool is sparse, so the common dense-only group skips the wait.
+    bool mHasSparsePool = false;
 };
 
 //! Host pools are committed progressively on a background thread, so a slot may
@@ -428,6 +530,10 @@ public:
 //! recycled slots are reused first, so the Nth fresh allocation waits only for
 //! the chunk containing it, and once the fill completes every wait is a single
 //! relaxed load.
+//!
+//! Those two entry points are the only place this tier waits on the fill, and the
+//! only place it needs to: a slot stays backed for as long as it is held, so code
+//! that receives one has nothing left to check. Do not add a wait to a read path.
 class HostPoolGroup : public PoolGroupBase
 {
 public:
@@ -438,6 +544,13 @@ public:
     //! pool today, which makes the two equal.
     HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t groupVmSize,
         HostMemBackingOptions const& options = {});
+
+    [[nodiscard]] HostMem const* hostMem(PoolIndex poolIndex) const;
+
+    [[nodiscard]] CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::HOST_MEM;
+    }
 
     Slot allocate() override;
     std::vector<Slot> allocateMultiple(SlotCount numSlots) override;
@@ -451,18 +564,60 @@ class DiskPoolGroup : public PoolGroupBase
 {
 public:
     DiskPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, std::string const& directory);
+
+    [[nodiscard]] CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::DISK;
+    }
 };
 
 // ---------------------------------------------------------------------------
 // CacheLevelStorage — manages all pool groups for one cache tier.
 // Mirrors _storage/_core.py::CacheLevelStorage.
 // ---------------------------------------------------------------------------
+//! A second medium's budget over a disjoint subset of each pool group's pools.
+//!
+//! A slot spans every pool of its group, so one slot count drives the bytes taken in every
+//! pool -- but the pools of the GPU tier are of two media, each with its own total and its
+//! own allocation grain. This names the second one. `pools[pg]` lists exactly the pools
+//! `quota` pays for; the primary selector passed beside it lists exactly the pools the
+//! primary quota pays for. The two are complements: no pool is named by both, and together
+//! they are all of the group's pools.
+//!
+//! `pools[pg]` may be empty, which is how "this group costs the second medium nothing" is
+//! said. Such a group takes no share of `quota` and can never be bound by it.
+struct SecondaryPoolBudget
+{
+    //! Bytes of the second medium, for the whole level, or unset to leave it unbounded.
+    //! A budget, not a per-group maximum: how it divides between groups is what the
+    //! allocator decides.
+    //!
+    //! Unset still matters. `pools` is what the primary quota does *not* pay for, which is
+    //! a property of the pools rather than of any budget: leaving it out would charge host
+    //! memory to a device quota. So a level with sparse pools always passes this, and only
+    //! `quota` says whether anything bounds them.
+    std::optional<size_t> quota;
+    //! The second medium's allocation grain, which is a property of its allocator rather
+    //! than of the level. Host-backed pools round to HostMem::kAlignment, not to the device
+    //! granularity, so charging them in device grains would over-count every one of them.
+    size_t granularity = 0;
+    //! The pools `quota` pays for, per pool group.
+    TypedVec<PoolGroupIndex, std::vector<PoolIndex>> pools;
+};
+
 class CacheLevelStorage
 {
 public:
     virtual ~CacheLevelStorage() = default;
 
     virtual CacheTier cacheTier() const noexcept = 0;
+
+    //! What one pool group's memory actually is. Differs from cacheTier() only at the hot
+    //! level, where a sparse life cycle's pool group is host memory.
+    [[nodiscard]] CacheTier cacheTier(PoolGroupIndex pgIdx) const
+    {
+        return mPoolGroups.at(pgIdx)->cacheTier();
+    }
 
     PoolGroupIndex numPoolGroups() const noexcept
     {
@@ -511,12 +666,25 @@ public:
         return std::get<MemAddress>(mPoolGroups.at(pgIdx)->slotAddress(slotId).at(poolIdx));
     }
 
+    //! Host bytes this level holds for sparse pools, which its quota does not pay for.
+    size_t sparseHostBytes() const noexcept
+    {
+        size_t granularity = poolSizeGranularity();
+        size_t total = 0;
+        for (auto const& pg : mPoolGroups)
+            total += pg->sparseNumBytes(granularity);
+        return total;
+    }
+
+    //! Bytes this level's quota is paying for. Host-backed sparse pools are excluded: the
+    //! quota measures one medium, and a rebalance that defaulted to an inflated figure
+    //! would hand the level more slots than the device can hold.
     size_t totalQuota() const noexcept
     {
         size_t granularity = poolSizeGranularity();
         size_t total = 0;
         for (auto const& pg : mPoolGroups)
-            total += pg->roundedNumBytes(granularity);
+            total += pg->denseNumBytes(granularity);
         return total;
     }
 
@@ -527,6 +695,35 @@ public:
         ret.reserve(mPoolGroups.size());
         for (auto const& pg : mPoolGroups)
             ret.push_back(pg->numSlots());
+        return ret;
+    }
+
+    //! The pools whose pages are host memory, as indices into slotSizeLists()[pg].
+    //!
+    //! Empty everywhere but the hot level: sparsity is declared per buffer and only the hot
+    //! level separates pools by it. A cold group is a single pool holding whatever the codec
+    //! packs into it, dense and sparse buffers alike, and reports itself unsparse; so does a
+    //! GPU tier that happens to be a cold level. An empty answer is also what a hot level
+    //! with no sparse buffer gives.
+    //!
+    //! The pools this level's quota pays for are the complement, which the allocator derives
+    //! rather than taking: that way no pool can be charged twice or missed.
+    [[nodiscard]] TypedVec<PoolGroupIndex, std::vector<PoolIndex>> sparsePools() const
+    {
+        TypedVec<PoolGroupIndex, std::vector<PoolIndex>> ret;
+        ret.reserve(mPoolGroups.size());
+        for (auto const& pg : mPoolGroups)
+        {
+            std::vector<PoolIndex> sparse;
+            for (PoolIndex pool{0}; pool < pg->slotSize().size(); ++pool)
+            {
+                if (pg->isSparse(pool))
+                {
+                    sparse.push_back(pool);
+                }
+            }
+            ret.push_back(std::move(sparse));
+        }
         return ret;
     }
 
@@ -546,14 +743,51 @@ public:
         return ret;
     }
 
-    // Current ratio list: proportion of bytes per pool group.
+    //! Bytes each pool group holds at `slotCounts`, every pool in the grain of the medium it
+    //! lives in: dense pools in this level's granularity, sparse ones in the host alignment
+    //! their pages are actually rounded to.
+    //!
+    //! This is the measure the pool ratio speaks in, and the one the allocator divides
+    //! against. Measuring sparse pools in device grains instead -- they differ by up to
+    //! 8192x -- would put the two sides of a rebalance's comparison in different units.
+    [[nodiscard]] TypedVec<PoolGroupIndex, size_t> allBytes(TypedVec<PoolGroupIndex, SlotCount> const& slotCounts) const
+    {
+        TypedVec<PoolGroupIndex, size_t> ret(mPoolGroups.size(), 0);
+        for (PoolGroupIndex pgIdx{0}; pgIdx < mPoolGroups.size(); ++pgIdx)
+        {
+            auto const& pg = mPoolGroups[pgIdx];
+            size_t total = 0;
+            for (PoolIndex pool{0}; pool < pg->slotSize().size(); ++pool)
+            {
+                auto const grain = pg->isSparse(pool) ? HostMem::kAlignment : poolSizeGranularity();
+                total += roundUp(slotCountToSizeT(slotCounts[pgIdx]) * pg->slotSize().at(pool), grain);
+            }
+            ret[pgIdx] = total;
+        }
+        return ret;
+    }
+
+    //! Current ratio list: proportion of bytes per pool group.
+    //!
+    //! Counts every pool, host-backed ones included -- unlike totalQuota(), which pays for
+    //! the dense ones alone. The asymmetry is deliberate: this ratio is projected onto cold
+    //! levels, where one pool holds dense and sparse buffers together, and it is what a
+    //! rebalance compares its target against. Both sides of that comparison have to measure
+    //! the same bytes or it never settles; see "The quota excludes sparse pools; the ratio
+    //! counts them" in SPARSE_ATTENTION_DESIGN.md.
     TypedVec<PoolGroupIndex, float> ratioList() const
     {
+        TypedVec<PoolGroupIndex, SlotCount> counts(mPoolGroups.size(), 0);
+        for (PoolGroupIndex pgIdx{0}; pgIdx < mPoolGroups.size(); ++pgIdx)
+        {
+            counts[pgIdx] = mPoolGroups[pgIdx]->numSlots();
+        }
+        auto const bytes = allBytes(counts);
         TypedVec<PoolGroupIndex, float> ret(mPoolGroups.size(), 0.f);
         float total = 0.f;
         for (PoolGroupIndex pgIdx{0}; pgIdx < mPoolGroups.size(); ++pgIdx)
         {
-            auto sz = static_cast<float>(mPoolGroups[pgIdx]->numBytes());
+            auto sz = static_cast<float>(bytes[pgIdx]);
             ret[pgIdx] = sz;
             total += sz;
         }
@@ -577,26 +811,50 @@ public:
         return std::nullopt;
     }
 
-    // Compute slot counts per pool group for a given ratio, min_slots, and optional quota.
-    // Instance convenience method — delegates to the static version below.
-    TypedVec<PoolGroupIndex, SlotCount> computeSlotCountList(TypedVec<PoolGroupIndex, float> const& ratioList,
-        TypedVec<PoolGroupIndex, SlotCount> const& minSlots, std::optional<size_t> quota = std::nullopt) const;
-
-    // Static version: compute slot counts from quota, slot size lists, ratio, granularity, and min_slots.
-    // Mirrors Python CacheLevelStorage.ratio_to_slot_count_list.
+    //! Divide `quota` between pool groups by `ratioList`, honouring `minSlots` as a floor,
+    //! and `secondBudget` as a second medium's total over a disjoint set of the same pools.
+    //!
+    //! `slotSizeLists` holds every pool's size; `pools[pg]` names the ones `quota` pays for
+    //! and `secondBudget->pools[pg]` the ones its own quota pays for. A slot spans all of
+    //! them, so one count per group settles both media at once.
+    //!
+    //! Both budgets and the floors are kept exactly; the ratio is the only soft bound. The
+    //! floors come off the top rather than out of anyone's share, so no division of the rest
+    //! can break one, and a group bound by either budget releases what it does not use of
+    //! the other -- which is the whole reason this is one pass rather than a quota followed
+    //! by a clamp. A group named by neither budget for a medium costs that medium nothing.
+    //!
+    //! The two budgets can only conflict at the floors, and that condition names neither the
+    //! ratio nor `quota`. It is therefore a property of the configuration: it is rejected the
+    //! first time this runs, and a rebalance -- which changes both of those and none of the
+    //! terms in the condition -- cannot begin to fail.
+    //!
+    //! With `secondBudget` unset this is the single-budget allocator, unchanged.
+    //!
+    //! @throws std::runtime_error when the floors alone exceed either budget.
     static TypedVec<PoolGroupIndex, SlotCount> ratioToSlotCountList(size_t quota,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         TypedVec<PoolGroupIndex, float> const& ratioList, size_t granularity,
-        TypedVec<PoolGroupIndex, SlotCount> const& minSlots);
+        TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+        std::optional<SecondaryPoolBudget> const& secondBudget = std::nullopt);
 
-    // Distribute grains among pools within a pool group.
-    // Returns {num_slots, grains_consumed}.
-    static std::pair<SlotCount, size_t> grainsToSlots(
-        size_t pgGrains, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t granularity);
+    //! The pools `quota` pays for: every pool the second budget does not name.
+    //!
+    //! Derived rather than given, so the two budgets partition the group's pools by
+    //! construction -- a pool cannot be charged to both, nor left to neither.
+    static TypedVec<PoolGroupIndex, std::vector<PoolIndex>> poolsPaidByQuota(
+        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
+        std::optional<SecondaryPoolBudget> const& secondBudget);
 
-    // Compute minimum grains needed for numSlots in a pool group.
-    static size_t grainsForSlots(
-        SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t granularity);
+    // Distribute grains among the named pools of one pool group.
+    // Returns {num_slots, grains_consumed}. `which` must not be empty.
+    static std::pair<SlotCount, size_t> grainsToSlots(size_t pgGrains, TypedVec<PoolIndex, size_t> const& slotSizeList,
+        std::vector<PoolIndex> const& which, size_t granularity);
+
+    // Minimum grains the named pools of one pool group need for numSlots. Zero for an empty
+    // `which`, which is what lets a group with no pool of a medium cost that medium nothing.
+    static size_t grainsForSlots(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
+        std::vector<PoolIndex> const& which, size_t granularity);
 
 protected:
     TypedVec<PoolGroupIndex, std::unique_ptr<PoolGroupBase>> mPoolGroups;
@@ -605,6 +863,10 @@ protected:
 class GpuCacheLevelStorage : public CacheLevelStorage
 {
 public:
+    //! Sparse pools are allocated from host memory, which each SlotDesc declares per pool.
+    //! Their pages are too large for device memory and are read through the sparse cache
+    //! rather than directly, so they live on the hot level as ordinary pages that merely
+    //! happen to be host-resident.
     GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
         TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator);
 
