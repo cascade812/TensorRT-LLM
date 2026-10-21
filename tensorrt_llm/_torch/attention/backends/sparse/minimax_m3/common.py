@@ -75,6 +75,9 @@ class MiniMaxM3SparseParams(SparseParams):
     implementation: Literal["triton", "msa"] = "triton"
     indexer_kv_dtype: Literal["bf16", "fp8"] = "bf16"
     fuse_qkv_index_projection: bool = False
+    # Sparse layers keep their K/V history in host memory; decode reads the
+    # selected blocks through a per-request GPU cache.
+    enable_kv_cache_offload: bool = False
 
     @property
     def indices_block_size(self) -> int:

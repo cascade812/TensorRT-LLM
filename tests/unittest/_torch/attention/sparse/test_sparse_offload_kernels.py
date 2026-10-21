@@ -6,8 +6,12 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.offload_kernels import (
+    SPARSE_IN_FLIGHT_COLUMN,
+    complete_sparse_tails,
+    copy_pages,
     gather_sparse_batch_rows,
     merge_sparse_arena_indices,
+    select_sparse_history_unit_union,
     select_sparse_history_units,
 )
 
@@ -260,3 +264,196 @@ def test_gather_rejects_invalid_layout(invalid):
         out = torch.empty(3, dtype=torch.int32, device="cuda")
     with pytest.raises(ValueError):
         gather_sparse_batch_rows(values, rows, out)
+
+
+def _union_reference(head_topk, requests, batch_rows, active, history, width, unit_tokens):
+    num_rows = history.numel()
+    out = torch.full((num_rows, width), -1, dtype=torch.int32)
+    columns = torch.full(head_topk.shape, -1, dtype=torch.int32)
+    for query, request in enumerate(requests.tolist()):
+        if query >= active or not 0 <= request < active:
+            continue
+        row = batch_rows[request].item()
+        if not 0 <= row < num_rows:
+            continue
+        history_units = history[row].item() // unit_tokens
+        picks = head_topk[:, query, :]
+        union = sorted({unit for unit in picks.flatten().tolist() if 0 <= unit < history_units})
+        out[row, : min(width, len(union))] = torch.tensor(union[:width], dtype=torch.int32)
+        for head in range(picks.shape[0]):
+            for k, unit in enumerate(picks[head].tolist()):
+                if 0 <= unit < history_units and union.index(unit) < width:
+                    columns[head, query, k] = union.index(unit)
+                elif unit == history_units:
+                    columns[head, query, k] = SPARSE_IN_FLIGHT_COLUMN
+    return out, columns
+
+
+@_requires_cuda
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("active", [0, 2, 3])
+def test_union_sorts_distinct_history_picks_into_batch_rows(strided, active):
+    num_rows, num_heads, topk, unit_tokens = 5, 4, 6, 128
+    history = torch.tensor([7 * 128 + 5, 0, 300, 12 * 128, 99], dtype=torch.int32)
+    batch_rows = torch.tensor([3, 0, 2, -1, -1], dtype=torch.int32)
+    # Heads overlap and repeat units; each names the in-flight block of its row too.
+    head_topk = torch.full((num_heads, 3, topk), -1, dtype=torch.int32)
+    head_topk[:, 0, :] = torch.tensor(
+        [
+            [0, 3, 5, 12, -1, -1],
+            [3, 4, 11, 12, -1, -1],
+            [1, 11, 12, -1, -1, -1],
+            [0, 1, 2, 12, 12, -1],
+        ]
+    )
+    head_topk[:, 1, :3] = torch.tensor([[0, 7, 6], [7, 2, 6], [6, -1, -1], [7, 1, 3]])
+    head_topk[:, 2, :2] = torch.tensor([[0, 1], [2, 1], [0, 2], [1, 2]])
+    requests = torch.tensor([0, 1, 2], dtype=torch.int32)
+    width = num_heads * (topk - 1)
+    out = torch.full((num_rows, width), 777, dtype=torch.int32, device="cuda")
+    columns = torch.full(head_topk.shape, 777, dtype=torch.int32, device="cuda")
+    select_sparse_history_unit_union(
+        _cuda_tensor(head_topk, strided),
+        _cuda_tensor(requests),
+        _cuda_tensor(batch_rows),
+        _cuda_tensor([active]),
+        _cuda_tensor(history),
+        out,
+        columns,
+        unit_tokens=unit_tokens,
+    )
+    expected_out, expected_columns = _union_reference(
+        head_topk, requests, batch_rows, active, history, width, unit_tokens
+    )
+    assert torch.equal(out.cpu(), expected_out)
+    assert torch.equal(columns.cpu(), expected_columns)
+
+
+@_requires_cuda
+def test_union_matches_reference_for_random_picks():
+    generator = torch.Generator().manual_seed(0)
+    num_rows, num_heads, topk, unit_tokens, queries = 16, 4, 16, 128, 11
+    history = torch.randint(0, 64 * 128, (num_rows,), generator=generator, dtype=torch.int32)
+    batch_rows = torch.full((num_rows,), -1, dtype=torch.int32)
+    batch_rows[:queries] = torch.randperm(num_rows, generator=generator)[:queries].to(torch.int32)
+    head_topk = torch.full((num_heads, queries, topk), -1, dtype=torch.int32)
+    for query in range(queries):
+        units = history[batch_rows[query]].item() // unit_tokens + 1
+        for head in range(num_heads):
+            picks = torch.randperm(units, generator=generator)[:topk].to(torch.int32)
+            head_topk[head, query, : picks.numel()] = picks.sort().values
+    requests = torch.arange(queries, dtype=torch.int32)
+    width = num_heads * (topk - 1)
+    out = torch.empty((num_rows, width), dtype=torch.int32, device="cuda")
+    columns = torch.empty(head_topk.shape, dtype=torch.int32, device="cuda")
+    select_sparse_history_unit_union(
+        head_topk.cuda(),
+        requests.cuda(),
+        batch_rows.cuda(),
+        _cuda_tensor([queries]),
+        history.cuda(),
+        out,
+        columns,
+        unit_tokens=unit_tokens,
+    )
+    expected_out, expected_columns = _union_reference(
+        head_topk, requests, batch_rows, queries, history, width, unit_tokens
+    )
+    assert torch.equal(out.cpu(), expected_out)
+    assert torch.equal(columns.cpu(), expected_columns)
+
+
+@_requires_cuda
+def test_union_replays_in_a_cuda_graph_with_new_picks_and_rows():
+    num_rows, num_heads, topk = 4, 2, 4
+    head_topk = torch.full((num_heads, 2, topk), -1, dtype=torch.int32, device="cuda")
+    requests = torch.arange(2, dtype=torch.int32, device="cuda")
+    batch_rows = torch.full((num_rows,), -1, dtype=torch.int32, device="cuda")
+    active = torch.zeros(1, dtype=torch.int32, device="cuda")
+    history = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
+    out = torch.empty((num_rows, num_heads * (topk - 1)), dtype=torch.int32, device="cuda")
+    columns = torch.empty(head_topk.shape, dtype=torch.int32, device="cuda")
+    args = (head_topk, requests, batch_rows, active, history, out, columns)
+    select_sparse_history_unit_union(*args, unit_tokens=128)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        select_sparse_history_unit_union(*args, unit_tokens=128)
+    for step in range(3):
+        picks = torch.tensor([[0, step, 4, -1], [step + 1, 4, -1, -1]], dtype=torch.int32)
+        head_topk[:, 0, :].copy_(picks)
+        head_topk[:, 1, :].copy_(picks.flip(0))
+        batch_rows.copy_(torch.tensor([step % num_rows, (step + 1) % num_rows, -1, -1]))
+        active.fill_(2)
+        history.fill_(4 * 128 + 3)
+        graph.replay()
+        expected_out, expected_columns = _union_reference(
+            head_topk.cpu(),
+            requests.cpu(),
+            batch_rows.cpu(),
+            2,
+            history.cpu(),
+            out.shape[1],
+            128,
+        )
+        assert torch.equal(out.cpu(), expected_out)
+        assert torch.equal(columns.cpu(), expected_columns)
+
+
+@_requires_cuda
+def test_copy_pages_moves_each_page_between_any_two_addresses():
+    source = torch.arange(3 * 4096, dtype=torch.int32, device="cuda").view(3, 4096)
+    pinned = torch.zeros((2, 1024), dtype=torch.int32).pin_memory()
+    target = torch.zeros((2, 4096), dtype=torch.int32, device="cuda")
+    # Device to device, then device to mapped host memory and back.
+    copy_pages(
+        torch.tensor(
+            [source[2].data_ptr(), source[0].data_ptr(), source[1].data_ptr()],
+            dtype=torch.int64,
+            device="cuda",
+        ),
+        torch.tensor(
+            [target[0].data_ptr(), target[1].data_ptr(), pinned[1].data_ptr()],
+            dtype=torch.int64,
+            device="cuda",
+        ),
+        torch.tensor([4096 * 4, 2048 * 4, 1024 * 4], dtype=torch.int64, device="cuda"),
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(target[0], source[2])
+    assert torch.equal(target[1, :2048], source[0, :2048])
+    assert (target[1, 2048:] == 0).all()
+    assert torch.equal(pinned[1], source[1, :1024].cpu())
+    assert (pinned[0] == 0).all()
+
+
+@_requires_cuda
+def test_complete_sparse_tails_copies_only_rows_with_a_unit_in_flight():
+    rows, page_words = 4, 64
+    tails = [
+        torch.arange(rows * page_words, dtype=torch.int64, device="cuda").view(rows, page_words)
+        + 1000 * buffer
+        for buffer in range(2)
+    ]
+    arenas = [torch.zeros((10, page_words), dtype=torch.int64, device="cuda") for _ in range(2)]
+    writes = torch.tensor([[3, 7], [-1, -1], [0, 2], [-1, -1]], dtype=torch.int32, device="cuda")
+
+    def array(values):
+        return torch.tensor(values, dtype=torch.int64, device="cuda")
+
+    page_bytes = page_words * 8
+    complete_sparse_tails(
+        writes,
+        array([tail.data_ptr() for tail in tails]),
+        array([page_bytes, page_bytes]),
+        array([arena.data_ptr() for arena in arenas]),
+        array([page_bytes, page_bytes]),
+        array([0, 1]),
+        array([page_words, page_words]),
+    )
+    torch.cuda.synchronize()
+    for buffer in range(2):
+        expected = torch.zeros_like(arenas[buffer])
+        for row, cells in enumerate(writes.tolist()):
+            if cells[buffer] >= 0:
+                expected[cells[buffer]] = tails[buffer][row]
+        assert torch.equal(arenas[buffer], expected)

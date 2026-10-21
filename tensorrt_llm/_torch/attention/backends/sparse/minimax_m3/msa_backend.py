@@ -38,10 +38,16 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..offload import (
+    SparseOffloadState,
+    allocate_sparse_offload_state,
+    get_sparse_offload_metadata_layers,
+)
 from .common import (
     MiniMaxM3SparseConfig,
     MiniMaxM3SparseMetadataParams,
@@ -182,6 +188,13 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     msa_q_batch_row: Optional[torch.Tensor] = None
     msa_q_intra: Optional[torch.Tensor] = None
     msa_kv_lens_staged: Optional[torch.Tensor] = None
+    # KV cache offload, decode-only: the shared per-step state, each new token's
+    # tail slot (Batch row * tokens_per_block + position in its block), each
+    # (local KV head, pick)'s union column, and the requests' input positions.
+    msa_offload_state: Optional[SparseOffloadState] = None
+    msa_offload_tail_slots: Optional[torch.Tensor] = None
+    msa_offload_pick_columns: Optional[torch.Tensor] = None
+    msa_offload_request_indices: Optional[torch.Tensor] = None
 
     # _msa_buffers_ready gates the once-only device buffers;
     # _msa_fields_ready marks that the current step's buffers are populated.
@@ -513,6 +526,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        if getattr(kv_cache_manager, "_enable_kv_cache_offload", False):
+            self._create_msa_offload_buffers(max_num_sequences, max_num_tokens)
         # The proxy scratch needs the fmha_sm100 plan geometry. This metadata
         # exists only for the MSA backend, whose selection already required the
         # kernels, so a failed import here is a hard error rather than a reason
@@ -534,6 +549,81 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 capture_graph=capture_graph,
             )
         self._msa_buffers_ready = True
+
+    def _create_msa_offload_buffers(self, max_num_sequences: int, max_num_tokens: int) -> None:
+        """Allocate the offload state, tail slots and union columns, graph-stable.
+
+        The state holds one row per native Batch row; the union columns one per
+        (local KV head, request, pick), matching the indexer's head-major picks.
+        """
+        manager = self.kv_cache_manager
+        topk = manager._sparse_offload_topk
+        layers = get_sparse_offload_metadata_layers(self, topk=topk)
+        if not layers:
+            return
+        buffers = self.cuda_graph_buffers
+        capture_graph = self.is_cuda_graph
+
+        def allocate(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+            return self.get_empty(
+                buffers,
+                shape,
+                cache_name=f"msa_offload_{name}",
+                dtype=dtype,
+                capture_graph=capture_graph,
+            )
+
+        self.msa_offload_state = allocate_sparse_offload_state(
+            allocate, layers, max_batch_size=manager.max_batch_size, topk=topk
+        )
+        num_kv_heads = max(
+            manager.num_kv_heads_per_layer[manager.layer_offsets[layer]] for layer in layers
+        )
+        self.msa_offload_pick_columns = allocate(
+            "pick_columns", (num_kv_heads, max_num_sequences, MSA_REQUIRED_TOPK), torch.int32
+        )
+        self.msa_offload_pick_columns.fill_(-1)
+        self.msa_offload_tail_slots = allocate("tail_slots", (max_num_tokens,), torch.int32)
+        self.msa_offload_tail_slots.fill_(-1)
+        self.msa_offload_request_indices = allocate(
+            "request_indices", (max_num_sequences,), torch.int32
+        )
+        torch.arange(max_num_sequences, dtype=torch.int32, out=self.msa_offload_request_indices)
+
+    def _prepare_msa_offload(self) -> None:
+        """Map this step's requests to their Batch rows and new tokens to tail slots.
+
+        Runs in prepare(), outside capture, after the Batch was published. A new
+        token at position p of its request goes to its row's tail at p modulo the
+        page size; graph padding has no row and writes nothing.
+        """
+        state = self.msa_offload_state
+        manager = self.kv_cache_manager
+        manager.prepare_sparse_offload(state, self.request_ids, beam_width=self.beam_width)
+        num_tokens = int(self.num_tokens)
+        page_size = int(manager.tokens_per_block)
+        rows = state.batch_rows[:num_tokens]
+        slots = self.msa_offload_tail_slots[:num_tokens]
+        # slot = row * page_size + (kv_len - 1) % page_size, or -1 without a row.
+        torch.remainder(self.msa_seq_lens_cuda[:num_tokens] - 1, page_size, out=slots)
+        slots.add_(rows * page_size)
+        slots.masked_fill_(rows < 0, -1)
+        self.msa_offload_tail_slots[num_tokens:].fill_(-1)
+
+    def _check_msa_offload_batch(self) -> None:
+        """Refuse what offload cannot serve before any cache is touched.
+
+        An offloading worker decodes only, one token per request: the native
+        cache holds one block in flight per request, and context rows would
+        write a prompt's history straight into the arena it does not own.
+        """
+        if int(self.num_contexts or 0) > 0:
+            raise NotImplementedError("MiniMax-M3 KV cache offload decodes only; got context rows")
+        seq_lens = self.seq_lens
+        if seq_lens is not None and bool((seq_lens[: int(self.num_seqs)] != 1).any()):
+            raise NotImplementedError(
+                "MiniMax-M3 KV cache offload takes one query token per request"
+            )
 
     def _msa_max_decode_query_len(self) -> int:
         """Worst-case query tokens per generation request: 1 + draft_len.
@@ -651,6 +741,12 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         return buf
 
     def prepare(self) -> None:
+        offload = self.msa_offload_state is not None
+        if offload:
+            self._check_msa_offload_batch()
+            # Publish (or join) the native Batch before the base metadata copies
+            # the page tables the Batch now owns.
+            self.kv_cache_manager.prepare_sparse_batch(self.request_ids)
         super().prepare()
         self._check_beam_width()
         # Everything below reads these.
@@ -661,6 +757,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._build_msa_fields()
         self._check_capture_is_pure_decode()
         self._build_step_plans()
+        if offload:
+            self._prepare_msa_offload()
 
     def _check_beam_width(self) -> None:
         """Fail on beam search, which every MSA site assumes away.
@@ -1346,7 +1444,66 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         producer has already inserted E4M3 index-K into the side cache.
         `metadata` only supplies the step's write slots (msa_out_cache_loc,
         filled by prepare()) and the cache manager.
+
+        With KV cache offload, an offloaded layer's paged K/V views address its
+        host pages, so the paged write keeps the block being written there too.
+        The same token also goes to the request's tail page, which attention
+        reads; a step that completes a block copies the tail into the cell the
+        native cache reserved for it (see SparseOffloadTailLayer).
         """
+        self._write_paged_layer_caches(k, v, idx_k, metadata, kv_scale_orig_quant)
+        manager = metadata.kv_cache_manager
+        state = getattr(metadata, "msa_offload_state", None)
+        if state is None or not manager.is_sparse_offload_layer(self.layer_idx):
+            return
+        self._write_offload_tails(k, v, metadata, kv_scale_orig_quant)
+        writes = manager.prepare_sparse_write_indices(state, self.layer_idx)
+        manager.complete_sparse_offload_tails(self.layer_idx, writes)
+
+    def _write_offload_tails(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        metadata,
+        kv_scale_orig_quant: Optional[torch.Tensor],
+    ) -> None:
+        """Write this step's K/V tokens into their requests' tail pages."""
+        from .kernels.msa_scatter import fused_write_layer_caches, fused_write_layer_caches_nvfp4
+
+        views = metadata.kv_cache_manager.get_sparse_offload_page_views(self.layer_idx)
+        tail_slots = metadata.msa_offload_tail_slots[: k.shape[0]]
+        tail_k, tail_v = views[Role.KEY][1], views[Role.VALUE][1]
+        if Role.KEY_BLOCK_SCALE in views:
+            if not fused_write_layer_caches_nvfp4(
+                tail_k,
+                tail_v,
+                views[Role.KEY_BLOCK_SCALE][1],
+                views[Role.VALUE_BLOCK_SCALE][1],
+                None,
+                tail_slots,
+                k,
+                v,
+                None,
+                kv_scale_orig_quant,
+            ):
+                raise RuntimeError("NVFP4 tail writes require CUDA HND views and FP32 scales")
+            return
+        # Graph padding has no Batch row, so its tail slot is -1; only the fused
+        # writer skips negative slots.
+        if not fused_write_layer_caches(tail_k, tail_v, None, tail_slots, k, v, None):
+            raise RuntimeError(
+                "MiniMax-M3 KV cache offload writes tails with the fused cache writer, "
+                "which needs K and V as [tokens, heads * head_dim] row views"
+            )
+
+    def _write_paged_layer_caches(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        idx_k: Optional[torch.Tensor],
+        metadata,
+        kv_scale_orig_quant: Optional[torch.Tensor],
+    ) -> None:
         from .kernels.msa_scatter import fused_write_layer_caches, fused_write_layer_caches_nvfp4
 
         layer_idx = self.layer_idx

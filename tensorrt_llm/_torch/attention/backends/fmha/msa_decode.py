@@ -177,25 +177,45 @@ class MsaDecodeFmha(PhasedFmha):
     ) -> None:
         # This kernel also pulls in Triton, a second reason to keep it out of
         # module scope.
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+
         from ..sparse.minimax_m3.kernels.msa_utils import msa_paged_kv
         from ..sparse.minimax_m3.kernels.triton_sparse_decode import minimax_m3_sparse_attn_decode
 
         attn = params.attn
         head_dim = attn.head_dim
         num_tokens = params.num_tokens
-        k_paged, v_paged = msa_paged_kv(params.meta.kv_cache_manager, attn.layer_idx)
-        nvfp4_args = {}
         manager = params.meta.kv_cache_manager
+        # The kernel reads the top-k table head-major and the indexer builds it
+        # that way for every step, so this is a view. It reads every stride, so a
+        # mixed step's strided suffix works too.
+        topk = kv_block_indexes[params.token_offset : params.token_offset + num_tokens].permute(
+            1, 0, 2
+        )
+        offload = None
+        if getattr(params.meta, "msa_offload_state", None) is not None and (
+            manager.is_sparse_offload_layer(attn.layer_idx)
+        ):
+            offload, views = self._fetch_offloaded_history(params, topk)
+            k_paged, v_paged = views[Role.KEY][0], views[Role.VALUE][0]
+        else:
+            k_paged, v_paged = msa_paged_kv(manager, attn.layer_idx)
+        nvfp4_args = {}
         if getattr(manager, "is_nvfp4_layer", lambda _: False)(attn.layer_idx):
             from .msa_prefill import _aligned_nvfp4_dequant_scales
 
             if params.fwd.kv_scale_quant_orig is None:
                 raise RuntimeError("NVFP4 sparse decode requires dequantization scales")
             k_scale, v_scale = _aligned_nvfp4_dequant_scales(attn, params.fwd.kv_scale_quant_orig)
-            scales = manager.get_block_scale_buffers(attn.layer_idx, "HND")
+            if offload is not None:
+                k_block_scale = views[Role.KEY_BLOCK_SCALE][0]
+                v_block_scale = views[Role.VALUE_BLOCK_SCALE][0]
+            else:
+                scales = manager.get_block_scale_buffers(attn.layer_idx, "HND")
+                k_block_scale, v_block_scale = scales[:, 0], scales[:, 1]
             nvfp4_args = dict(
-                k_block_scale=scales[:, 0],
-                v_block_scale=scales[:, 1],
+                k_block_scale=k_block_scale,
+                v_block_scale=v_block_scale,
                 k_global_scale=k_scale,
                 v_global_scale=v_scale,
             )
@@ -205,19 +225,71 @@ class MsaDecodeFmha(PhasedFmha):
             params.query_input.view(num_tokens, attn.num_heads, head_dim),
             k_paged,
             v_paged,
-            # The kernel reads the top-k table head-major and the indexer
-            # builds it that way for every step, so this is a view. It reads
-            # every stride, so a mixed step's strided suffix works too.
-            kv_block_indexes[params.token_offset : params.token_offset + num_tokens].permute(
-                1, 0, 2
-            ),
+            topk,
             block_table,
             seq_lens,
             sm_scale=(head_dim**-0.5) / float(attn.q_scaling),
             output=params.output.view(num_tokens, attn.num_heads, head_dim),
             decode_query_len=params.input_seq_length,
+            offload=offload,
             **nvfp4_args,
         )
+
+    def _fetch_offloaded_history(self, params: FmhaParams, topk: torch.Tensor):
+        """Fetch the history this layer's heads picked and say where each pick lives.
+
+        With KV cache offload the native cache keeps one selection per request
+        and layer, so the step fetches the union of the heads' history picks; each
+        pick then finds its block's arena cell through its union column, and a
+        pick of the block being written reads its request's tail. Returns the
+        kernel's offload inputs and the layer's (arena, tail) page views.
+        """
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+
+        from ..sparse.minimax_m3.kernels.triton_sparse_decode import SparseDecodeOffload
+        from ..sparse.offload_kernels import select_sparse_history_unit_union
+
+        metadata = params.meta
+        manager = metadata.kv_cache_manager
+        state = metadata.msa_offload_state
+        layer = params.attn.layer_idx
+        num_tokens = params.num_tokens
+        if params.input_seq_length != 1 or params.seq_offset != 0:
+            raise RuntimeError("MiniMax-M3 KV cache offload decodes one token per request")
+        columns = metadata.msa_offload_pick_columns[: topk.shape[0], :num_tokens]
+        select_sparse_history_unit_union(
+            topk,
+            metadata.msa_offload_request_indices[:num_tokens],
+            state.batch_rows,
+            state.active_request_count,
+            state.history_lengths,
+            state.selected_history_units,
+            columns,
+            unit_tokens=int(manager.tokens_per_block),
+        )
+        cells = manager.fetch_sparse_selection(state, layer)
+        descriptor = state.layers[layer]
+        # A buffer reads its cells at its output slice, which buffers with
+        # coinciding arena indices share.
+        out_slots = state.out_slots[layer]
+        views = manager.get_sparse_offload_page_views(layer)
+        nvfp4 = Role.KEY_BLOCK_SCALE in views
+        offload = SparseDecodeOffload(
+            pick_columns=columns,
+            cells=cells,
+            rows=state.batch_rows[:num_tokens],
+            tail_k=views[Role.KEY][1],
+            tail_v=views[Role.VALUE][1],
+            cell_columns=(
+                out_slots[descriptor.buffer_index(Role.KEY)],
+                out_slots[descriptor.buffer_index(Role.VALUE)],
+                out_slots[descriptor.buffer_index(Role.KEY_BLOCK_SCALE)] if nvfp4 else -1,
+                out_slots[descriptor.buffer_index(Role.VALUE_BLOCK_SCALE)] if nvfp4 else -1,
+            ),
+            tail_k_block_scale=views[Role.KEY_BLOCK_SCALE][1] if nvfp4 else None,
+            tail_v_block_scale=views[Role.VALUE_BLOCK_SCALE][1] if nvfp4 else None,
+        )
+        return offload, views
 
     def _run_dense(
         self,

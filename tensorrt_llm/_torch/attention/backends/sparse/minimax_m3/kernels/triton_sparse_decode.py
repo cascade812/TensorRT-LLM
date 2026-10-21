@@ -37,7 +37,7 @@ Differences from upstream:
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 import triton
@@ -45,6 +45,7 @@ import triton.language as tl
 
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 
+from ...offload_kernels import SPARSE_IN_FLIGHT_COLUMN
 from .msa_utils import check_decode_span_shape
 
 # One sparse block is exactly one KV page.
@@ -138,6 +139,16 @@ def _gqa_sparse_decode_kernel(
     lse_ptr,  # partial lse (log2), unused when DIRECT_OUTPUT
     block_table_ptr,  # [num_reqs, max_blocks]
     seq_lens,  # [num_reqs]
+    # Offload only (dummies otherwise): each pick's union column, the arena cell of
+    # every union column per sparse buffer, each request's Batch row, and the tail
+    # pages that hold every row's block being written.
+    offload_cols_ptr,  # [num_kv_heads, total_q, topk]
+    offload_cells_ptr,  # [batch_rows, num_buffers, union]
+    offload_rows_ptr,  # [num_reqs]
+    tail_k_ptr,  # [batch_rows, num_kv_heads, page_size, head_dim (or /2 packed)]
+    tail_v_ptr,
+    tail_ksc_ptr,
+    tail_vsc_ptr,
     total_q,
     gqa_group_size,
     head_dim,
@@ -170,6 +181,20 @@ def _gqa_sparse_decode_kernel(
     stride_l_b,
     stride_l_h,
     stride_bt_b,
+    stride_cols_h,
+    stride_cols_n,
+    stride_cols_k,
+    stride_cells_row,
+    stride_cells_buf,
+    stride_cells_col,
+    stride_tail_k,
+    stride_tail_v,
+    stride_tail_ksc,
+    stride_tail_vsc,
+    cells_k,  # buffer column of K, V and their block scales in offload_cells
+    cells_v,
+    cells_ksc,
+    cells_vsc,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
@@ -182,6 +207,8 @@ def _gqa_sparse_decode_kernel(
     USE_LINEAR_SOFTMAX: tl.constexpr,  # measured NVFP4 online-softmax recurrence
     SCALE_COLS: tl.constexpr,  # head_dim // NVFP4_SF_VEC_SIZE, NVFP4 only
     DIRECT_OUTPUT: tl.constexpr,  # one chunk needs neither FP32 scratch nor a merge
+    OFFLOAD: tl.constexpr,  # history pages come from the offload arena, see above
+    IN_FLIGHT: tl.constexpr,  # union column of a pick of the block being written
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     if KV_NVFP4:
@@ -255,21 +282,65 @@ def _gqa_sparse_decode_kernel(
         q = q.to(COMPUTE_DTYPE)
     kv_scale = tl.load(kv_scale_ptr) if USE_SCALE else 1.0
 
+    if OFFLOAD:
+        offload_row = tl.load(offload_rows_ptr + req_id).to(tl.int64)
+        cols_row = offload_cols_ptr + pid_kh * stride_cols_h + pid_b * stride_cols_n
+        cells_row = offload_cells_ptr + offload_row * stride_cells_row
     cur_idx_ptr = t_ptr + pid_kh * stride_th + pid_b * stride_tn + chunk_start * stride_tk
-    for _ in tl.range(chunk_start, chunk_end):
+    for pick in tl.range(chunk_start, chunk_end):
         blk = tl.load(cur_idx_ptr)
         cur_idx_ptr = cur_idx_ptr + stride_tk
-        # int64 page offsets: a large cache overflows int32 well before the
-        # per-page block offsets do.
-        page = tl.load(bt_row + blk).to(tl.int64)
+        if OFFLOAD:
+            # A history block sits in the arena at its buffers' cells; the block
+            # being written sits in the row's tail.
+            column = tl.load(cols_row + pick * stride_cols_k)
+            in_flight = column == IN_FLIGHT
+            column = tl.maximum(column, 0)
+            cell_k = tl.load(cells_row + cells_k * stride_cells_buf + column * stride_cells_col)
+            cell_v = tl.load(cells_row + cells_v * stride_cells_buf + column * stride_cells_col)
+            k_blk = tl.where(
+                in_flight,
+                tail_k_ptr + offload_row * stride_tail_k,
+                k_ptr + cell_k.to(tl.int64) * stride_k_blk,
+            )
+            v_blk = tl.where(
+                in_flight,
+                tail_v_ptr + offload_row * stride_tail_v,
+                v_ptr + cell_v.to(tl.int64) * stride_v_blk,
+            )
+            if KV_NVFP4:
+                cell_ksc = tl.load(
+                    cells_row + cells_ksc * stride_cells_buf + column * stride_cells_col
+                )
+                cell_vsc = tl.load(
+                    cells_row + cells_vsc * stride_cells_buf + column * stride_cells_col
+                )
+                ksc_blk = tl.where(
+                    in_flight,
+                    tail_ksc_ptr + offload_row * stride_tail_ksc,
+                    k_sc_ptr + cell_ksc.to(tl.int64) * stride_ksc_blk,
+                )
+                vsc_blk = tl.where(
+                    in_flight,
+                    tail_vsc_ptr + offload_row * stride_tail_vsc,
+                    v_sc_ptr + cell_vsc.to(tl.int64) * stride_vsc_blk,
+                )
+        else:
+            # int64 page offsets: a large cache overflows int32 well before the
+            # per-page block offsets do.
+            page = tl.load(bt_row + blk).to(tl.int64)
+            k_blk = k_ptr + page * stride_k_blk
+            v_blk = v_ptr + page * stride_v_blk
+            if KV_NVFP4:
+                ksc_blk = k_sc_ptr + page * stride_ksc_blk
+                vsc_blk = v_sc_ptr + page * stride_vsc_blk
         pos_mask = blk * BLOCK_SIZE_K + off_n < kv_len
         if KV_NVFP4:
             # K block scales are token-major linear within the page-head region;
             # see _fused_nvfp4_paged_scatter_kernel in msa_scatter.
             k_deq = _dequant_nvfp4_rows(
                 tl.load(
-                    k_ptr
-                    + page * stride_k_blk
+                    k_blk
                     + pid_kh * stride_k_h
                     + off_n[:, None] * stride_k_pos
                     + off_dp[None, :] * stride_k_d,
@@ -277,11 +348,7 @@ def _gqa_sparse_decode_kernel(
                     other=0,
                 ),
                 tl.load(
-                    k_sc_ptr
-                    + page * stride_ksc_blk
-                    + pid_kh * stride_ksc_h
-                    + off_n[:, None] * SCALE_COLS
-                    + off_s[None, :],
+                    ksc_blk + pid_kh * stride_ksc_h + off_n[:, None] * SCALE_COLS + off_s[None, :],
                     mask=pos_mask[:, None],
                     other=0,
                 ),
@@ -293,8 +360,7 @@ def _gqa_sparse_decode_kernel(
             k = tl.trans(k_deq).to(q.dtype)
         else:
             k = tl.load(
-                k_ptr
-                + page * stride_k_blk
+                k_blk
                 + pid_kh * stride_k_h
                 + off_n[None, :] * stride_k_pos
                 + off_d[:, None] * stride_k_d,
@@ -318,8 +384,7 @@ def _gqa_sparse_decode_kernel(
             # linear one: [token // 4, scale_col, token % 4].
             v = _dequant_nvfp4_rows(
                 tl.load(
-                    v_ptr
-                    + page * stride_v_blk
+                    v_blk
                     + pid_kh * stride_v_h
                     + off_n[:, None] * stride_v_pos
                     + off_dp[None, :] * stride_v_d,
@@ -327,8 +392,7 @@ def _gqa_sparse_decode_kernel(
                     other=0,
                 ),
                 tl.load(
-                    v_sc_ptr
-                    + page * stride_vsc_blk
+                    vsc_blk
                     + pid_kh * stride_vsc_h
                     + (off_n[:, None] // 4) * (4 * SCALE_COLS)
                     + 4 * off_s[None, :]
@@ -343,8 +407,7 @@ def _gqa_sparse_decode_kernel(
             ).to(q.dtype)
         else:
             v = tl.load(
-                v_ptr
-                + page * stride_v_blk
+                v_blk
                 + pid_kh * stride_v_h
                 + off_n[:, None] * stride_v_pos
                 + off_d[None, :] * stride_v_d,
@@ -1001,6 +1064,33 @@ def _check_nvfp4_inputs(
             )
 
 
+class SparseDecodeOffload(NamedTuple):
+    """Where an offloaded sparse layer's history and in-flight block live.
+
+    With KV cache offload, ``k_paged``/``v_paged`` (and the NVFP4 block scales)
+    are the layer's arena views, addressed by cell rather than through the block
+    table. Each pick finds its block's cell through its union column; a pick of
+    the block being written reads the request's tail page instead.
+    """
+
+    # [num_kv_heads, total_q, topk] int32: each pick's union column, or
+    # SPARSE_IN_FLIGHT_COLUMN for the block being written.
+    pick_columns: torch.Tensor
+    # [batch_rows, num_buffers, union] int32: each union column's arena cell, per
+    # sparse buffer, as fetch_sparse_pages returns it.
+    cells: torch.Tensor
+    # [num_reqs] int32: each request's Batch row.
+    rows: torch.Tensor
+    # [batch_rows, num_kv_heads, page_size, head_dim (or /2 packed)]: each row's
+    # block being written, in the arena views' dtype and page layout.
+    tail_k: torch.Tensor
+    tail_v: torch.Tensor
+    # Columns of K, V and (NVFP4) their block scales in cells.
+    cell_columns: tuple[int, int, int, int]
+    tail_k_block_scale: Optional[torch.Tensor] = None
+    tail_v_block_scale: Optional[torch.Tensor] = None
+
+
 @torch.no_grad()
 def minimax_m3_sparse_attn_decode(
     q: torch.Tensor,  # [total_q, num_heads, head_dim]
@@ -1019,6 +1109,7 @@ def minimax_m3_sparse_attn_decode(
     k_global_scale: Optional[torch.Tensor] = None,
     v_global_scale: Optional[torch.Tensor] = None,
     num_topk_chunks: Optional[int] = None,
+    offload: Optional[SparseDecodeOffload] = None,
 ) -> None:
     """Block-sparse GQA decode attention, written into output in place.
 
@@ -1037,6 +1128,10 @@ def minimax_m3_sparse_attn_decode(
 
     num_topk_chunks overrides the split-K factor and exists for tests: the
     merged result must not depend on it.
+
+    offload reads the history through the KV cache offload arena and the block
+    being written through each request's tail; see SparseDecodeOffload. The
+    block table is then unused.
     """
     total_q, num_heads, head_dim = q.shape
     num_kv_heads = int(k_paged.shape[1])
@@ -1074,6 +1169,15 @@ def minimax_m3_sparse_attn_decode(
             k_block_scale.view(torch.uint8),
             v_block_scale.view(torch.uint8),
         )
+        if offload is not None:
+            if offload.tail_k_block_scale is None or offload.tail_v_block_scale is None:
+                raise ValueError("NVFP4 offload decode needs the tails' block scales")
+            offload = offload._replace(
+                tail_k=offload.tail_k.view(torch.uint8),
+                tail_v=offload.tail_v.view(torch.uint8),
+                tail_k_block_scale=offload.tail_k_block_scale.view(torch.uint8),
+                tail_v_block_scale=offload.tail_v_block_scale.view(torch.uint8),
+            )
     max_topk = int(topk_idx.shape[-1])
     gqa_group_size = num_heads // num_kv_heads
     use_scale = k_paged.dtype in _FP8_DTYPES and kv_scale is not None
@@ -1105,7 +1209,8 @@ def minimax_m3_sparse_attn_decode(
             decode_query_len=decode_query_len,
             capability=capability,
         )
-        if kv_nvfp4
+        # The pair kernel reads the block table only.
+        if kv_nvfp4 and offload is None
         else 1
     )
     if num_topk_chunks is None:
@@ -1204,6 +1309,42 @@ def minimax_m3_sparse_attn_decode(
         if query_group_size == 2
         else {}
     )
+    if query_group_size == 2:
+        offload_args = ()
+        offload_strides = ()
+        offload_options = {}
+    elif offload is None:
+        # Triton needs real pointers even for the unused arguments.
+        offload_args = (block_table,) * 3 + (output,) * 4
+        # Pick-column, cell and tail strides, then the four buffer columns.
+        offload_strides = (0,) * 14
+        offload_options = {"OFFLOAD": False, "IN_FLIGHT": SPARSE_IN_FLIGHT_COLUMN}
+    else:
+        if offload.pick_columns.shape != topk_idx.shape:
+            raise ValueError("Offload pick columns must match the top-k picks")
+        if offload.tail_k.dtype != k_paged.dtype or offload.tail_v.dtype != v_paged.dtype:
+            raise ValueError("Offload tails must share the arena views' dtype")
+        tail_k_scale = offload.tail_k_block_scale if kv_nvfp4 else output
+        tail_v_scale = offload.tail_v_block_scale if kv_nvfp4 else output
+        offload_args = (
+            offload.pick_columns,
+            offload.cells,
+            offload.rows,
+            offload.tail_k,
+            offload.tail_v,
+            tail_k_scale,
+            tail_v_scale,
+        )
+        offload_strides = (
+            *offload.pick_columns.stride(),
+            *offload.cells.stride(),
+            offload.tail_k.stride(0),
+            offload.tail_v.stride(0),
+            tail_k_scale.stride(0) if kv_nvfp4 else 0,
+            tail_v_scale.stride(0) if kv_nvfp4 else 0,
+            *offload.cell_columns,
+        )
+        offload_options = {"OFFLOAD": True, "IN_FLIGHT": SPARSE_IN_FLIGHT_COLUMN}
     producer_kernel[
         (total_q // query_group_size) * num_topk_chunks,
         num_kv_heads,
@@ -1221,6 +1362,7 @@ def minimax_m3_sparse_attn_decode(
         lse_arg,
         block_table,
         seq_lens,
+        *offload_args,
         total_q,
         gqa_group_size,
         head_dim,
@@ -1248,6 +1390,7 @@ def minimax_m3_sparse_attn_decode(
         *o_strides,
         *lse_strides,
         block_table.stride(0),
+        *offload_strides,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         NUM_TOPK_CHUNKS=num_topk_chunks,
         USE_SCALE=use_scale,
@@ -1258,6 +1401,7 @@ def minimax_m3_sparse_attn_decode(
         USE_LINEAR_SOFTMAX=use_linear_softmax,
         SCALE_COLS=scale_cols,
         DIRECT_OUTPUT=direct_output,
+        **offload_options,
         **pair_kernel_options,
         **pdl_launch,
         **launch_options,
@@ -1295,6 +1439,7 @@ def minimax_m3_sparse_attn_decode(
 __all__ = [
     "NVFP4_SF_VEC_SIZE",
     "SPARSE_BLOCK_SIZE",
+    "SparseDecodeOffload",
     "_sm100f_nvfp4_merge_launch_options",
     "_sm100f_nvfp4_num_topk_chunks",
     "_sm100f_nvfp4_query_group_size",

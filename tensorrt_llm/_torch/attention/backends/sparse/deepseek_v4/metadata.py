@@ -340,7 +340,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             return
         manager = self.kv_cache_manager
         # Descriptors include every sparse role in native fetch order.
-        layers = get_sparse_offload_metadata_layers(self)
+        layers = get_sparse_offload_metadata_layers(
+            self, topk=self.sparse_mla_topk, max_draft_tokens=self.max_draft_tokens
+        )
         if not layers:
             # This PP stage has no ratio-4 main KV to stage.
             return

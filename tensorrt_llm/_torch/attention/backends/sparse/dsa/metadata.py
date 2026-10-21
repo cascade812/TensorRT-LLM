@@ -396,7 +396,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.sparse_offload_write_event = torch.cuda.Event()
         self.sparse_offload_fetch_event = torch.cuda.Event()
         manager = self.kv_cache_manager
-        layers = get_sparse_offload_metadata_layers(self)
+        layers = get_sparse_offload_metadata_layers(
+            self, topk=self.sparse_mla_topk, max_draft_tokens=self.max_draft_tokens
+        )
         local_layers = manager.pp_layers
         indexer_mask = manager.indexer_k_cache_local_layer_mask
         self.sparse_offload_next_shared_layer = {

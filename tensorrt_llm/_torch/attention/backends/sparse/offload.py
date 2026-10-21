@@ -20,7 +20,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Collection, Iterable
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Callable, Collection, Iterable, Mapping
 
 import torch
 
@@ -43,7 +44,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KVCache,
 )
 
-from .offload_kernels import select_sparse_history_units
+from .offload_kernels import complete_sparse_tails, copy_pages, select_sparse_history_units
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor import llm_request
@@ -75,7 +76,9 @@ class SparseOffloadLayerDescriptor:
     Descriptor construction validates matching data/scale pool counts and
     buffer positions, including padding. Their index columns are equal, so a
     writer and a gather consume the data column for both pools while retaining
-    their respective base addresses and byte strides.
+    their respective base addresses and byte strides. Any other buffer a layer
+    reads, such as a separate V buffer, is read at its own fetched index; the
+    remaining sparse buffers are padding.
     ``arena_row_counts`` covers each complete pool region across all leases
     and buffers, including padding; it is independent of host-page capacity.
     """
@@ -88,6 +91,13 @@ class SparseOffloadLayerDescriptor:
     group_id: LayerGroupId
     unit_tokens: int
     padding_regions: tuple[SparseOffloadPaddingRegion, ...] = ()
+
+    def buffer_index(self, role: DataRole) -> int:
+        """Return the fetch-order position of this layer's ``role`` buffer."""
+        for index, buffer_id in enumerate(self.buffer_ids):
+            if buffer_id.role == role:
+                return index
+        raise KeyError(f"Layer has no sparse {role} buffer")
 
 
 @dataclass(kw_only=True)
@@ -227,7 +237,9 @@ def allocate_sparse_offload_state(
     )
 
 
-def get_sparse_offload_metadata_layers(metadata) -> dict[int, SparseOffloadLayerDescriptor]:
+def get_sparse_offload_metadata_layers(
+    metadata, *, topk: int, max_draft_tokens: int = 0
+) -> dict[int, SparseOffloadLayerDescriptor]:
     """Validate an attention metadata's fixed offload configuration and return its layers.
 
     Offload runs single-beam and non-speculative, so per-batch beam and draft
@@ -236,12 +248,17 @@ def get_sparse_offload_metadata_layers(metadata) -> dict[int, SparseOffloadLayer
     manager construction, before metadata initialization, so they are checked
     once here rather than on each batch. An empty result means this pipeline
     stage has no offloaded layer.
+
+    Args:
+        metadata: The attention metadata that will hold the offload state.
+        topk: Units one row selects, which must match the manager's.
+        max_draft_tokens: The metadata's draft tokens per request.
     """
     manager = metadata.kv_cache_manager
     if (
         metadata.beam_width != 1
         or manager.max_beam_width != 1
-        or metadata.max_draft_tokens
+        or max_draft_tokens
         or manager.max_draft_len
         or manager.max_total_draft_tokens
         or metadata.draft_kv_cache_manager is not None
@@ -249,11 +266,45 @@ def get_sparse_offload_metadata_layers(metadata) -> dict[int, SparseOffloadLayer
         raise NotImplementedError("Sparse offload requires single-beam, non-speculative execution")
     manager._validate_sparse_history_policy()
     layers = manager.get_sparse_offload_descriptors()
-    if layers and (
-        metadata.sparse_mla_topk <= 0 or metadata.sparse_mla_topk != manager._sparse_offload_topk
-    ):
+    if layers and (topk <= 0 or topk != manager._sparse_offload_topk):
         raise ValueError("Sparse offload metadata must match the configured positive top-k")
     return layers
+
+
+@dataclass(frozen=True, slots=True)
+class SparseOffloadTailLayer:
+    """GPU pages that hold one layer's in-flight unit for each Batch row.
+
+    Native caches a unit only on the step that completes it. A model whose unit
+    covers several tokens therefore keeps the unit being written in a tail page
+    per (Batch row, sparse buffer): attention reads the unit there, and the
+    step that completes it copies the tail into the cell
+    ``prepare_sparse_write_indices`` names, before the flush writes the cell to
+    the unit's host page. The model also writes each new token to the unit's
+    host page, so a row seated mid-unit, whether a request arriving from the
+    context worker or one resuming, seeds its tail from that page.
+
+    ``pages`` maps each sparse buffer's role to its uint8 [B, page_bytes] tail
+    pages. The CUDA int64 [F] descriptors, in fetch order, drive
+    :func:`complete_sparse_tails`; ``columns`` holds each buffer's output slice
+    of the write indices, which only the native Batch can name, so it is filled
+    when the Batch is built. ``host_page_bases`` and ``host_slot_strides``
+    locate a buffer's page of a KV cache slot in host memory.
+    """
+
+    buffer_ids: tuple[BufferId, ...]
+    pages: dict[DataRole, torch.Tensor]
+    tail_addresses: torch.Tensor
+    tail_row_bytes: torch.Tensor
+    arena_addresses: torch.Tensor
+    cell_bytes: torch.Tensor
+    columns: torch.Tensor
+    num_words: torch.Tensor
+    host_page_bases: tuple[int, ...]
+    host_slot_strides: tuple[int, ...]
+    page_bytes: tuple[int, ...]
+    group_id: LayerGroupId
+    unit_tokens: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,12 +354,26 @@ class SparseOffloadCacheMixin:
 
     _enable_kv_cache_offload: bool = False
     _sparse_offload_topk: int | None = None
+    _sparse_offload_unit_tails: bool = False
+    _sparse_offload_tails: Mapping[int, SparseOffloadTailLayer] = MappingProxyType({})
     _sparse_batch: Batch | None = None
     _sparse_batch_prepared: bool = False
 
-    def _init_sparse_offload(self, *, enabled: bool, topk: int | None) -> None:
+    def _init_sparse_offload(
+        self, *, enabled: bool, topk: int | None, unit_tails: bool = False
+    ) -> None:
+        """Set up offload before the base constructor builds the cache config.
+
+        Args:
+            enabled: Whether the sparse layers offload their history.
+            topk: Units one row selects in each layer.
+            unit_tails: Keep each row's in-flight unit in tail pages, for units
+                longer than one token; see ``SparseOffloadTailLayer``.
+        """
         self._enable_kv_cache_offload = enabled
         self._sparse_offload_topk = topk
+        self._sparse_offload_unit_tails = enabled and unit_tails
+        self._sparse_offload_tails: dict[int, SparseOffloadTailLayer] = {}
         self._sparse_batch = None
         self._sparse_batch_members: dict[int, _SparseBatchMember] = {}
         self._sparse_batch_prepared = False
@@ -332,12 +397,22 @@ class SparseOffloadCacheMixin:
         }
         if not buffer_counts:
             return 0
-        return SPARSE_OFFLOAD_STATE_COPIES * SparseOffloadState.device_bytes(
+        scratch = SPARSE_OFFLOAD_STATE_COPIES * SparseOffloadState.device_bytes(
             max_batch_size=self.max_batch_size,
             topk=self._sparse_offload_topk,
             buffer_counts=buffer_counts,
             nvfp4_head_dim=self._sparse_offload_nvfp4_head_dim(),
         )
+        if self._sparse_offload_unit_tails:
+            # One page per Batch row of every sparse buffer, held by the manager once.
+            scratch += self.max_batch_size * sum(
+                buffer.size
+                for layer in config.layers
+                if getattr(layer, "sparse_cache", None) is not None
+                for buffer in layer.buffers
+                if buffer.is_sparse
+            )
+        return scratch
 
     def _has_sparse_offload_layers(self) -> bool:
         """Whether a local layer fetches through a sparse cache."""
@@ -445,18 +520,24 @@ class SparseOffloadCacheMixin:
                 max_batch_size=self.max_batch_size,
                 max_blocks_per_seq=self.max_blocks_per_seq,
             )
+            for tail in self._sparse_offload_tails.values():
+                slots = self._sparse_batch.sparse_out_slots(list(tail.buffer_ids))
+                tail.columns.copy_(torch.tensor(slots, dtype=torch.int64))
         batch = self._sparse_batch
         try:
             batch.wait_published()
             self._release_sparse_batch(
                 request_id for request_id in self._sparse_batch_members if request_id not in caches
             )
+            seated = []
             for request_id, cache in caches.items():
                 member = self._sparse_batch_members.get(request_id)
                 if member is None:
-                    self._sparse_batch_members[request_id] = _SparseBatchMember(
+                    member = _SparseBatchMember(
                         cache=cache, row=batch.add_kv_cache(cache), blocks=cache.num_blocks
                     )
+                    self._sparse_batch_members[request_id] = member
+                    seated.append(member)
                 else:
                     member.blocks = max(member.blocks, cache.num_blocks)
             self._refresh_sparse_page_index_bufs()
@@ -466,6 +547,7 @@ class SparseOffloadCacheMixin:
             self._stream.wait_stream(stream)
             batch.publish()
             stream.wait_stream(self._stream)
+            self._seed_sparse_offload_tails(seated)
             self._sparse_batch_prepared = True
         finally:
             if not self._sparse_batch_prepared:
@@ -745,6 +827,7 @@ class SparseOffloadCacheMixin:
         *,
         unit_tokens: int,
         scale_role: DataRole | None = None,
+        read_roles: Collection[DataRole] = (),
         name: str,
     ) -> SparseOffloadLayerDescriptor:
         """Describe one layer's complete sparse fetch buffer set.
@@ -759,6 +842,8 @@ class SparseOffloadCacheMixin:
             data_role: The buffer attention reads, by arena row.
             unit_tokens: Original tokens one selection unit covers.
             scale_role: A block-scale buffer that must share the data's arena rows.
+            read_roles: Further sparse buffers attention reads, each at its own
+                fetched index, such as a separate V buffer and the block scales.
             name: The model layer, for messages.
         """
         if not self.impl.is_sparse(layer_id, data_role):
@@ -789,6 +874,9 @@ class SparseOffloadCacheMixin:
             raise ValueError(f"{name}'s sparse buffers must include {data_role}")
         buffers.sort(key=layout.pool_indices.__getitem__)
         scale_id = BufferId(layer_id, scale_role) if scale_role is not None else None
+        read_ids = {BufferId(layer_id, role) for role in read_roles}
+        if not read_ids <= set(buffers):
+            raise ValueError(f"{name}'s sparse buffers must include {sorted(read_roles)}")
         if scale_id is not None:
             if scale_id not in buffers:
                 raise ValueError(f"{name} requires a sparse block-scale buffer")
@@ -811,7 +899,11 @@ class SparseOffloadCacheMixin:
         )
         padding_regions = []
         for buffer, base in zip(buffers, arena_bases):
-            if buffer == data_id or (scale_id is not None and buffer == scale_id):
+            if (
+                buffer == data_id
+                or buffer in read_ids
+                or (scale_id is not None and buffer == scale_id)
+            ):
                 continue
             pool_count, position = layout.positions[buffer]
             buffer_bytes = reserved_units * unit_bytes[buffer.role]
@@ -863,6 +955,122 @@ class SparseOffloadCacheMixin:
                 ).zero_()
         # Construction completes before any producer or captured graph can use the arena.
         self._stream.synchronize()
+
+    def _allocate_sparse_offload_tails(
+        self, layers: dict[int, SparseOffloadLayerDescriptor]
+    ) -> None:
+        """Allocate every offloaded layer's tail pages after manager construction.
+
+        Covers each sparse buffer of each layer, one page per Batch row, in one
+        allocation that ``get_sparse_offload_scratch_bytes`` reserved. Only a cache
+        whose units are whole pages has tails so far.
+        """
+        if not self._sparse_offload_unit_tails or not layers:
+            return
+        rows = self.max_batch_size
+        page_bytes = {
+            layer: tuple(
+                self.impl.get_page_stride(buffer.layer_id, buffer.role)
+                for buffer in descriptor.buffer_ids
+            )
+            for layer, descriptor in layers.items()
+        }
+        storage = torch.empty(
+            rows * sum(sum(sizes) for sizes in page_bytes.values()),
+            dtype=torch.uint8,
+            device=self._stream.device,
+        )
+        offset = 0
+        for layer, descriptor in layers.items():
+            layer_id = descriptor.buffer_ids[0].layer_id
+            if self.impl.get_sparse_cache_units_per_page(layer_id) != 1:
+                raise NotImplementedError(
+                    "Sparse offload tails need units of a whole page; layer "
+                    f"{layer} has smaller units"
+                )
+            pages = {}
+            host_page_bases = []
+            host_slot_strides = []
+            for buffer, size in zip(descriptor.buffer_ids, page_bytes[layer]):
+                if size % 8 or offset % 8:
+                    raise ValueError("Sparse offload tail pages must be 8-byte aligned")
+                pages[buffer.role] = storage[offset : offset + rows * size].view(rows, size)
+                offset += rows * size
+                scale = int(self.impl.get_page_index_converter(buffer.layer_id, buffer.role).scale)
+                host_page_bases.append(
+                    int(self.impl.get_mem_pool_base_address(buffer.layer_id, buffer.role))
+                )
+                host_slot_strides.append(scale * size)
+
+            def descriptor_array(values) -> torch.Tensor:
+                return torch.tensor(values, dtype=torch.int64, device=self._stream.device)
+
+            self._sparse_offload_tails[layer] = SparseOffloadTailLayer(
+                buffer_ids=descriptor.buffer_ids,
+                pages=pages,
+                tail_addresses=descriptor_array(
+                    [pages[buffer.role].data_ptr() for buffer in descriptor.buffer_ids]
+                ),
+                tail_row_bytes=descriptor_array(page_bytes[layer]),
+                arena_addresses=descriptor_array(descriptor.arena_base_addresses),
+                # A cell is one page of its buffer when a unit is a whole page.
+                cell_bytes=descriptor_array(page_bytes[layer]),
+                columns=descriptor_array(range(len(descriptor.buffer_ids))),
+                num_words=descriptor_array([size // 8 for size in page_bytes[layer]]),
+                host_page_bases=tuple(host_page_bases),
+                host_slot_strides=tuple(host_slot_strides),
+                page_bytes=page_bytes[layer],
+                group_id=descriptor.group_id,
+                unit_tokens=descriptor.unit_tokens,
+            )
+
+    def get_sparse_offload_tail(self, layer_idx: int) -> SparseOffloadTailLayer:
+        """Return a layer's tail pages, by global layer index."""
+        return self._sparse_offload_tails[layer_idx]
+
+    def _seed_sparse_offload_tails(self, members: Iterable[_SparseBatchMember]) -> None:
+        """Copy each newly seated row's partly written unit from its host page to its tails.
+
+        Runs on the current stream after publication, before the forward that
+        writes the next token of the unit. A row seated at a unit boundary has
+        nothing to copy.
+        """
+        if not self._sparse_offload_tails:
+            return
+        sources = []
+        destinations = []
+        sizes = []
+        for member in members:
+            history = member.cache.history_length
+            slots_by_group = {}
+            for tail in self._sparse_offload_tails.values():
+                if history % tail.unit_tokens == 0:
+                    continue
+                if tail.group_id not in slots_by_group:
+                    slots_by_group[tail.group_id] = member.cache.get_base_page_indices(
+                        tail.group_id
+                    )
+                slot = int(slots_by_group[tail.group_id][history // tail.unit_tokens])
+                if slot == BAD_PAGE_INDEX:
+                    raise RuntimeError("A seated request's in-flight unit has no host page")
+                for index, role in enumerate(tail.pages):
+                    sources.append(
+                        tail.host_page_bases[index] + slot * tail.host_slot_strides[index]
+                    )
+                    destinations.append(tail.pages[role][member.row].data_ptr())
+                    sizes.append(tail.page_bytes[index])
+        if not sources:
+            return
+        pinned = prefer_pinned()
+        device = self._stream.device
+        copy_pages(
+            *(
+                torch.tensor(values, dtype=torch.int64, pin_memory=pinned).to(
+                    device, non_blocking=True
+                )
+                for values in (sources, destinations, sizes)
+            )
+        )
 
     # ------------------------------------------------------------------
     # Per-step offload operations
@@ -960,6 +1168,25 @@ class SparseOffloadCacheMixin:
         state.write_layer = layer_idx
         return out
 
+    def complete_sparse_offload_tails(self, layer_idx: int, write_indices: torch.Tensor) -> None:
+        """Copy the units this step completes from their tails into their cells.
+
+        ``write_indices`` is the layer's [B, F] result of
+        ``prepare_sparse_write_indices``. Call it after the model has written this
+        step's token to the tails and before the forward ends; the flush after the
+        forward writes the cells to their host pages. Captured with the forward.
+        """
+        tail = self._sparse_offload_tails[layer_idx]
+        complete_sparse_tails(
+            write_indices,
+            tail.tail_addresses,
+            tail.tail_row_bytes,
+            tail.arena_addresses,
+            tail.cell_bytes,
+            tail.columns,
+            tail.num_words,
+        )
+
     @nvtx_range_debug("fetch_sparse_indices")
     def fetch_sparse_indices(
         self,
@@ -1007,7 +1234,26 @@ class SparseOffloadCacheMixin:
                 state.selected_history_units,
                 unit_tokens=descriptor.unit_tokens,
             )
-            out = state.fetched_indices[len(descriptor.buffer_ids)]
+        return self.fetch_sparse_selection(state, layer_idx)
+
+    def fetch_sparse_selection(self, state: SparseOffloadState, layer_idx: int) -> torch.Tensor:
+        """Fetch the history ``state.selected_history_units`` names for one layer.
+
+        The caller has written the selection on the current stream: int32 [B, K]
+        unit ordinals by Batch row, each unique within its row, all below the
+        row's history units, padded with -1. Return int32[B, F, K] like
+        ``fetch_sparse_indices``.
+        """
+        if (
+            not self._enable_kv_cache_offload
+            or not state.prepared
+            or state.is_prefill
+            or state.batch is None
+        ):
+            raise RuntimeError("Sparse fetch requires prepared decode metadata")
+        descriptor = state.layers[layer_idx]
+        out = state.fetched_indices[len(descriptor.buffer_ids)]
+        with torch.cuda.device(out.device):
             if layer_idx not in state.out_slots:
                 state.out_slots[layer_idx] = tuple(
                     state.batch.sparse_out_slots(list(descriptor.buffer_ids))
