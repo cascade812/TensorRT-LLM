@@ -372,7 +372,7 @@ def _fetch_case(multiple_roles=False, rows=None):
     _publish(manager, [20, 10], rows)
     state = _metadata(manager).sparse_offload_state
     manager.prepare_sparse_offload(state, [20, 10], beam_width=1)
-    manager.impl.fetch_sparse_pages = _FetchDouble()
+    manager._sparse_batch.fetch_sparse_pages = _FetchDouble()
     topk = torch.tensor(
         [[2, -1, 0, 1, -2, 3, 99, -1], [1, 0, -1, 2, -1, -1, -1, -1]],
         dtype=torch.int32,
@@ -417,7 +417,7 @@ def test_prepare_writes_and_attention_merge_on_ordered_streams(rows):
         # Request 20 has history 7 and capacity 8, so its unit 1 is newly complete.
         out[row_20, 0] = 77
 
-    case.manager.impl.prepare_sparse_write_indices = prepare
+    case.manager._sparse_batch.prepare_sparse_write_indices = prepare
     producer.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(producer):
         writes = case.manager.prepare_sparse_compressor_write_indices(case.state, 2)
@@ -489,7 +489,7 @@ def test_compressor_writes_check_once_that_scales_share_the_data_row():
         out[0, descriptor.data_buffer_index] = 77
         out[0, descriptor.scale_buffer_index] = scale_row["value"]
 
-    case.manager.impl.prepare_sparse_write_indices = prepare
+    case.manager._sparse_batch.prepare_sparse_write_indices = prepare
     case.manager.prepare_sparse_compressor_write_indices(case.state, 2)
     assert case.manager._paired_write_layers == {2}
     # A checked layer's indices are not read back on the host again.
@@ -648,7 +648,7 @@ def test_fetch_uses_batch_rows_and_preserves_topk_slots(multiple_roles, rows):
         torch.testing.assert_close(
             out[:, i], torch.where(expected >= 0, expected + (i % 2) * 101, -1)
         )
-    call = case.manager.impl.fetch_sparse_pages.calls[-1]
+    call = case.manager._sparse_batch.fetch_sparse_pages.calls[-1]
     assert call[0] is case.manager._sparse_batch
     assert call[1] == case.state.layers[2].buffer_ids
     assert call[2] is case.state.selected_history_units and call[3] is out
@@ -683,7 +683,7 @@ def test_fetch_rejects_unprepared_or_prefill_metadata(invalid):
 @_requires_cuda
 def test_fetch_propagates_native_failure():
     case = _fetch_case()
-    case.manager.impl.fetch_sparse_pages = Mock(side_effect=RuntimeError("fetch failed"))
+    case.manager._sparse_batch.fetch_sparse_pages = Mock(side_effect=RuntimeError("fetch failed"))
     with pytest.raises(RuntimeError, match="fetch failed"):
         _fetch(case)
 
@@ -704,7 +704,7 @@ def test_fetch_refreshes_all_outputs_for_empty_selection(empty):
         )
     out = _fetch(case)
     assert (out == -1).all()
-    assert len(case.manager.impl.fetch_sparse_pages.calls) == 2
+    assert len(case.manager._sparse_batch.fetch_sparse_pages.calls) == 2
 
 
 @_requires_cuda

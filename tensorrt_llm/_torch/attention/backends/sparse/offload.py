@@ -944,8 +944,7 @@ class SparseOffloadCacheMixin:
         out = state.write_indices[len(descriptor.buffer_ids)]
         state.write_layer = None
         with torch.cuda.device(out.device):
-            self.impl.prepare_sparse_write_indices(
-                batch=state.batch,
+            state.batch.prepare_sparse_write_indices(
                 buffers=descriptor.buffer_ids,
                 out=out,
                 stream=CudaStream(torch.cuda.current_stream().cuda_stream),
@@ -1036,8 +1035,7 @@ class SparseOffloadCacheMixin:
             out = state.fetched_indices[len(descriptor.buffer_ids)]
             # Fetch even for an empty selection so every output slot is refreshed
             # on graph replay. Native Batch supplies page tables and watermarks.
-            self.impl.fetch_sparse_pages(
-                batch=state.batch,
+            state.batch.fetch_sparse_pages(
                 buffers=descriptor.buffer_ids,
                 selected=state.selected_history_units,
                 out=out,

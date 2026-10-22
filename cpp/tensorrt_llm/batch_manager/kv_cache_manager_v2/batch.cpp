@@ -593,7 +593,7 @@ void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
         {
             continue;
         }
-        mManager->writeBackSparseUnits(*this, lcId, mCudaStream);
+        writeBackSparseUnits(lcId, mCudaStream);
     }
     mFlushRead = CachedCudaEvent{reinterpret_cast<CudaStream>(mCudaStream)};
 }
@@ -1450,6 +1450,227 @@ bool Batch::isContiguous() const noexcept
 int Batch::rowOf(KvCache const& kvCache) const
 {
     return kvCache.mBatch == this ? kvCache.mBatchRow : -1;
+}
+
+void Batch::prepareSparseWriteIndices(std::vector<BufferId> const& buffers, int32_t* out, CUstream stream)
+{
+    if (out == nullptr)
+    {
+        throw std::invalid_argument("prepareSparseWriteIndices: out must be a device pointer");
+    }
+
+    auto const span = mManager->_sparseLayerSpan(buffers, "prepareSparseWriteIndices");
+    LifeCycleId const lcId = span.lifeCycle;
+
+    LayerGroupId const lgId{lcId.value()};
+    auto const& scratch = sparseStepScratch(lgId);
+    if (scratch.inFlightSlot == nullptr)
+    {
+        throw std::invalid_argument("prepareSparseWriteIndices: this layer group carries no sparse cache");
+    }
+
+    int const unitsPerPage = mManager->sparseCacheUnitsPerPage(lcId);
+    auto const views = reinterpret_cast<SparseCacheView const*>(sparseCacheViews(lgId));
+    auto const marks = watermarks();
+    auto const numRows = maxBatchSize();
+
+    // A resolve with no selection. It makes the in-flight unit resident -- reusing its entry
+    // when a previous step already pinned it -- and does nothing else: an in-flight unit's
+    // host page is not written until the watermark passes it, so there is nothing to copy.
+    //
+    // The selection and miss arrays are therefore left null, which the resolve tolerates only
+    // because it records a miss against the copy list under `ordinal < historyUnits`, and an
+    // in-flight ordinal never satisfies it. A change that made that write unconditional would
+    // fault here rather than quietly copying stale bytes over what the model wrote.
+    SparseResolveArgs resolve;
+    resolve.views = views;
+    resolve.numRows = numRows;
+    resolve.layerInGroup = span.layerInGroup;
+    resolve.numLayers = mManager->sparseCacheLayerCount(lcId);
+    resolve.entriesPerLayer = mManager->sparseCacheSubSlotsPerBuffer(lcId) * unitsPerPage;
+    resolve.selectionWidth = 0;
+    resolve.historyTokens = reinterpret_cast<int32_t const*>(marks.historyLength);
+    resolve.capacityTokens = reinterpret_cast<int32_t const*>(marks.capacity);
+    resolve.unitTokens = mManager->config().tokensPerBlock / unitsPerPage;
+    resolve.inFlightSlot = scratch.inFlightSlot;
+    resolve.maxInFlightUnits = scratch.maxInFlightUnits;
+    resolve.missCount = scratch.missCount;
+    launchSparseResolve(resolve, stream);
+
+    // The in-flight list stands in for a selection: the resolve writes kNoSparseSlot past the
+    // span, so a row with nothing in flight needs no separate signal.
+    for (auto const& copy : mManager->sparseCopyTemplates(lcId))
+    {
+        auto const runBase = std::max(copy.bufferBase, span.bufferBase);
+        auto const runEnd = std::min(copy.bufferBase + copy.numBuffers, span.bufferBase + span.numBuffers);
+        if (runBase >= runEnd)
+        {
+            continue;
+        }
+        SparseOutIndexArgs indices;
+        indices.views = views;
+        indices.numRows = numRows;
+        indices.selected = nullptr;
+        indices.outSlot = scratch.inFlightSlot;
+        // One entry per request: resize() bounds capacity - history to a single token, so at
+        // most one unit is ever in flight. The scratch row is the reservation's headroom,
+        // which is wider, hence the separate stride.
+        indices.selectionWidth = 1;
+        indices.outSlotStride = scratch.maxInFlightUnits;
+        indices.out = out;
+        indices.outBuffers = span.numBuffers;
+        indices.outBase = runBase - span.bufferBase;
+        indices.bufferBase = runBase;
+        indices.numBuffers = runEnd - runBase;
+        indices.cellsPerBuffer = copy.cellsPerBuffer;
+        indices.cellsPerLease = copy.cellsPerLease;
+        indices.unitsPerPage = unitsPerPage;
+        launchSparseOutIndices(indices, stream);
+    }
+}
+
+void Batch::writeBackSparseUnits(LifeCycleId lifeCycle, CUstream stream)
+{
+    LayerGroupId const lgId{lifeCycle.value()};
+    auto const views = reinterpret_cast<SparseCacheView const*>(sparseCacheViews(lgId));
+    auto const numRows = maxBatchSize();
+
+    // Which units each row crossed. One scan covers every (layer, row); a row whose
+    // watermark did not move reports none.
+    auto const& scratch = sparseStepScratch(lgId);
+    SparseFlushListArgs listArgs;
+    listArgs.views = views;
+    listArgs.numRows = numRows;
+    listArgs.numLayers = scratch.numLayers;
+    listArgs.fromUnits = flushRangeRow(lifeCycle);
+    listArgs.toUnits = listArgs.fromUnits + numRows;
+    listArgs.work = scratch.flushWork;
+    listArgs.outCount = scratch.flushCount;
+    launchSparseFlushList(listArgs, stream);
+
+    // One launch for every pool and every layer: the descriptors the Batch built already
+    // say where each pool's buffers and index tables are, and a flush list is per layer.
+    SparseUnitCopyArgs copy;
+    copy.views = views;
+    copy.numRows = numRows;
+    copy.copyDesc = scratch.copyDesc;
+    copy.bufferBase = 0;
+    copy.numBuffers = scratch.numBuffers;
+    copy.direction = SparseCopyDirection::kWriteBack;
+    copy.unitsPerPage = mManager->sparseCacheUnitsPerPage(lifeCycle);
+    // The work list is every layer of this row, which is what a write-back crosses at
+    // once -- unlike a fetch, which resolves one layer across the
+    copy.work = scratch.flushWork;
+    copy.bufferLayer = mManager->sparseArena(lifeCycle).bufferLayer();
+    copy.gridCtas = mManager->_sparseCopyGridCtas(scratch.flushWork.capacity);
+    launchSparseUnitCopy(copy, stream);
+}
+
+void Batch::fetchSparsePages(
+    std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth, int32_t* out, CUstream stream)
+{
+    if (selected == nullptr || out == nullptr)
+    {
+        throw std::invalid_argument("fetchSparsePages: selected and out must be device pointers");
+    }
+
+    auto const span = mManager->_sparseLayerSpan(buffers, "fetchSparsePages");
+    LifeCycleId const lcId = span.lifeCycle;
+    auto const bufferBase = span.bufferBase;
+    auto const numBuffers = span.numBuffers;
+    auto const layerInGroup = span.layerInGroup;
+
+    auto const& scratch = sparseStepScratch(LayerGroupId{lcId.value()});
+    if (scratch.outSlot == nullptr)
+    {
+        throw std::invalid_argument("fetchSparsePages: this layer group carries no sparse cache");
+    }
+    if (selectionWidth != scratch.selectionWidth)
+    {
+        throw std::invalid_argument("fetchSparsePages: selectionWidth must match the configured numSelectedBlocks");
+    }
+
+    int const unitsPerPage = mManager->sparseCacheUnitsPerPage(lcId);
+    LayerGroupId const lgId{lcId.value()};
+    auto const views = reinterpret_cast<SparseCacheView const*>(sparseCacheViews(lgId));
+    auto const marks = watermarks();
+    auto const table = gpuCoalescedPageTable(lgId);
+    auto const numRows = maxBatchSize();
+
+    SparseResolveArgs resolve;
+    resolve.views = views;
+    resolve.numRows = numRows;
+    resolve.layerInGroup = layerInGroup;
+    resolve.numLayers = mManager->sparseCacheLayerCount(lcId);
+    resolve.entriesPerLayer = mManager->sparseCacheSubSlotsPerBuffer(lcId) * unitsPerPage;
+    resolve.selected = selected;
+    resolve.selectionWidth = selectionWidth;
+    resolve.historyTokens = reinterpret_cast<int32_t const*>(marks.historyLength);
+    resolve.capacityTokens = reinterpret_cast<int32_t const*>(marks.capacity);
+    resolve.unitTokens = mManager->config().tokensPerBlock / unitsPerPage;
+    resolve.outSlot = scratch.outSlot;
+    resolve.inFlightSlot = scratch.inFlightSlot;
+    resolve.maxInFlightUnits = scratch.maxInFlightUnits;
+    // The list is one, reused from layer to layer; the counter is this layer's own, so a
+    // step can clear every layer's at once instead of one clear before each resolve.
+    auto layerWork = scratch.fetchWork;
+    layerWork.total += layerInGroup;
+    resolve.work = layerWork;
+    resolve.missCount = scratch.missCount;
+    // Every row adds its own hits and misses as it resolves them.
+    resolve.hitMiss = scratch.hitMiss;
+    launchSparseResolve(resolve, stream);
+
+    // The misses this layer produced, applied to each of its buffers. One list row per
+    // batch row, so the inner index is zero once workRowBase names the layer resolved.
+    //
+    // One launch for every pool of this layer. The descriptors the Batch built already
+    // clip each pool to the layer's buffers and name its index table, so nothing here
+    // depends on which layer is being resolved beyond choosing the row.
+    SparseUnitCopyArgs copy;
+    copy.views = views;
+    copy.numRows = numRows;
+    // The same descriptors as the write-back: a run never spans layers, so it already
+    // names this layer's index table. Only the buffer range below differs.
+    copy.copyDesc = scratch.copyDesc;
+    copy.bufferBase = bufferBase;
+    copy.numBuffers = numBuffers;
+    copy.direction = SparseCopyDirection::kFetch;
+    copy.unitsPerPage = unitsPerPage;
+    copy.work = layerWork;
+    copy.bufferLayer = mManager->sparseArena(lcId).bufferLayer();
+    copy.gridCtas = mManager->_sparseCopyGridCtas(scratch.fetchWork.capacity);
+    launchSparseUnitCopy(copy, stream);
+
+    // The index table the attention kernel reads is derived from the resolve's slots alone:
+    // it neither reads a cell nor waits for one to be filled. The copy releases its launch
+    // dependency as soon as it is addressed, so this follows it on the stream without
+    // waiting for it to finish.
+    auto const plan = mManager->sparseBufferPlan(lcId);
+    for (auto const& pool : mManager->sparseCopyTemplates(lcId))
+    {
+        auto const runBase = std::max(pool.bufferBase, bufferBase);
+        auto const runEnd = std::min(pool.bufferBase + pool.numBuffers, bufferBase + numBuffers);
+        if (runBase >= runEnd)
+        {
+            continue;
+        }
+        SparseOutIndexArgs indices;
+        indices.views = views;
+        indices.numRows = numRows;
+        indices.selected = selected;
+        indices.outSlot = scratch.outSlot;
+        indices.selectionWidth = selectionWidth;
+        indices.out = out;
+        indices.outBuffers = numBuffers;
+        indices.outBase = runBase - bufferBase;
+        indices.bufferBase = runBase;
+        indices.numBuffers = runEnd - runBase;
+        indices.cellsPerBuffer = pool.cellsPerBuffer;
+        indices.cellsPerLease = pool.cellsPerLease;
+        indices.unitsPerPage = unitsPerPage;
+        launchSparseOutIndices(indices, stream);
+    }
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

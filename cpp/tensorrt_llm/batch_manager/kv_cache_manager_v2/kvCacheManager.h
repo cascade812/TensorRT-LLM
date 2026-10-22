@@ -218,66 +218,6 @@ public:
     // Composite converter (scale + expansion).
     PageIndexConverter getPageIndexConverter(LayerId layerId, DataRole role) const;
 
-    //! Resolve a batch's selections against each buffer's per-request history cache.
-    //!
-    //! Device-driven and stream-ordered throughout: the selection is read from device
-    //! memory, so the host neither inspects it nor decides anything, and the call enqueues
-    //! onto `stream` and returns. Every shape is static across steps, so a CUDA graph can
-    //! capture it.
-    //!
-    //! `buffers` must be exactly one layer's sparse buffers. One layer, not one layer
-    //! group, because a layer's selection is computed from the previous layer's output, so
-    //! a step's selections are not all known at its start. The whole layer, not a subset,
-    //! because the resolve marks entries resident on behalf of every buffer at once:
-    //! filling only some would leave the rest stale while the metadata claimed otherwise.
-    //!
-    //! `selected` is [maxBatchSize][selectionWidth] unit ordinals, negative where padded,
-    //! and must name only units below the history watermark -- a unit at or above it has
-    //! not been written back, so fetching it would copy stale bytes. That is a wrong
-    //! answer rather than a memory error, and the call cannot detect it, so it is the
-    //! selector's responsibility.
-    //!
-    //! `out` is [maxBatchSize][buffers.size()][selectionWidth], written in full, in the
-    //! expanded index space getPageIndexConverter() produces: entry k is the index holding
-    //! `selected[row][k]`, or kBadPageIndex where that slot carries no selection.
-    //!
-    //! Relative to getSparseCacheBaseAddress() for the buffer, not getMemPoolBaseAddress()
-    //! and not a cache level: the pool names the buffer's pages, which are host memory for a
-    //! sparse life cycle, while the cells a kernel reads live in the arena.
-    //!
-    //! Compact, in the selection's own order, rather than a table indexed by unit ordinal,
-    //! because that is the shape sparse attention kernels take. See
-    //! SPARSE_ATTENTION_DESIGN.md's "Fetch".
-    void fetchSparsePages(Batch& batch, std::vector<BufferId> const& buffers, int32_t const* selected,
-        int selectionWidth, int32_t* out, CUstream stream);
-
-    //! Give the in-flight unit of each request a cell, and report where to write it.
-    //!
-    //! The unit between the two watermarks is the one the model is about to produce. It has
-    //! no host copy yet -- a unit reaches its page only when resize() carries the watermark
-    //! past it -- so nothing is fetched here: the call assigns a cell and leaves its bytes
-    //! to the model.
-    //!
-    //! Separate from fetchSparsePages because the orders differ. A fetch needs the
-    //! selection, which the indexer produces from the previous layer; a write needs only
-    //! the watermarks, so it can run first, which is the order the model requires.
-    //!
-    //! Idempotent while the watermarks and the reservation hold: the resolve probes
-    //! residency before it takes a victim, so a later call -- including the fetch's own
-    //! resolve -- finds the entry and reuses it rather than assigning a second. The entry
-    //! is pinned for as long as its unit is in flight, so no fetch can evict it.
-    //!
-    //! `buffers` is one layer's sparse buffers, exactly as for fetchSparsePages.
-    //!
-    //! `out` is [maxBatchSize][buffers.size()], written in full, in the same expanded index
-    //! space fetchSparsePages produces and relative to the same per-pool arena region:
-    //! kBadPageIndex where the row holds no reservation or has nothing in flight.
-    void prepareSparseWriteIndices(Batch& batch, std::vector<BufferId> const& buffers, int32_t* out, CUstream stream);
-
-    //! Write back every row's crossed units for one life cycle, from the ranges the Batch
-    //! staged. One scan over (layer, row), then one copy per pool covering the whole batch.
-    void writeBackSparseUnits(Batch& batch, LifeCycleId lifeCycle, CUstream stream);
-
     // Group a set of BufferIds into contiguous AggregatedPageDesc descriptors.
     // Mirrors Python's KVCacheManager.get_aggregated_pages().
     std::vector<AggregatedPageDesc> getAggregatedPages(std::vector<BufferId> const& buffers) const;
@@ -648,6 +588,8 @@ public:
     // White-box introspection (incl. test-only auto-tuner state mutation) reaches
     // private members directly rather than widening the public API.
     friend class KvCacheIntrospection;
+    //! Reaches _sparseLayerSpan to resolve a layer's buffers for its own step.
+    friend class Batch;
 
 private:
     // First member, so the registration covers the whole lifetime: it is taken before any state

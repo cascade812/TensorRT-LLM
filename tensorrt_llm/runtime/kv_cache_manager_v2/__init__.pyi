@@ -1209,6 +1209,176 @@ class Batch:
         range because they were allocated by an earlier step.
         """
 
+    def prepare_sparse_write_indices(
+        self,
+        buffers: Sequence[BufferId],
+        out: DeviceArray,  # int32[batch, len(buffers)]
+        stream: CudaStream | None = None,
+    ) -> None:
+        """Give each request's in-flight unit a cell, and report where to write it.
+
+        The unit between the two watermarks is the one the model is about to produce. It
+        has no host copy yet -- a unit reaches its page only when :meth:`_KVCache.resize`
+        carries the watermark past it -- so nothing is fetched here. The call assigns a
+        cell and leaves its bytes to the model; reading one before the model writes it
+        yields whatever the cell last held.
+
+        Separate from :meth:`fetch_sparse_pages` because the orders differ. A fetch needs
+        the selection, which the indexer produces from the previous layer's output; a write
+        needs only the watermarks. So this can run first, which is the order the model
+        requires, and it needs no top-k.
+
+        Idempotent while the watermarks and the reservation hold. The resolve probes
+        residency before taking a victim, so a later call -- including the one inside
+        :meth:`fetch_sparse_pages` -- finds the entry and reuses it rather than assigning a
+        second. The entry is pinned for as long as its unit is in flight, so no fetch can
+        evict it, and a fetch never copies over it: a unit at or above the watermark has no
+        written-back host page, so there is nothing it could be refilled from.
+
+        Args:
+            batch: whose watermarks and cache views are published. A row's cache must hold
+                the reservation taken at :meth:`_KVCache.resume`.
+            buffers: exactly one layer's sparse buffers, in the cache's order -- the same
+                rule and the same order as :meth:`fetch_sparse_pages`.
+            out: int32 ``[batch.max_batch_size, len(buffers)]``, written in full.
+                ``out[b][i]`` is the index of the in-flight unit's cell for ``buffers[i]``,
+                and ``BAD_PAGE_INDEX`` where the row holds no reservation or has nothing in
+                flight. One entry per request, not per query token: :meth:`_KVCache.resize`
+                bounds ``capacity - history_length`` to a single token, so at most one unit
+                is ever in flight.
+
+                ``BAD_PAGE_INDEX`` is an ordinary outcome, not an error. A unit is in flight
+                only once it is whole: with ``tokens_per_block_override`` of 4, that is one
+                step in four, which is also the only step on which a ratio-4 compressor has
+                produced anything to write. With one token per unit it is every step.
+            stream: the CUDA stream to enqueue on.
+
+        Indices are in the same expanded index space :meth:`fetch_sparse_pages` produces
+        and relative to the same base -- :meth:`get_sparse_cache_base_address` for that
+        buffer, **not** :meth:`get_mem_pool_base_address`. The latter names the buffer's
+        host-backed *pages*; the cells live in a separate GPU arena.
+
+        Call it after publication and before the model's KV writes, ordering the two
+        through the stream. Regenerate the output whenever a watermark or a reservation
+        changes, and keep it unmodified until its consumers are done. Complete the writes
+        before advancing history through :meth:`_KVCache.resize`, which is what writes a
+        finished unit back to its host page.
+
+        Device-driven and stream-ordered, with static shapes, so a CUDA graph can capture
+        it.
+
+
+        Order it after batch publication and before consumers, on the same stream or
+        through events across streams. The call reads no device values on the host, and
+        with fixed batch and output shapes it is CUDA-graph-capturable.
+
+        The entry is shared by all of the layer's sparse buffers, but each buffer's index
+        is relative to its own :meth:`get_sparse_cache_base_address`, including when data
+        and scales sit in different pools. The indices carry request and buffer placement;
+        they are neither request-local cache-entry numbers nor byte addresses.
+        """
+    def fetch_sparse_pages(
+        self,
+        buffers: Sequence[BufferId],
+        selected: DeviceArray,  # int32[batch, topk]
+        out: DeviceArray,  # int32[batch, len(buffers), topk]
+        stream: CudaStream,
+    ) -> None:
+        """Resolve a batch's selections against each buffer's per-request history cache.
+
+        Device-driven and stream-ordered throughout: the selection is read from device
+        memory, so the host neither inspects it nor decides anything, and the call
+        enqueues onto ``stream`` and returns. Order it against the selection kernel by
+        sharing a stream, or across streams with an event. Every shape is static across
+        steps, so the call is capturable in a CUDA graph.
+
+        ``buffers`` must be exactly one layer's sparse buffers, in the order
+        :meth:`get_mem_pool_base_address` numbers them. One layer, not one layer group:
+        a layer's selection is computed from the previous layer's output, so a step's
+        selections are not all known at its start. Consecutive layers that share a
+        selection still get a call each, so the first layer's copies start as early as
+        possible; pass the same ``selected`` to each.
+
+        The whole layer, not a subset, because the resolve marks entries resident on
+        behalf of every buffer at once: filling only some would leave the rest stale while
+        the metadata claimed otherwise.
+
+        ``selected`` holds block ordinals, ``topk`` uniform across requests and ``-1``
+        past a request's valid count. The page table and the per-request count of
+        eligible blocks come from ``batch``, whose row order ``selected`` and ``out``
+        both inherit.
+
+        Eligible means below the history watermark: a block at or above it holds input
+        tokens whose host page has not been written back yet, so selecting it would read
+        stale bytes. Not a memory-safety problem -- the page table is uniform, so the
+        ordinal resolves to a real page of the same request -- but a wrong answer. The call
+        cannot detect an ineligible ordinal, so naming only eligible ones is the selector's
+        responsibility.
+
+        Each selected unit is looked up in the owning request's cache for that layer.
+        A hit is reused in place; a miss is copied from the locked host page into a slot
+        taken from the free list, evicting least-recently-used when it is empty.
+        Reservation at :meth:`_KVCache.resume` guarantees room for a full selection
+        width, so a fetch always satisfies its own layer, and within a step a fetch may
+        evict entries of layers already processed but never one a later kernel still
+        needs.
+
+        Copies leave the host page authoritative rather than moving it, so evicting a
+        fetched cell moves no data. The copies are a snapshot, which is sound only because a
+        block below the watermark is already written back and immutable. A cell holding an
+        in-flight block is the one exception, and is never an eviction candidate.
+
+        The in-flight unit is reserved internally but is not appended to ``out``. Use
+        :meth:`prepare_sparse_write_indices` before the model's KV writes to obtain its
+        per-buffer physical write indices independently of the selection.
+
+        ``out`` is written in full and is **compact**: entry ``[b][i][k]`` is the cache
+        index holding ``selected[b][k]`` for ``buffers[i]``, and ``BAD_PAGE_INDEX`` where
+        that slot carries no selection. Padding stays where the
+        selection put it rather than being packed out, so slot ``k`` of ``out`` and slot
+        ``k`` of ``selected`` describe the same unit.
+
+        Compact, in the selection's own order, rather than a table indexed by unit
+        ordinal, because that is the shape sparse attention kernels take: a token-sparse
+        kernel is handed the index list in place of its page table and reads one unit per
+        slot, and a block-sparse kernel takes the list beside a page table it still uses.
+        None indexes a table by ordinal, so producing one would only oblige the caller to
+        compact it again.
+
+        The buffer dimension is a dimension rather than a separate array per buffer
+        because attention kernels commonly want one tensor covering K and V. It cannot be
+        dropped: a layer's buffers share the resolve, but not their cells. A lease gives
+        each buffer its own contiguous run of cells, so one selection resolves to a
+        different index per buffer, and each needs its own row.
+
+        Indices are in the expanded index space :class:`PageIndexConverter` produces, and
+        are relative to :meth:`get_sparse_cache_base_address` for the buffer they were
+        fetched for -- **not** to :meth:`get_mem_pool_base_address`, and not to a cache
+        level. The pool names the buffer's pages, which for a sparse life cycle are host
+        memory; the cells a kernel reads live in a separate GPU arena, with a region per
+        pool. Pairing these indices with the pool base reads the wrong allocation.
+
+        The selection is per layer, not per KV head: every head of a layer shares one
+        resident set. Algorithms that let different KV heads select different units are
+        therefore not expressible against this cache.
+
+        **Decode only.** ``selected`` carries one row per batch row, so a request
+        contributes a single selection per call. Sparse attention kernels index their
+        selection by *query token*, which coincides with the request only while a request
+        contributes one token -- that is, during generation.
+
+        The restriction is not just the row count. The resolve makes the selected units
+        resident in the request's cache, which holds ``max_cached_units``; residency is a
+        property of the request, not of a query token. A prefill chunk of N query tokens
+        each choosing their own units has a union of up to N times the selection width, so
+        the reservation could no longer cover a call, and a unit evicted for a later query
+        token would invalidate an index already returned for an earlier one. Widening this
+        to one row per token would make that reachable rather than fix it.
+
+        Serving prefill from a host-resident history is an open design question; see
+        SPARSE_ATTENTION_DESIGN.md.
+        """
+
     def flushed_history(self, row: int) -> int:
         """The history a row has been written back to.
 
@@ -1401,179 +1571,6 @@ class KVCacheManager:
         pool layout to restate it.
         """
     def get_page_index_upper_bound(self, layer_id: LayerId, data_role: DataRole) -> int: ...
-    def prepare_sparse_write_indices(
-        self,
-        batch: Batch,
-        buffers: Sequence[BufferId],
-        out: DeviceArray,  # int32[batch, len(buffers)]
-        stream: CudaStream | None = None,
-    ) -> None:
-        """Give each request's in-flight unit a cell, and report where to write it.
-
-        The unit between the two watermarks is the one the model is about to produce. It
-        has no host copy yet -- a unit reaches its page only when :meth:`_KVCache.resize`
-        carries the watermark past it -- so nothing is fetched here. The call assigns a
-        cell and leaves its bytes to the model; reading one before the model writes it
-        yields whatever the cell last held.
-
-        Separate from :meth:`fetch_sparse_pages` because the orders differ. A fetch needs
-        the selection, which the indexer produces from the previous layer's output; a write
-        needs only the watermarks. So this can run first, which is the order the model
-        requires, and it needs no top-k.
-
-        Idempotent while the watermarks and the reservation hold. The resolve probes
-        residency before taking a victim, so a later call -- including the one inside
-        :meth:`fetch_sparse_pages` -- finds the entry and reuses it rather than assigning a
-        second. The entry is pinned for as long as its unit is in flight, so no fetch can
-        evict it, and a fetch never copies over it: a unit at or above the watermark has no
-        written-back host page, so there is nothing it could be refilled from.
-
-        Args:
-            batch: whose watermarks and cache views are published. A row's cache must hold
-                the reservation taken at :meth:`_KVCache.resume`.
-            buffers: exactly one layer's sparse buffers, in the cache's order -- the same
-                rule and the same order as :meth:`fetch_sparse_pages`.
-            out: int32 ``[batch.max_batch_size, len(buffers)]``, written in full.
-                ``out[b][i]`` is the index of the in-flight unit's cell for ``buffers[i]``,
-                and ``BAD_PAGE_INDEX`` where the row holds no reservation or has nothing in
-                flight. One entry per request, not per query token: :meth:`_KVCache.resize`
-                bounds ``capacity - history_length`` to a single token, so at most one unit
-                is ever in flight.
-
-                ``BAD_PAGE_INDEX`` is an ordinary outcome, not an error. A unit is in flight
-                only once it is whole: with ``tokens_per_block_override`` of 4, that is one
-                step in four, which is also the only step on which a ratio-4 compressor has
-                produced anything to write. With one token per unit it is every step.
-            stream: the CUDA stream to enqueue on.
-
-        Indices are in the same expanded index space :meth:`fetch_sparse_pages` produces
-        and relative to the same base -- :meth:`get_sparse_cache_base_address` for that
-        buffer, **not** :meth:`get_mem_pool_base_address`. The latter names the buffer's
-        host-backed *pages*; the cells live in a separate GPU arena.
-
-        Call it after publication and before the model's KV writes, ordering the two
-        through the stream. Regenerate the output whenever a watermark or a reservation
-        changes, and keep it unmodified until its consumers are done. Complete the writes
-        before advancing history through :meth:`_KVCache.resize`, which is what writes a
-        finished unit back to its host page.
-
-        Device-driven and stream-ordered, with static shapes, so a CUDA graph can capture
-        it.
-
-
-        Order it after batch publication and before consumers, on the same stream or
-        through events across streams. The call reads no device values on the host, and
-        with fixed batch and output shapes it is CUDA-graph-capturable.
-
-        The entry is shared by all of the layer's sparse buffers, but each buffer's index
-        is relative to its own :meth:`get_sparse_cache_base_address`, including when data
-        and scales sit in different pools. The indices carry request and buffer placement;
-        they are neither request-local cache-entry numbers nor byte addresses.
-        """
-
-    def fetch_sparse_pages(
-        self,
-        batch: Batch,
-        buffers: Sequence[BufferId],
-        selected: DeviceArray,  # int32[batch, topk]
-        out: DeviceArray,  # int32[batch, len(buffers), topk]
-        stream: CudaStream,
-    ) -> None:
-        """Resolve a batch's selections against each buffer's per-request history cache.
-
-        Device-driven and stream-ordered throughout: the selection is read from device
-        memory, so the host neither inspects it nor decides anything, and the call
-        enqueues onto ``stream`` and returns. Order it against the selection kernel by
-        sharing a stream, or across streams with an event. Every shape is static across
-        steps, so the call is capturable in a CUDA graph.
-
-        ``buffers`` must be exactly one layer's sparse buffers, in the order
-        :meth:`get_mem_pool_base_address` numbers them. One layer, not one layer group:
-        a layer's selection is computed from the previous layer's output, so a step's
-        selections are not all known at its start. Consecutive layers that share a
-        selection still get a call each, so the first layer's copies start as early as
-        possible; pass the same ``selected`` to each.
-
-        The whole layer, not a subset, because the resolve marks entries resident on
-        behalf of every buffer at once: filling only some would leave the rest stale while
-        the metadata claimed otherwise.
-
-        ``selected`` holds block ordinals, ``topk`` uniform across requests and ``-1``
-        past a request's valid count. The page table and the per-request count of
-        eligible blocks come from ``batch``, whose row order ``selected`` and ``out``
-        both inherit.
-
-        Eligible means below the history watermark: a block at or above it holds input
-        tokens whose host page has not been written back yet, so selecting it would read
-        stale bytes. Not a memory-safety problem -- the page table is uniform, so the
-        ordinal resolves to a real page of the same request -- but a wrong answer. The call
-        cannot detect an ineligible ordinal, so naming only eligible ones is the selector's
-        responsibility.
-
-        Each selected unit is looked up in the owning request's cache for that layer.
-        A hit is reused in place; a miss is copied from the locked host page into a slot
-        taken from the free list, evicting least-recently-used when it is empty.
-        Reservation at :meth:`_KVCache.resume` guarantees room for a full selection
-        width, so a fetch always satisfies its own layer, and within a step a fetch may
-        evict entries of layers already processed but never one a later kernel still
-        needs.
-
-        Copies leave the host page authoritative rather than moving it, so evicting a
-        fetched cell moves no data. The copies are a snapshot, which is sound only because a
-        block below the watermark is already written back and immutable. A cell holding an
-        in-flight block is the one exception, and is never an eviction candidate.
-
-        The in-flight unit is reserved internally but is not appended to ``out``. Use
-        :meth:`prepare_sparse_write_indices` before the model's KV writes to obtain its
-        per-buffer physical write indices independently of the selection.
-
-        ``out`` is written in full and is **compact**: entry ``[b][i][k]`` is the cache
-        index holding ``selected[b][k]`` for ``buffers[i]``, and ``BAD_PAGE_INDEX`` where
-        that slot carries no selection. Padding stays where the
-        selection put it rather than being packed out, so slot ``k`` of ``out`` and slot
-        ``k`` of ``selected`` describe the same unit.
-
-        Compact, in the selection's own order, rather than a table indexed by unit
-        ordinal, because that is the shape sparse attention kernels take: a token-sparse
-        kernel is handed the index list in place of its page table and reads one unit per
-        slot, and a block-sparse kernel takes the list beside a page table it still uses.
-        None indexes a table by ordinal, so producing one would only oblige the caller to
-        compact it again.
-
-        The buffer dimension is a dimension rather than a separate array per buffer
-        because attention kernels commonly want one tensor covering K and V. It cannot be
-        dropped: a layer's buffers share the resolve, but not their cells. A lease gives
-        each buffer its own contiguous run of cells, so one selection resolves to a
-        different index per buffer, and each needs its own row.
-
-        Indices are in the expanded index space :class:`PageIndexConverter` produces, and
-        are relative to :meth:`get_sparse_cache_base_address` for the buffer they were
-        fetched for -- **not** to :meth:`get_mem_pool_base_address`, and not to a cache
-        level. The pool names the buffer's pages, which for a sparse life cycle are host
-        memory; the cells a kernel reads live in a separate GPU arena, with a region per
-        pool. Pairing these indices with the pool base reads the wrong allocation.
-
-        The selection is per layer, not per KV head: every head of a layer shares one
-        resident set. Algorithms that let different KV heads select different units are
-        therefore not expressible against this cache.
-
-        **Decode only.** ``selected`` carries one row per batch row, so a request
-        contributes a single selection per call. Sparse attention kernels index their
-        selection by *query token*, which coincides with the request only while a request
-        contributes one token -- that is, during generation.
-
-        The restriction is not just the row count. The resolve makes the selected units
-        resident in the request's cache, which holds ``max_cached_units``; residency is a
-        property of the request, not of a query token. A prefill chunk of N query tokens
-        each choosing their own units has a union of up to N times the selection width, so
-        the reservation could no longer cover a call, and a unit evicted for a later query
-        token would invalidate an index already returned for an earlier one. Widening this
-        to one row per token would make that reachable rather than fix it.
-
-        Serving prefill from a host-resident history is an open design question; see
-        SPARSE_ATTENTION_DESIGN.md.
-        """
-
     def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def get_page_index_converter(
         self, layer_id: LayerId, data_role: DataRole

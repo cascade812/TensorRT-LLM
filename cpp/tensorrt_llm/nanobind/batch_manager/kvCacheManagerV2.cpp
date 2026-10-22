@@ -2848,6 +2848,96 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "be selected, and resize() refuses a history this has not covered. Bounded by the capacity each "
             "row started from, so a resumed request moving history across a whole prompt writes back "
             "nothing. Reads the index table as of the last publish.")
+        .def(
+            "prepare_sparse_write_indices",
+            [](kv::Batch& self, std::vector<kv::BufferId> const& buffers, DeviceArray2D const& out, nb::object stream)
+            {
+                if (static_cast<int>(out.shape(0)) != self.maxBatchSize())
+                {
+                    throw std::invalid_argument(
+                        "prepare_sparse_write_indices: out must carry one row per batch row, not one per "
+                        "query token. A request has at most one unit in flight; prefill and speculative "
+                        "decoding give it several and are out of scope");
+                }
+                if (out.shape(1) != buffers.size())
+                {
+                    throw std::invalid_argument("prepare_sparse_write_indices: out's last extent must be len(buffers)");
+                }
+                auto const handle
+                    = stream.is_none() ? CUstream{} : reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream));
+                auto* outPtr = out.data();
+                nb::gil_scoped_release rel;
+                self.prepareSparseWriteIndices(buffers, outPtr, handle);
+            },
+            nb::arg("buffers"), nb::arg("out").noconvert(), nb::arg("stream") = nb::none(),
+            "Give each request's in-flight unit a cell, and report where to write it.\n\n"
+            "The unit between the two watermarks is the one the model is about to produce. It has no "
+            "host copy yet -- a unit reaches its page only when resize() carries the watermark past "
+            "it -- so nothing is fetched: the call assigns a cell and leaves its bytes to the model.\n\n"
+            "Separate from fetch_sparse_pages because the orders differ. A fetch needs the selection, "
+            "which the indexer produces from the previous layer; a write needs only the watermarks, so "
+            "it can run first, which is the order the model requires.\n\n"
+            "Idempotent while the watermarks and the reservation hold: a later call, including the "
+            "fetch's own resolve, finds the entry and reuses it. The entry is pinned while its unit is "
+            "in flight, so no fetch can evict it.\n\n"
+            "buffers is one layer's sparse buffers, exactly as for fetch_sparse_pages. out is "
+            "int32[batch, len(buffers)], written in full, in the same expanded index space "
+            "fetch_sparse_pages produces and relative to the same get_sparse_cache_base_address "
+            "region: BAD_PAGE_INDEX where the row holds no reservation or nothing in flight.\n\n"
+            "Device-driven and stream-ordered: enqueues and returns, and every shape is static, so a "
+            "CUDA graph can capture it.")
+        .def(
+            "fetch_sparse_pages",
+            [](kv::Batch& self, std::vector<kv::BufferId> const& buffers, DeviceArray2D const& selected,
+                DeviceArray3D const& out, nb::object stream)
+            {
+                if (selected.shape(0) != out.shape(0))
+                {
+                    throw std::invalid_argument("fetch_sparse_pages: selected and out must agree on the batch size");
+                }
+                if (static_cast<int>(selected.shape(0)) != self.maxBatchSize())
+                {
+                    throw std::invalid_argument(
+                        "fetch_sparse_pages: selected must carry one row per batch row, not one per query "
+                        "token. A request contributes a single selection per step; prefill and speculative "
+                        "decoding give it several and are out of scope");
+                }
+                if (out.shape(1) != buffers.size())
+                {
+                    throw std::invalid_argument("fetch_sparse_pages: out's middle extent must be len(buffers)");
+                }
+                if (out.shape(2) != selected.shape(1))
+                {
+                    throw std::invalid_argument(
+                        "fetch_sparse_pages: out's last extent must be the selection width; the result is compact, "
+                        "one index per selection slot, not a table indexed by ordinal");
+                }
+                auto const handle
+                    = stream.is_none() ? CUstream{} : reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream));
+                auto* selectedPtr = selected.data();
+                auto* outPtr = out.data();
+                auto const width = static_cast<int>(selected.shape(1));
+                nb::gil_scoped_release rel;
+                self.fetchSparsePages(buffers, selectedPtr, width, outPtr, handle);
+            },
+            nb::arg("buffers"), nb::arg("selected"), nb::arg("out").noconvert(), nb::arg("stream") = nb::none(),
+            "Resolve a batch's selections against each buffer's per-request history cache.\n\n"
+            "buffers must be exactly one layer's sparse buffers, in the cache's order. One layer, "
+            "not one layer group, because a layer's selection is computed from the previous "
+            "layer's output. The whole layer, not a subset, because the resolve marks entries "
+            "resident on behalf of every buffer at once.\n\n"
+            "selected is int32[batch, topk] unit ordinals, one row per request rather than per "
+            "query token, negative where padded, and must name only units below the history "
+            "watermark. out is int32[batch, len(buffers), topk], "
+            "written in full in the expanded index space: entry k is the index holding "
+            "selected[b][k], or BAD_PAGE_INDEX where that slot carries no selection. Compact, in "
+            "the selection's own order, because that is the shape sparse attention kernels take.\n\n"
+            "Indices are relative to get_sparse_cache_base_address for the buffer, not to "
+            "get_mem_pool_base_address and not to a cache level: the pool names the buffer's "
+            "pages, which are host memory for a sparse life cycle, while the cells a kernel "
+            "reads live in the arena.\n\n"
+            "Device-driven and stream-ordered: enqueues and returns, and every shape is static, "
+            "so a CUDA graph can capture it.")
         .def("flushed_history", &kv::Batch::flushedHistory, nb::arg("row"),
             "The history a row has been written back to. A row that has never needed a flush reads its own "
             "history, so a caller may always compare against it.")
@@ -3142,98 +3232,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "These are not drawn from the GPU tier's quota -- they are a different medium -- so "
             "they appear in no other total a caller can read, and get_quota(GPU_LEVEL) excludes "
             "them. Reported so a deployment can count what it is actually pinning.")
-        .def(
-            "prepare_sparse_write_indices",
-            [](kv::KvCacheManager& self, kv::Batch& batch, std::vector<kv::BufferId> const& buffers,
-                DeviceArray2D const& out, nb::object stream)
-            {
-                if (static_cast<int>(out.shape(0)) != batch.maxBatchSize())
-                {
-                    throw std::invalid_argument(
-                        "prepare_sparse_write_indices: out must carry one row per batch row, not one per "
-                        "query token. A request has at most one unit in flight; prefill and speculative "
-                        "decoding give it several and are out of scope");
-                }
-                if (out.shape(1) != buffers.size())
-                {
-                    throw std::invalid_argument("prepare_sparse_write_indices: out's last extent must be len(buffers)");
-                }
-                auto const handle
-                    = stream.is_none() ? CUstream{} : reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream));
-                auto* outPtr = out.data();
-                nb::gil_scoped_release rel;
-                self.prepareSparseWriteIndices(batch, buffers, outPtr, handle);
-            },
-            nb::arg("batch"), nb::arg("buffers"), nb::arg("out").noconvert(), nb::arg("stream") = nb::none(),
-            "Give each request's in-flight unit a cell, and report where to write it.\n\n"
-            "The unit between the two watermarks is the one the model is about to produce. It has no "
-            "host copy yet -- a unit reaches its page only when resize() carries the watermark past "
-            "it -- so nothing is fetched: the call assigns a cell and leaves its bytes to the model.\n\n"
-            "Separate from fetch_sparse_pages because the orders differ. A fetch needs the selection, "
-            "which the indexer produces from the previous layer; a write needs only the watermarks, so "
-            "it can run first, which is the order the model requires.\n\n"
-            "Idempotent while the watermarks and the reservation hold: a later call, including the "
-            "fetch's own resolve, finds the entry and reuses it. The entry is pinned while its unit is "
-            "in flight, so no fetch can evict it.\n\n"
-            "buffers is one layer's sparse buffers, exactly as for fetch_sparse_pages. out is "
-            "int32[batch, len(buffers)], written in full, in the same expanded index space "
-            "fetch_sparse_pages produces and relative to the same get_sparse_cache_base_address "
-            "region: BAD_PAGE_INDEX where the row holds no reservation or nothing in flight.\n\n"
-            "Device-driven and stream-ordered: enqueues and returns, and every shape is static, so a "
-            "CUDA graph can capture it.")
-        .def(
-            "fetch_sparse_pages",
-            [](kv::KvCacheManager& self, kv::Batch& batch, std::vector<kv::BufferId> const& buffers,
-                DeviceArray2D const& selected, DeviceArray3D const& out, nb::object stream)
-            {
-                if (selected.shape(0) != out.shape(0))
-                {
-                    throw std::invalid_argument("fetch_sparse_pages: selected and out must agree on the batch size");
-                }
-                if (static_cast<int>(selected.shape(0)) != batch.maxBatchSize())
-                {
-                    throw std::invalid_argument(
-                        "fetch_sparse_pages: selected must carry one row per batch row, not one per query "
-                        "token. A request contributes a single selection per step; prefill and speculative "
-                        "decoding give it several and are out of scope");
-                }
-                if (out.shape(1) != buffers.size())
-                {
-                    throw std::invalid_argument("fetch_sparse_pages: out's middle extent must be len(buffers)");
-                }
-                if (out.shape(2) != selected.shape(1))
-                {
-                    throw std::invalid_argument(
-                        "fetch_sparse_pages: out's last extent must be the selection width; the result is compact, "
-                        "one index per selection slot, not a table indexed by ordinal");
-                }
-                auto const handle
-                    = stream.is_none() ? CUstream{} : reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream));
-                auto* selectedPtr = selected.data();
-                auto* outPtr = out.data();
-                auto const width = static_cast<int>(selected.shape(1));
-                nb::gil_scoped_release rel;
-                self.fetchSparsePages(batch, buffers, selectedPtr, width, outPtr, handle);
-            },
-            nb::arg("batch"), nb::arg("buffers"), nb::arg("selected"), nb::arg("out").noconvert(),
-            nb::arg("stream") = nb::none(),
-            "Resolve a batch's selections against each buffer's per-request history cache.\n\n"
-            "buffers must be exactly one layer's sparse buffers, in the cache's order. One layer, "
-            "not one layer group, because a layer's selection is computed from the previous "
-            "layer's output. The whole layer, not a subset, because the resolve marks entries "
-            "resident on behalf of every buffer at once.\n\n"
-            "selected is int32[batch, topk] unit ordinals, one row per request rather than per "
-            "query token, negative where padded, and must name only units below the history "
-            "watermark. out is int32[batch, len(buffers), topk], "
-            "written in full in the expanded index space: entry k is the index holding "
-            "selected[b][k], or BAD_PAGE_INDEX where that slot carries no selection. Compact, in "
-            "the selection's own order, because that is the shape sparse attention kernels take.\n\n"
-            "Indices are relative to get_sparse_cache_base_address for the buffer, not to "
-            "get_mem_pool_base_address and not to a cache level: the pool names the buffer's "
-            "pages, which are host memory for a sparse life cycle, while the cells a kernel "
-            "reads live in the arena.\n\n"
-            "Device-driven and stream-ordered: enqueues and returns, and every shape is static, "
-            "so a CUDA graph can capture it.")
         .def(
             "resize",
             [](kv::KvCacheManager& self, int cacheLevel, size_t quota, bool bestEfforts)
