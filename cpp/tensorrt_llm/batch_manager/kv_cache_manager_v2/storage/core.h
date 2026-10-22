@@ -418,31 +418,14 @@ public:
     // Sizes per pool.
     TypedVec<PoolIndex, size_t> slotSize() const;
 
-    // Total bytes across all pools for one slot.
-    size_t numBytes() const noexcept
-    {
-        size_t total = 0;
-        for (auto const& pool : mPools)
-            total += pool->numBytes();
-        return total;
-    }
-
-    // Total bytes across all pools, rounding each pool's bytes up to granularity.
-    // Mirrors Python total_quota: sum(round_up(p.num_bytes, granularity) for p in pg._pools).
-    size_t roundedNumBytes(size_t granularity) const noexcept
-    {
-        size_t total = 0;
-        for (auto const& pool : mPools)
-            total += roundUp(pool->numBytes(), granularity);
-        return total;
-    }
-
-    //! The part of roundedNumBytes whose pages are `medium`, pools of any other medium
-    //! contributing nothing. Summed over the media it reaches, this is roundedNumBytes.
+    //! Bytes this group holds in pools whose pages are `medium`, each pool's total rounded
+    //! up to `granularity`. Pools of any other medium contribute nothing.
     //!
-    //! Bytes are only ever comparable within one medium, so a caller measuring them says
-    //! which: numBytes(cacheTier(), g) is what this tier's own quota pays for, and
-    //! numBytes(HOST_MEM, g) on a GPU-tier group is what it holds in host pages instead.
+    //! Bytes of different media are not comparable -- they are paid for from different
+    //! budgets and rounded to different grains -- so every caller measuring them names the
+    //! one it means. roundedNumBytes(cacheTier(), g) is what this group's own tier pays
+    //! for; roundedNumBytes(HOST_MEM, g) on a GPU-tier group is what it holds in host
+    //! pages besides.
     size_t roundedNumBytes(CacheTier medium, size_t granularity) const noexcept
     {
         size_t total = 0;
