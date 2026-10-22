@@ -18,6 +18,11 @@ The current C++ headers and tests are the source of truth. Historical Python
 behavior remains useful for compatibility testing, but migration-era proposed
 layouts or ownership models must not override the implementation.
 
+`SPARSE_ATTENTION_DESIGN.md` covers how a sparse buffer's pages are held in host
+memory and read through a per-request GPU cache, and `INDEX_CONVERSION_DESIGN.md`
+how page indices become the compact arena indices attention kernels take. Read
+them before changing `batch.*`, `sparseCache.*` or the index conversion.
+
 ## Layout
 
 - `common.h`, `config.h`, `tokenIdExt.h`, and `exceptions.h`: shared types,
@@ -25,6 +30,12 @@ layouts or ownership models must not override the implementation.
 - `blockRadixTree.*`: the shared prefix-reuse tree and SHA-256 block keys.
 - `page.*`, `kvCache.*`, and `kvCacheManager.*`: page lifecycle, per-request
   cache state, and the top-level manager.
+- `batch.*`: the caches stepped together and their device-side mirror — row
+  ownership, the per-layer-group page tables a sparse fetch reads, and the
+  per-row watermarks a step derives its counts from.
+- `sparseCache.*`, `sparseCacheKernels.*`, and `indexConversionKernels.*`: the
+  per-request GPU cache over host-backed sparse pages, and the conversion from
+  page indices to the compact arena indices attention kernels take.
 - `storage/`, `storageManager.*`, `evictionController.*`, and `copyEngine.*`:
   pools, eviction ownership, migration, and data movement.
 - `lifeCycleRegistry.*`: layer-group/lifecycle mapping, including attention and
@@ -82,6 +93,31 @@ slots, schedules pages for eviction, migrates pages between levels, and resizes
 pools. `CopyEngine` performs the actual batched transfers; C++ code calls it
 directly and must not round-trip through Python bindings.
 
+`Batch` groups the `KvCache`s stepped together and owns their row order. Rows are
+slots rather than positions in a compacted list, so removing a member leaves a
+hole instead of shifting later rows and the shapes and addresses a captured graph
+baked in stay valid. Membership is exclusive and carries the sparse arena lease,
+so a request joins only once it is ready to be stepped; `move()` relocates a
+member between rows without ending membership, which `removeKvCache()` followed
+by `addKvCache()` would. A member may not be resumed, suspended or closed while
+seated, because those write page indices through the Batch's staged row.
+
+`publish()` uploads a step's page tables and watermarks from pinned staging and
+returns with the copy still in flight, so every later host write to a member's
+page indices — a `KvCache::resize()`, a commit, a beam fork, an SWA recycle,
+anything that locks or unlocks a page — must be separated from it by
+`waitPublished()`, or it races the copy and publishes a torn table. The Batch's
+own mutators are exempt: `resize()`, `move()`, `addKvCache()` and
+`removeKvCache()` each wait for themselves. `publish()` throws rather than waits
+when the previous publish has not been waited on, because waiting there would
+cover only its own write and hide a member already mutated into the hazard; the
+lock and unlock paths carry a debug check for the member side of the same rule.
+
+A sparse member writes back the units its history passes through
+`flushSparseUnits()`, and must have done so for the history it is giving up
+before it leaves, since removal returns the arena lease and discards whatever the
+GPU cache held.
+
 The dependency direction is broadly:
 
 ```text
@@ -90,6 +126,7 @@ types/config/exceptions
   -> storage pools + eviction + copy engine + radix tree
   -> pages + storage manager
   -> per-request KvCache
+  -> Batch + sparse cache
   -> KvCacheManager
   -> nanobind API
 ```
