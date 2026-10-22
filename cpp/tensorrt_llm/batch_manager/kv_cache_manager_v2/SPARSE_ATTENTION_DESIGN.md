@@ -662,7 +662,7 @@ for an earlier one. Taking one row per token would make that reachable, not fix 
 
 **What else is sized by this, and would need revisiting.** The restriction reaches further
 than the fetch. `maxInputLength()` returns one token, which makes
-`sparseCacheMaxInFlightUnits` one, which in turn sizes the write-back's per-row flush list
+`_sparseCacheMaxInFlightUnits` one, which in turn sizes the write-back's per-row flush list
 and bounds how far one watermark move may travel. Those adapt on their own if the constant
 rises -- `flushSparseUnits()` refuses a span wider than the headroom, and the scan asserts
 the list cannot overrun. What does *not* adapt is throughput: the write-back is tuned on the

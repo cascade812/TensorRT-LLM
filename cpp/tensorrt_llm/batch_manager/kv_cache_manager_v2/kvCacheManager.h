@@ -106,6 +106,25 @@ struct PageIndexConverter
 //! a (layer, pool) run are consecutive. The fetch needs the first, because it resolves one
 //! layer; the copy needs the second, because a pool fixes a cell's size, the slot stride it
 //! is read from, and the unit layout, so one launch serves one pool.
+//! What one life cycle's sparse fetch path is shaped like, as _computeSparseCacheShape
+//! derives it from the configuration. One record rather than a column per field: every
+//! field is filled in the same pass for the same life cycle and read together per step, so
+//! splitting them only invites the columns to disagree about their length.
+struct SparseCacheShape
+{
+    //! Cells a request caches per buffer, counting history and everything in flight.
+    int maxUnits = 0;
+    //! Sub-slots one page divides into. One when the life cycle has no fetch path, so the
+    //! page and the unit coincide.
+    int unitsPerPage = 1;
+    //! Sparse buffers this life cycle has.
+    int buffers = 0;
+    //! Units a step selects per buffer.
+    int selection = 0;
+    //! Layers of this life cycle that carry a sparse cache.
+    int layers = 0;
+};
+
 struct SparseBufferPlan
 {
     BufferId id;
@@ -381,6 +400,13 @@ public:
         return mConfig;
     }
 
+    //! The shape of a life cycle's fetch path, or a default one for a life cycle with none.
+    [[nodiscard]] SparseCacheShape const& _sparseCacheShape(LifeCycleId lifeCycle) const noexcept
+    {
+        static constexpr SparseCacheShape kNoFetchPath{};
+        return lifeCycle < mSparseCacheShape.size() ? mSparseCacheShape[lifeCycle] : kNoFetchPath;
+    }
+
     //! Cells a request's sparse cache holds per buffer of this life cycle, counting both
     //! populations: the history it caches and everything still in flight. Zero when the life
     //! cycle is not sparse or its fetch path is unconfigured.
@@ -389,7 +415,7 @@ public:
     //! leaves above the selection width is the headroom KvCache::maxInputLength() reports.
     [[nodiscard]] int sparseCacheMaxUnits(LifeCycleId lifeCycle) const noexcept
     {
-        return lifeCycle < mSparseCacheMaxUnits.size() ? mSparseCacheMaxUnits[lifeCycle] : 0;
+        return _sparseCacheShape(lifeCycle).maxUnits;
     }
 
     //! Whether any life cycle has a configured sparse fetch path. A property of the
@@ -400,32 +426,14 @@ public:
     //! less than a second copy of the same fact could drift.
     [[nodiscard]] bool hasSparseCache() const noexcept
     {
-        return std::ranges::any_of(mSparseCacheMaxUnits, [](int units) { return units > 0; });
-    }
-
-    //! Units a step selects per buffer of this life cycle. The cache must hold a whole
-    //! selection on top of everything in flight, so this is what the in-flight headroom is
-    //! measured against.
-    [[nodiscard]] int sparseCacheSelectionWidth(LifeCycleId lifeCycle) const noexcept
-    {
-        return lifeCycle < mSparseCacheSelection.size() ? mSparseCacheSelection[lifeCycle] : 0;
+        return std::ranges::any_of(mSparseCacheShape, [](SparseCacheShape const& shape) { return shape.maxUnits > 0; });
     }
 
     //! Selection units carried by one buffer of this life cycle, i.e. tokens_per_block
     //! divided by the unit's token count. One when the unit is a whole block.
     [[nodiscard]] int sparseCacheUnitsPerPage(LifeCycleId lifeCycle) const noexcept
     {
-        return lifeCycle < mSparseCacheUnitsPerPage.size() ? mSparseCacheUnitsPerPage[lifeCycle] : 1;
-    }
-
-    //! Layers this life cycle has that carry a sparse cache.
-    //!
-    //! The cache metadata is per layer rather than per buffer, because every sparse buffer
-    //! of a layer selects the same units: one resident set and one recency order serve them
-    //! all, and the entry index resolved from it addresses each buffer's own cell.
-    [[nodiscard]] int sparseCacheLayerCount(LifeCycleId lifeCycle) const noexcept
-    {
-        return lifeCycle < mSparseCacheLayers.size() ? mSparseCacheLayers[lifeCycle] : 0;
+        return _sparseCacheShape(lifeCycle).unitsPerPage;
     }
 
     //! Sparse buffers this life cycle has, one per (layer, role). Cells and cold-page
@@ -436,24 +444,8 @@ public:
     //! cache count the same number.
     [[nodiscard]] int sparseCacheBufferCount(LifeCycleId lifeCycle) const noexcept
     {
-        return lifeCycle < mSparseCacheBuffers.size() ? mSparseCacheBuffers[lifeCycle] : 0;
+        return _sparseCacheShape(lifeCycle).buffers;
     }
-
-    //! Sub-slots a request's sparse cache reserves per buffer of this life cycle, i.e. the
-    //! cell count divided by the expansion. A property of configuration, not of any one
-    //! request, which is what lets a batch size its fetch scratch before any member exists.
-    [[nodiscard]] int sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const noexcept;
-
-    //! Bound on how far capacity can lead history, in units: whatever the cache holds
-    //! beyond a full selection. One definition, because the resolve's in-flight array and
-    //! the write-back's flush list are bounded by the same headroom.
-    [[nodiscard]] int sparseCacheMaxInFlightUnits(LifeCycleId lifeCycle) const noexcept;
-
-    //! This life cycle's sparse buffers, in the order the cache numbers them.
-    [[nodiscard]] std::vector<SparseBufferPlan> sparseBufferPlan(LifeCycleId lifeCycle) const;
-
-    //! Just their ids, in the same order.
-    [[nodiscard]] std::vector<BufferId> sparseBufferIds(LifeCycleId lifeCycle) const;
 
     //! The index table specs every sparse life cycle needs, one per (layer, pool) run.
     //!
@@ -464,19 +456,6 @@ public:
     //! need not re-derive the pool layout to restate it.
     [[nodiscard]] std::vector<IndexTableSpec> sparseIndexTableSpecs() const;
 
-    //! Everything a sparse copy needs that follows from configuration alone: the two pools,
-    //! the unit layout and the cell geometry. A caller fills in whose cache it is copying
-    //! into and which work list to read.
-    //!
-    //! One entry per maximal run of consecutive buffers sharing a hot pool, because a pool
-    //! fixes a cell's size, the slot stride it is read from and the unit layout. Buffers are
-    //! ordered (layer, pool), so a life cycle whose sparse buffers are alike yields a single
-    //! run, and the quantised shape -- data and block scales in pools of their own -- yields
-    //! one per layer and pool. A caller that wants only some buffers clips each run to them.
-    [[nodiscard]] std::vector<SparseCopyRun> sparseCopyTemplates(LifeCycleId lifeCycle) const;
-
-    //! CTAs a copy over a list of `workCapacity` entries should launch.
-    [[nodiscard]] int32_t _sparseCopyGridCtas(int32_t workCapacity) const;
     //! Multiprocessors of the device this manager runs on, read once on first use.
     mutable int32_t mSmCount = 0;
 
@@ -492,25 +471,6 @@ public:
     //! keeps one meaning whether or not a buffer is sparse. The arena is a second allocation
     //! holding the only GPU-resident copy a kernel can read, so it gets its own accessor.
     [[nodiscard]] MemAddress getSparseCacheBaseAddress(LayerId layerId, DataRole const& role) const;
-
-    //! This life cycle's arena of GPU cells, from which a request takes its lease at
-    //! resume(). Empty when the life cycle has no sparse fetch path configured.
-    //!
-    //! Owned here rather than by StorageManager: the cells must stay GPU-resident while the
-    //! life cycle's hot pool group becomes host memory, and a cell is not a page, so it has
-    //! no answer to the question every storage slot must answer -- which block it holds.
-    [[nodiscard]] SparseCellArena& sparseArena(LifeCycleId lifeCycle)
-    {
-        return mSparseArenas[lifeCycle];
-    }
-
-    //! Storage attributes of one buffer: its pool, its offset within that pool's slot, its
-    //! expanded size and its expansion. Forwarded because StorageManager keeps the table
-    //! private and this manager is its friend.
-    [[nodiscard]] BufferAttr const& bufferAttr(LayerId layerId, DataRole const& role) const
-    {
-        return mStorage->getBufferAttr(layerId, role);
-    }
 
     LifeCycleRegistry const& lifeCycles() const noexcept
     {
@@ -604,6 +564,75 @@ public:
     friend class Batch;
 
 private:
+    // Sparse layout the Batch reads to drive a step. Private: a Batch is the only
+    // caller, and it is a friend above.
+    //! Units a step selects per buffer of this life cycle. The cache must hold a whole
+    //! selection on top of everything in flight, so this is what the in-flight headroom is
+    //! measured against.
+    [[nodiscard]] int _sparseCacheSelectionWidth(LifeCycleId lifeCycle) const noexcept
+    {
+        return _sparseCacheShape(lifeCycle).selection;
+    }
+
+    //! Layers this life cycle has that carry a sparse cache.
+    //!
+    //! The cache metadata is per layer rather than per buffer, because every sparse buffer
+    //! of a layer selects the same units: one resident set and one recency order serve them
+    //! all, and the entry index resolved from it addresses each buffer's own cell.
+    [[nodiscard]] int _sparseCacheLayerCount(LifeCycleId lifeCycle) const noexcept
+    {
+        return _sparseCacheShape(lifeCycle).layers;
+    }
+
+    //! Sub-slots a request's sparse cache reserves per buffer of this life cycle, i.e. the
+    //! cell count divided by the expansion. A property of configuration, not of any one
+    //! request, which is what lets a batch size its fetch scratch before any member exists.
+    [[nodiscard]] int _sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const noexcept;
+
+    //! Bound on how far capacity can lead history, in units: whatever the cache holds
+    //! beyond a full selection. One definition, because the resolve's in-flight array and
+    //! the write-back's flush list are bounded by the same headroom.
+    [[nodiscard]] int _sparseCacheMaxInFlightUnits(LifeCycleId lifeCycle) const noexcept;
+
+    //! This life cycle's sparse buffers, in the order the cache numbers them.
+    [[nodiscard]] std::vector<SparseBufferPlan> _sparseBufferPlan(LifeCycleId lifeCycle) const;
+
+    //! Just their ids, in the same order.
+    [[nodiscard]] std::vector<BufferId> _sparseBufferIds(LifeCycleId lifeCycle) const;
+
+    //! Everything a sparse copy needs that follows from configuration alone: the two pools,
+    //! the unit layout and the cell geometry. A caller fills in whose cache it is copying
+    //! into and which work list to read.
+    //!
+    //! One entry per maximal run of consecutive buffers sharing a hot pool, because a pool
+    //! fixes a cell's size, the slot stride it is read from and the unit layout. Buffers are
+    //! ordered (layer, pool), so a life cycle whose sparse buffers are alike yields a single
+    //! run, and the quantised shape -- data and block scales in pools of their own -- yields
+    //! one per layer and pool. A caller that wants only some buffers clips each run to them.
+    [[nodiscard]] std::vector<SparseCopyRun> _sparseCopyTemplates(LifeCycleId lifeCycle) const;
+
+    //! CTAs a copy over a list of `workCapacity` entries should launch.
+    [[nodiscard]] int32_t _sparseCopyGridCtas(int32_t workCapacity) const;
+
+    //! This life cycle's arena of GPU cells, from which a request takes its lease at
+    //! resume(). Empty when the life cycle has no sparse fetch path configured.
+    //!
+    //! Owned here rather than by StorageManager: the cells must stay GPU-resident while the
+    //! life cycle's hot pool group becomes host memory, and a cell is not a page, so it has
+    //! no answer to the question every storage slot must answer -- which block it holds.
+    [[nodiscard]] SparseCellArena& _sparseArena(LifeCycleId lifeCycle)
+    {
+        return mSparseArenas[lifeCycle];
+    }
+
+    //! Storage attributes of one buffer: its pool, its offset within that pool's slot, its
+    //! expanded size and its expansion. Forwarded because StorageManager keeps the table
+    //! private and this manager is its friend.
+    [[nodiscard]] BufferAttr const& _bufferAttr(LayerId layerId, DataRole const& role) const
+    {
+        return mStorage->getBufferAttr(layerId, role);
+    }
+
     // First member, so the registration covers the whole lifetime: it is taken before any state
     // this manager could leave behind exists, and dropped after ~KvCacheManager has run.
     PoisonHold mPoisonHold;
@@ -648,11 +677,7 @@ private:
     LifeCycleRegistry mLifeCycles;
 
     // All indexed by life cycle; see the sparseCache* accessors.
-    TypedVec<LifeCycleId, int> mSparseCacheMaxUnits;
-    TypedVec<LifeCycleId, int> mSparseCacheUnitsPerPage;
-    TypedVec<LifeCycleId, int> mSparseCacheBuffers;
-    TypedVec<LifeCycleId, int> mSparseCacheSelection;
-    TypedVec<LifeCycleId, int> mSparseCacheLayers;
+    TypedVec<LifeCycleId, SparseCacheShape> mSparseCacheShape;
     TypedVec<LifeCycleId, SparseCellArena> mSparseArenas;
     std::shared_ptr<EventSink> mEventSink;
     std::shared_ptr<StorageManager> mStorage;

@@ -77,7 +77,7 @@ _BATCH_VIEW_ALIGNMENT = 8
 # Pinned host memory is mapped in whole pages of this many bytes.
 _HOST_PAGE_BYTES = 4096
 # A decode step writes one query token per request, which completes at most one
-# unit, so one unit per layer is in flight (sparseCacheMaxInFlightUnits).
+# unit, so one unit per layer is in flight (_sparseCacheMaxInFlightUnits).
 _SPARSE_MAX_FLUSH_UNITS = 1
 # The GPU tier allocates pools in granules of 2 MiB, doubled for every doubling
 # of the quota above 1 GiB, at most four times.

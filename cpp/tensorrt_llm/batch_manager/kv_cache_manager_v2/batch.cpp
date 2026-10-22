@@ -146,8 +146,8 @@ void Batch::_allocateCopyDesc()
         {
             continue;
         }
-        auto const runs = mManager->sparseCopyTemplates(lcId);
-        auto const plan = mManager->sparseBufferPlan(lcId);
+        auto const runs = mManager->_sparseCopyTemplates(lcId);
+        auto const plan = mManager->_sparseBufferPlan(lcId);
         scratch.numBuffers = static_cast<int32_t>(plan.size());
         offset[static_cast<size_t>(lcId.value())] = host.size();
 
@@ -175,7 +175,7 @@ void Batch::_allocateCopyDesc()
                 // it through a view it loads per work item.
                 desc.deviceBase = run.deviceBase
                     + static_cast<uint64_t>(
-                          mManager->sparseArena(lcId).shape().bufferSlotInPool[static_cast<size_t>(buffer)])
+                          mManager->_sparseArena(lcId).shape().bufferSlotInPool[static_cast<size_t>(buffer)])
                         * run.cellsPerBuffer * run.bufferBytes;
                 desc.leaseStride = static_cast<uint32_t>(run.cellsPerLease) * run.bufferBytes;
                 desc.cellBytes = run.bufferBytes;
@@ -225,7 +225,7 @@ int32_t Batch::_flushCapacity(LifeCycleId lifeCycle) const
     }
     // Without a budget, a step is assumed to advance capacity by the in-flight headroom in
     // every row at once, which is what a decode step does.
-    return mMaxBatchSize * std::max(1, mManager->sparseCacheMaxInFlightUnits(lifeCycle));
+    return mMaxBatchSize * std::max(1, mManager->_sparseCacheMaxInFlightUnits(lifeCycle));
 }
 
 void Batch::_allocateStepScratch()
@@ -238,15 +238,15 @@ void Batch::_allocateStepScratch()
     size_t total = 0;
     for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
     {
-        int const width = mManager->sparseCacheSelectionWidth(lcId);
+        int const width = mManager->_sparseCacheSelectionWidth(lcId);
         if (mManager->sparseCacheMaxUnits(lcId) <= 0 || width <= 0)
         {
             continue;
         }
         auto& scratch = mScratch[lcId];
         scratch.selectionWidth = width;
-        scratch.maxInFlightUnits = mManager->sparseCacheMaxInFlightUnits(lcId);
-        scratch.numLayers = mManager->sparseCacheLayerCount(lcId);
+        scratch.maxInFlightUnits = mManager->_sparseCacheMaxInFlightUnits(lcId);
+        scratch.numLayers = mManager->_sparseCacheLayerCount(lcId);
         auto const layers = static_cast<size_t>(scratch.numLayers);
         // One list for the fetch, holding the worst case of every row missing its whole
         // selection; one per layer for the write-back, each holding the units the step's
@@ -390,7 +390,7 @@ void Batch::_buildIndexTables(std::vector<IndexTableSpec> const& specs)
         TLLM_CHECK_WITH_INFO(!spec.buffers.empty(), "An index table spec names no buffers");
 
         auto const& first = spec.buffers.front();
-        auto const lifeCycle = mManager->bufferAttr(first.layerId, first.role).lifeCycleId;
+        auto const lifeCycle = mManager->_bufferAttr(first.layerId, first.role).lifeCycleId;
         // Substitution replaces one layer's page, so every layer of the life cycle can no
         // longer read one table. SHARED is exactly the claim that they can.
         bool const mayHoldScratch = !mManager->supportsIndexMode(PageIndexMode::SHARED, lifeCycle).has_value();
@@ -411,7 +411,7 @@ void Batch::_buildIndexTables(std::vector<IndexTableSpec> const& specs)
         offsets.reserve(spec.buffers.size());
         for (auto const& buffer : spec.buffers)
         {
-            auto const& attr = mManager->bufferAttr(buffer.layerId, buffer.role);
+            auto const& attr = mManager->_bufferAttr(buffer.layerId, buffer.role);
             // The reference converter emits `expansion` entries per block. Nothing in the
             // tree sets tokensPerBlockOverride, and every attention backend refuses an
             // expansion of anything but one, so this follows them rather than building a
@@ -602,7 +602,7 @@ void Batch::_checkSparseRunsAreAddressable() const
 {
     for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
     {
-        auto const plan = mManager->sparseBufferPlan(lcId);
+        auto const plan = mManager->_sparseBufferPlan(lcId);
         if (plan.empty())
         {
             continue;
@@ -1056,7 +1056,7 @@ int Batch::addKvCache(KvCache& kvCache, int requestedRow)
     // from, so a free row always has a free lease and this cannot fail.
     for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
     {
-        auto& arena = mManager->sparseArena(lc);
+        auto& arena = mManager->_sparseArena(lc);
         if (arena.empty() || !kvCache.mSparseCache[lc].empty())
         {
             continue;
@@ -1428,7 +1428,7 @@ size_t Batch::sparseArenaBytes() const
     size_t total = 0;
     for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
     {
-        total += mManager->sparseArena(lc).numBytes();
+        total += mManager->_sparseArena(lc).numBytes();
     }
     return total;
 }
@@ -1486,8 +1486,8 @@ void Batch::prepareSparseWriteIndices(std::vector<BufferId> const& buffers, int3
     resolve.views = views;
     resolve.numRows = numRows;
     resolve.layerInGroup = span.layerInGroup;
-    resolve.numLayers = mManager->sparseCacheLayerCount(lcId);
-    resolve.entriesPerLayer = mManager->sparseCacheSubSlotsPerBuffer(lcId) * unitsPerPage;
+    resolve.numLayers = mManager->_sparseCacheLayerCount(lcId);
+    resolve.entriesPerLayer = mManager->_sparseCacheSubSlotsPerBuffer(lcId) * unitsPerPage;
     resolve.selectionWidth = 0;
     resolve.historyTokens = reinterpret_cast<int32_t const*>(marks.historyLength);
     resolve.capacityTokens = reinterpret_cast<int32_t const*>(marks.capacity);
@@ -1499,7 +1499,7 @@ void Batch::prepareSparseWriteIndices(std::vector<BufferId> const& buffers, int3
 
     // The in-flight list stands in for a selection: the resolve writes kNoSparseSlot past the
     // span, so a row with nothing in flight needs no separate signal.
-    for (auto const& copy : mManager->sparseCopyTemplates(lcId))
+    for (auto const& copy : mManager->_sparseCopyTemplates(lcId))
     {
         auto const runBase = std::max(copy.bufferBase, span.bufferBase);
         auto const runEnd = std::min(copy.bufferBase + copy.numBuffers, span.bufferBase + span.numBuffers);
@@ -1561,7 +1561,7 @@ void Batch::writeBackSparseUnits(LifeCycleId lifeCycle, CUstream stream)
     // The work list is every layer of this row, which is what a write-back crosses at
     // once -- unlike a fetch, which resolves one layer across the
     copy.work = scratch.flushWork;
-    copy.bufferLayer = mManager->sparseArena(lifeCycle).bufferLayer();
+    copy.bufferLayer = mManager->_sparseArena(lifeCycle).bufferLayer();
     copy.gridCtas = mManager->_sparseCopyGridCtas(scratch.flushWork.capacity);
     launchSparseUnitCopy(copy, stream);
 }
@@ -1601,8 +1601,8 @@ void Batch::fetchSparsePages(
     resolve.views = views;
     resolve.numRows = numRows;
     resolve.layerInGroup = layerInGroup;
-    resolve.numLayers = mManager->sparseCacheLayerCount(lcId);
-    resolve.entriesPerLayer = mManager->sparseCacheSubSlotsPerBuffer(lcId) * unitsPerPage;
+    resolve.numLayers = mManager->_sparseCacheLayerCount(lcId);
+    resolve.entriesPerLayer = mManager->_sparseCacheSubSlotsPerBuffer(lcId) * unitsPerPage;
     resolve.selected = selected;
     resolve.selectionWidth = selectionWidth;
     resolve.historyTokens = reinterpret_cast<int32_t const*>(marks.historyLength);
@@ -1638,7 +1638,7 @@ void Batch::fetchSparsePages(
     copy.direction = SparseCopyDirection::kFetch;
     copy.unitsPerPage = unitsPerPage;
     copy.work = layerWork;
-    copy.bufferLayer = mManager->sparseArena(lcId).bufferLayer();
+    copy.bufferLayer = mManager->_sparseArena(lcId).bufferLayer();
     copy.gridCtas = mManager->_sparseCopyGridCtas(scratch.fetchWork.capacity);
     launchSparseUnitCopy(copy, stream);
 
@@ -1646,8 +1646,8 @@ void Batch::fetchSparsePages(
     // it neither reads a cell nor waits for one to be filled. The copy releases its launch
     // dependency as soon as it is addressed, so this follows it on the stream without
     // waiting for it to finish.
-    auto const plan = mManager->sparseBufferPlan(lcId);
-    for (auto const& pool : mManager->sparseCopyTemplates(lcId))
+    auto const plan = mManager->_sparseBufferPlan(lcId);
+    for (auto const& pool : mManager->_sparseCopyTemplates(lcId))
     {
         auto const runBase = std::max(pool.bufferBase, bufferBase);
         auto const runEnd = std::min(pool.bufferBase + pool.numBuffers, bufferBase + numBuffers);

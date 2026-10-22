@@ -150,11 +150,7 @@ KvCacheManager::~KvCacheManager()
 void KvCacheManager::_computeSparseCacheShape()
 {
     LifeCycleId const numLc = mStorage->numLifeCycles();
-    mSparseCacheMaxUnits = TypedVec<LifeCycleId, int>(numLc, 0);
-    mSparseCacheUnitsPerPage = TypedVec<LifeCycleId, int>(numLc, 1);
-    mSparseCacheBuffers = TypedVec<LifeCycleId, int>(numLc, 0);
-    mSparseCacheSelection = TypedVec<LifeCycleId, int>(numLc, 0);
-    mSparseCacheLayers = TypedVec<LifeCycleId, int>(numLc, 0);
+    mSparseCacheShape = TypedVec<LifeCycleId, SparseCacheShape>(numLc, SparseCacheShape{});
 
     for (auto const& layer : mConfig.layers)
     {
@@ -184,16 +180,16 @@ void KvCacheManager::_computeSparseCacheShape()
         // they need no change. See SPARSE_ATTENTION_DESIGN.md.
         //
         // Until then, disagreement is rejected rather than silently resolved.
-        if (mSparseCacheLayers[lcId] > 0)
+        auto& shape = mSparseCacheShape[lcId];
+        if (shape.layers > 0)
         {
-            TLLM_CHECK_WITH_INFO(mSparseCacheMaxUnits[lcId] == cache.maxCachedUnits
-                    && mSparseCacheSelection[lcId] == cache.numSelectedBlocks
-                    && mSparseCacheUnitsPerPage[lcId] == unitsPerPage,
+            TLLM_CHECK_WITH_INFO(shape.maxUnits == cache.maxCachedUnits && shape.selection == cache.numSelectedBlocks
+                    && shape.unitsPerPage == unitsPerPage,
                 "Layers sharing a life cycle must declare the same sparse_cache; they share one arena");
         }
-        mSparseCacheMaxUnits[lcId] = cache.maxCachedUnits;
-        mSparseCacheSelection[lcId] = cache.numSelectedBlocks;
-        mSparseCacheUnitsPerPage[lcId] = unitsPerPage;
+        shape.maxUnits = cache.maxCachedUnits;
+        shape.selection = cache.numSelectedBlocks;
+        shape.unitsPerPage = unitsPerPage;
 
         bool layerCounted = false;
         for (auto const& buf : attn->buffers)
@@ -203,18 +199,18 @@ void KvCacheManager::_computeSparseCacheShape()
                 continue;
             }
             // One more cell in a reserved slot.
-            ++mSparseCacheBuffers[lcId];
+            ++shape.buffers;
             if (!layerCounted)
             {
                 // One more metadata row: the layer's buffers share it.
-                ++mSparseCacheLayers[lcId];
+                ++shape.layers;
                 layerCounted = true;
             }
         }
     }
 }
 
-int KvCacheManager::sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const noexcept
+int KvCacheManager::_sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const noexcept
 {
     int const maxUnits = sparseCacheMaxUnits(lifeCycle);
     if (maxUnits <= 0)
@@ -226,9 +222,9 @@ int KvCacheManager::sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const no
     return divUp(maxUnits, sparseCacheUnitsPerPage(lifeCycle));
 }
 
-int KvCacheManager::sparseCacheMaxInFlightUnits(LifeCycleId lifeCycle) const noexcept
+int KvCacheManager::_sparseCacheMaxInFlightUnits(LifeCycleId lifeCycle) const noexcept
 {
-    int const cells = sparseCacheSubSlotsPerBuffer(lifeCycle) * sparseCacheUnitsPerPage(lifeCycle);
+    int const cells = _sparseCacheSubSlotsPerBuffer(lifeCycle) * sparseCacheUnitsPerPage(lifeCycle);
     if (cells <= 0)
     {
         return 0;
@@ -239,7 +235,7 @@ int KvCacheManager::sparseCacheMaxInFlightUnits(LifeCycleId lifeCycle) const noe
     return 1;
 }
 
-std::vector<SparseBufferPlan> KvCacheManager::sparseBufferPlan(LifeCycleId lifeCycle) const
+std::vector<SparseBufferPlan> KvCacheManager::_sparseBufferPlan(LifeCycleId lifeCycle) const
 {
     // Layers outermost, as _computeSparseCacheShape walks them, so a layer's buffers stay
     // consecutive -- the fetch resolves one layer and names its buffers as a range.
@@ -267,7 +263,7 @@ std::vector<SparseBufferPlan> KvCacheManager::sparseBufferPlan(LifeCycleId lifeC
                 previousLayer = attn->layerId;
                 ++layerRow;
             }
-            auto const attr = bufferAttr(attn->layerId, buf.role);
+            auto const attr = _bufferAttr(attn->layerId, buf.role);
             plan.push_back(SparseBufferPlan{BufferId{attn->layerId, buf.role}, attr.poolIndex, attr.size,
                 static_cast<uint32_t>(attr.offset),
                 buf.sparseLayout(attn->sparseCache->unitsPerPage(mConfig.tokensPerBlock)), layerRow, 0});
@@ -289,10 +285,10 @@ std::vector<SparseBufferPlan> KvCacheManager::sparseBufferPlan(LifeCycleId lifeC
     return plan;
 }
 
-std::vector<BufferId> KvCacheManager::sparseBufferIds(LifeCycleId lifeCycle) const
+std::vector<BufferId> KvCacheManager::_sparseBufferIds(LifeCycleId lifeCycle) const
 {
     std::vector<BufferId> ids;
-    for (auto const& entry : sparseBufferPlan(lifeCycle))
+    for (auto const& entry : _sparseBufferPlan(lifeCycle))
     {
         ids.push_back(entry.id);
     }
@@ -304,7 +300,7 @@ std::vector<IndexTableSpec> KvCacheManager::sparseIndexTableSpecs() const
     std::vector<IndexTableSpec> specs;
     for (LifeCycleId lcId{0}; lcId < mStorage->numLifeCycles(); ++lcId)
     {
-        auto const plan = sparseBufferPlan(lcId);
+        auto const plan = _sparseBufferPlan(lcId);
         for (size_t begin = 0; begin < plan.size();)
         {
             size_t end = begin;
@@ -351,13 +347,13 @@ void KvCacheManager::_buildSparseArenas()
                 "A sparse buffer needs `constraints` to declare how many requests run together; "
                 "the cache arena is reserved up front and cannot be sized without it");
         }
-        auto const plan = sparseBufferPlan(lcId);
+        auto const plan = _sparseBufferPlan(lcId);
         TLLM_CHECK(!plan.empty());
 
         SparseCacheInit shape;
-        shape.numLayers = sparseCacheLayerCount(lcId);
+        shape.numLayers = _sparseCacheLayerCount(lcId);
         shape.numBuffers = sparseCacheBufferCount(lcId);
-        shape.cellsPerBuffer = sparseCacheSubSlotsPerBuffer(lcId);
+        shape.cellsPerBuffer = _sparseCacheSubSlotsPerBuffer(lcId);
         shape.entriesPerLayer = shape.cellsPerBuffer * sparseCacheUnitsPerPage(lcId);
 
         // The arena mirrors the hot pool group: one region per pool the life cycle's sparse
@@ -398,9 +394,9 @@ int32_t KvCacheManager::_sparseCopyGridCtas(int32_t workCapacity) const
     return sparseCopyGridCtas(workCapacity, mSmCount);
 }
 
-std::vector<SparseCopyRun> KvCacheManager::sparseCopyTemplates(LifeCycleId lifeCycle) const
+std::vector<SparseCopyRun> KvCacheManager::_sparseCopyTemplates(LifeCycleId lifeCycle) const
 {
-    auto const plan = sparseBufferPlan(lifeCycle);
+    auto const plan = _sparseBufferPlan(lifeCycle);
     TLLM_CHECK(!plan.empty());
     auto const& arena = mSparseArenas[lifeCycle];
 
@@ -442,7 +438,7 @@ std::vector<SparseCopyRun> KvCacheManager::sparseCopyTemplates(LifeCycleId lifeC
         // copy a kernel can read, and the arena is where cells live.
         args.deviceBase = arena.base(pool);
         args.bufferBytes = static_cast<uint32_t>(arena.bufferBytes(pool));
-        args.cellsPerBuffer = sparseCacheSubSlotsPerBuffer(lifeCycle);
+        args.cellsPerBuffer = _sparseCacheSubSlotsPerBuffer(lifeCycle);
         args.cellsPerLease = arena.cellsPerLease(pool);
         args.layout.numChunks = layout.numChunks;
         args.layout.chunkBytes = layout.chunkBytes;
@@ -461,7 +457,7 @@ MemAddress KvCacheManager::getSparseCacheBaseAddress(LayerId layerId, DataRole c
 {
     LifeCycleId const lcId{getLayerGroupId(layerId).value()};
     auto const& arena = mSparseArenas[lcId];
-    auto const plan = sparseBufferPlan(lcId);
+    auto const plan = _sparseBufferPlan(lcId);
     auto const it = std::find_if(plan.begin(), plan.end(),
         [&](SparseBufferPlan const& entry) { return entry.id.layerId == layerId && entry.id.role == role; });
     if (arena.empty() || it == plan.end())
@@ -492,7 +488,7 @@ KvCacheManager::SparseLayerSpan KvCacheManager::_sparseLayerSpan(
 
     SparseLayerSpan span;
     span.lifeCycle = LifeCycleId{getLayerGroupId(layerId).value()};
-    auto const all = sparseBufferIds(span.lifeCycle);
+    auto const all = _sparseBufferIds(span.lifeCycle);
     // Buffers are grouped by layer, so this layer's are a contiguous run.
     auto const first
         = std::find_if(all.begin(), all.end(), [layerId](BufferId const& id) { return id.layerId == layerId; });
