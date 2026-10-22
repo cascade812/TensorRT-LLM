@@ -3177,8 +3177,7 @@ def _native_config_with_sparse_arena(
     def plan_host_history_budget(
         self: KVCacheManagerV2, kv_cache_config: KvCacheConfig, **kwargs: object
     ) -> None:
-        # Settles the budget only. The device quota is no longer lowered here: the
-        # manager divides it against the host budget itself.
+        # Settles the budget only; the manager divides the device quota against it.
         self._host_history_budget = host_history_budget
 
     with (

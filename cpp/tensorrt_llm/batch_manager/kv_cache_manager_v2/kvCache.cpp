@@ -626,7 +626,7 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
             { _recordDroppedPages(pages, cacheLevel); };
             if (anyResident)
             {
-                tmpSlots = storageMgr.newResidentSlots(numSlotsNeeded, migrationRecorder, dropRecorder);
+                tmpSlots = storageMgr.newGpuSlots(numSlotsNeeded, migrationRecorder, dropRecorder);
             }
         }
         catch (OutOfPagesError const&)
@@ -1679,7 +1679,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                 DropRecorder const dropRecorder
                     = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
                 { _recordDroppedPages(pages, cacheLevel); };
-                newSlots = mManager->storage().newResidentSlots(allocCounts, migrationRecorder, dropRecorder);
+                newSlots = mManager->storage().newGpuSlots(allocCounts, migrationRecorder, dropRecorder);
             }
             catch (OutOfPagesError const&)
             {
@@ -2007,7 +2007,7 @@ void KvCache::_appendBeams(BeamIndex oldBeamWidth, BeamIndex newBeamWidth)
               CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
     DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
     { _recordDroppedPages(pages, cacheLevel); };
-    auto newSlots = storage.newResidentSlots(slotCounts, migrationRecorder, dropRecorder);
+    auto newSlots = storage.newGpuSlots(slotCounts, migrationRecorder, dropRecorder);
 
     // Page-index rows must exist before locking the copied pages because lock()
     // immediately publishes the page index through updateBasePageIndex().

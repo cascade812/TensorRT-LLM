@@ -496,9 +496,8 @@ __device__ inline void copyChunkWarp(char* dst, char const* src, uint32_t bytes,
 
 //! One pool's work, with a vector width fixed at compile time.
 //!
-//! Split from the kernel so the width can be switched on once per block rather than
-//! templated into four kernels: with the pools merged into one launch they no longer each
-//! have a launch to be templated by.
+//! Split from the kernel so the width is switched on once per block: one launch covers
+//! every pool, so there is no per-pool launch to template.
 template <typename Vec>
 __device__ void copySparseUnits(SparseUnitCopyArgs const& args, SparseCopyDesc const& desc, int32_t list, int32_t first)
 {

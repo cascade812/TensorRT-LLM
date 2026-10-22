@@ -67,8 +67,7 @@ public:
     static std::vector<int32_t> sparseCacheResidentOrdinals(KvCache const& kvCache, int lcId);
 
     // White-box hook: the first cell of this request's lease on the life cycle's arena, or
-    // -1 when it holds none. Identifies the lease the way the page list used to identify
-    // the reservation, now that a lease is one contiguous run rather than scattered slots.
+    // -1 when it holds none. A lease is one contiguous run, so its first cell identifies it.
     static int sparseCacheBaseCell(KvCache const& kvCache, int lcId, int pool);
 
     // White-box hook: units the last write-back moved per buffer, -1 where none has run.

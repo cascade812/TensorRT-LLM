@@ -1558,8 +1558,8 @@ void Batch::writeBackSparseUnits(LifeCycleId lifeCycle, CUstream stream)
     copy.numBuffers = scratch.numBuffers;
     copy.direction = SparseCopyDirection::kWriteBack;
     copy.unitsPerPage = mManager->sparseCacheUnitsPerPage(lifeCycle);
-    // The work list is every layer of this row, which is what a write-back crosses at
-    // once -- unlike a fetch, which resolves one layer across the
+    // The work list is every layer of this row, which is what a write-back crosses at once,
+    // unlike a fetch, which resolves one layer across the whole batch.
     copy.work = scratch.flushWork;
     copy.bufferLayer = mManager->_sparseArena(lifeCycle).bufferLayer();
     copy.gridCtas = mManager->_sparseCopyGridCtas(scratch.flushWork.capacity);

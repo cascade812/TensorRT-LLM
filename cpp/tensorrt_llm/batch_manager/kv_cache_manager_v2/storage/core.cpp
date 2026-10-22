@@ -1129,7 +1129,7 @@ SlotCount maxSlotsForAllBytes(TypedVec<PoolIndex, size_t> const& sizes, std::vec
 //!
 //! The counterpart of PoolGroupBase::getNumSlotsFromPools, and what makes a count
 //! self-consistent: growing to it costs nothing in any medium, so it never disturbs a
-//! budget. It replaces the tail bump loop the single-budget allocator used to run.
+//! budget.
 //!
 //! Every pool is in view, including ones the second budget pays for and whether or not that
 //! budget has a quota. A host-backed pool nobody is bounding is still real memory: dropping

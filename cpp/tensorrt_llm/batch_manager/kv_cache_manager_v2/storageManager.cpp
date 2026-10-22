@@ -605,65 +605,6 @@ TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newGpuSlots(
     return newSlots(kHotLevel, numSlotsPerLc, migrationRecorder, dropRecorder);
 }
 
-TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newResidentSlots(
-    TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc, MigrationRecorder const& migrationRecorder,
-    DropRecorder const& dropRecorder)
-{
-    LifeCycleId const numLc = numSlotsPerLc.size();
-    TypedVec<LifeCycleId, CacheLevel> levels(numLc);
-    std::set<CacheLevel> present;
-    for (LifeCycleId lc{0}; lc < numLc; ++lc)
-    {
-        levels[lc] = kHotLevel;
-        if (numSlotsPerLc[lc] > 0)
-        {
-            present.insert(levels[lc]);
-        }
-    }
-    if (present.size() <= 1)
-    {
-        // Every life cycle that wants slots shares one level; one allocation covers them.
-        CacheLevel const level = present.empty() ? kHotLevel : *present.begin();
-        return newSlots(level, numSlotsPerLc, migrationRecorder, dropRecorder);
-    }
-
-    TypedVec<LifeCycleId, std::vector<Slot>> result(numLc);
-    // Each level allocates from a different pool, so a later failure must hand back
-    // what the earlier levels already took before the error reaches the caller.
-    auto rollback = FuncGuard(
-        [&]()
-        {
-            for (LifeCycleId lc{0}; lc < numLc; ++lc)
-            {
-                for (auto& slot : result[lc])
-                {
-                    releaseSlot(lc, levels[lc], std::move(slot));
-                }
-            }
-        });
-    for (CacheLevel const level : present)
-    {
-        TypedVec<LifeCycleId, SlotCount> counts(numLc, 0);
-        for (LifeCycleId lc{0}; lc < numLc; ++lc)
-        {
-            if (levels[lc] == level)
-            {
-                counts[lc] = numSlotsPerLc[lc];
-            }
-        }
-        auto allocated = newSlots(level, counts, migrationRecorder, dropRecorder);
-        for (LifeCycleId lc{0}; lc < numLc; ++lc)
-        {
-            if (levels[lc] == level)
-            {
-                result[lc] = std::move(allocated[lc]);
-            }
-        }
-    }
-    rollback.cancel();
-    return result;
-}
-
 std::vector<Slot> StorageManager::newSlotsForPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount numSlots,
     MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
 {
@@ -730,9 +671,9 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
 
     CacheLevel const coldLevel = srcIsHot ? dstLevel : srcLevel;
     PoolGroupIndex const coldPgIdx = srcIsHot ? dstPgIdx : srcPgIdx;
-    // The group's tier, not poolMedium(): only a GPU-tier pool is ever host-backed, and a
+    // The level's tier, not poolMedium(): only a GPU-tier pool is ever host-backed, and a
     // cold level has none, so the two agree here and this asks about the level's own medium.
-    CacheTier const coldTier = cacheTier(coldLevel, coldPgIdx);
+    CacheTier const coldTier = cacheTier(coldLevel);
     size_t const coldPageBytes = slotSize(coldLevel, coldPgIdx).at(PoolIndex{0});
     PageIndexLocation const pageIndexLocation = mPageIndexLocations.at(batchingLayerGroupId);
     auto encodeBatch = [this, batchingLayerGroupId, pageIndexLocation](
@@ -846,11 +787,6 @@ CacheTier StorageManager::cacheTier(CacheLevel level) const
     return mLevels.at(level).cacheTier;
 }
 
-CacheTier StorageManager::cacheTier(CacheLevel level, PoolGroupIndex pgIdx) const
-{
-    return mLevels.at(level).storage->cacheTier(pgIdx);
-}
-
 CacheTier StorageManager::poolMedium(CacheLevel level, PoolGroupIndex pgIdx, PoolIndex poolIdx) const
 {
     return mLevels.at(level).storage->poolGroup(pgIdx).poolMedium(poolIdx);
@@ -858,7 +794,7 @@ CacheTier StorageManager::poolMedium(CacheLevel level, PoolGroupIndex pgIdx, Poo
 
 size_t StorageManager::sparseHostBytes() const
 {
-    return mLevels.at(kHotLevel).storage->sparseHostBytes();
+    return mLevels.at(kHotLevel).storage->secondaryMediumBytes();
 }
 
 void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
@@ -1875,7 +1811,7 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
     // Chargeable, not total: a rebalance that charged host bytes to the device budget would
     // under-size the level and evict live pages to reach it.
     // Empty everywhere but the hot level, where it is what the host budget pays for.
-    auto const secondBudget = _hostSparsePoolBudget(lvlStorage.sparsePools());
+    auto const secondBudget = _hostSparsePoolBudget(lvlStorage.poolsOfSecondaryMedium());
     size_t minQuota
         = minQuotaForLevel(lvlStorage.slotSizeLists(), lvlStorage.poolSizeGranularity(), minSlots, secondBudget);
     if (quota < minQuota)
@@ -1891,8 +1827,6 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
         throw std::invalid_argument("Quota " + std::to_string(quota) + " exceeds the reserved maximum of "
             + std::to_string(*maxQuota) + " for this cache level (raise the tier's max_quota)");
     }
-    // Rebalancing moves the device budget, which moves the slot counts the host-backed pools
-    // follow, so the host budget is divided again alongside it rather than assumed still met.
     auto newNumSlots = CacheLevelStorage::ratioToSlotCountList(
         quota, lvlStorage.slotSizeLists(), ratioList, lvlStorage.poolSizeGranularity(), minSlots, secondBudget);
 
@@ -2208,9 +2142,10 @@ TypedVec<LifeCycleId, size_t> StorageManager::slotsToBytes(TypedVec<LifeCycleId,
         auto const& sizes = slotSize(kHotLevel, poolGroup);
         for (PoolIndex pool{0}; pool < sizes.size(); ++pool)
         {
-            auto const grain
-                = std::ranges::find(sparse, pool) == sparse.end() ? deviceGranularity : HostMem::kAlignment;
-            numBytes[lifeCycle] += roundUp(slotCountToSizeT(numSlots[lifeCycle]) * sizes[pool], grain);
+            auto const medium
+                = std::ranges::find(sparse, pool) == sparse.end() ? CacheTier::GPU_MEM : CacheTier::HOST_MEM;
+            numBytes[lifeCycle] += roundUp(
+                slotCountToSizeT(numSlots[lifeCycle]) * sizes[pool], hotPoolSizeGranularity(medium, deviceGranularity));
         }
     }
     return numBytes;
@@ -2308,7 +2243,7 @@ TypedVec<PoolGroupIndex, float> StorageManager::constrainPoolGroupRatio(
     // The same budgets the allocator will actually use, or the ratio this derives would
     // describe a layout the next rebalance cannot produce.
     auto slotCountList = CacheLevelStorage::ratioToSlotCountList(gpuStorage.totalQuota(), gpuStorage.slotSizeLists(),
-        ratio, gpuStorage.poolSizeGranularity(), mMinSlots, _hostSparsePoolBudget(gpuStorage.sparsePools()));
+        ratio, gpuStorage.poolSizeGranularity(), mMinSlots, _hostSparsePoolBudget(gpuStorage.poolsOfSecondaryMedium()));
     // All-bytes, each medium in its own grain -- the same measure ratioList() reports, so
     // the target this derives and the layout a rebalance then achieves are comparable. They
     // have to be: _needAdjustment treats this as a prediction of the allocator's own output

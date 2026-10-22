@@ -100,12 +100,6 @@ struct PageIndexConverter
     std::vector<int> operator()(int baseIndex) const;
 };
 
-//! One sparse buffer of a life cycle, with everything the cache derives from it.
-//!
-//! Ordered layers-outermost, then by pool within a layer, so that both a layer's buffers and
-//! a (layer, pool) run are consecutive. The fetch needs the first, because it resolves one
-//! layer; the copy needs the second, because a pool fixes a cell's size, the slot stride it
-//! is read from, and the unit layout, so one launch serves one pool.
 //! What one life cycle's sparse fetch path is shaped like, as _computeSparseCacheShape
 //! derives it from the configuration. One record rather than a column per field: every
 //! field is filled in the same pass for the same life cycle and read together per step, so
@@ -125,6 +119,12 @@ struct SparseCacheShape
     int layers = 0;
 };
 
+//! One sparse buffer of a life cycle, with everything the cache derives from it.
+//!
+//! Ordered layers-outermost, then by pool within a layer, so that both a layer's buffers and
+//! a (layer, pool) run are consecutive. The fetch needs the first, because it resolves one
+//! layer; the copy needs the second, because a pool fixes a cell's size, the slot stride it
+//! is read from, and the unit layout, so one launch serves one pool.
 struct SparseBufferPlan
 {
     BufferId id;
@@ -641,8 +641,6 @@ private:
     //! Guards all mutable state reachable from this manager. See the scope note above.
     mutable ReentrantSharedMutex mApiMutex;
 
-    // Throw unless every KvCache has been closed. `api` names the caller so the message
-    // points at the mistake rather than at whatever breaks later.
     //! One layer's run within its life cycle's sparse buffer list, as the sparse entry
     //! points name it: they take a layer's buffers and address them as a range.
     struct SparseLayerSpan
@@ -655,6 +653,8 @@ private:
 
     [[nodiscard]] SparseLayerSpan _sparseLayerSpan(std::vector<BufferId> const& buffers, char const* api) const;
 
+    // Throw unless every KvCache has been closed. `api` names the caller so the message
+    // points at the mistake rather than at whatever breaks later.
     void _checkNoLivingKvCaches(char const* api) const;
 
     void _adjustLevel(CacheLevel level, size_t quota);

@@ -481,8 +481,8 @@ def test_compress_storage_views_match_allocation_size(
     manager.impl.get_mem_pool_base_address = Mock(
         side_effect=lambda layer, role, mode: addresses[role]
     )
-    # A sparse buffer no longer stretches its page index space, so the bound is pages
-    # either way and a page still holds compressed_block_size rows.
+    # A sparse buffer's page index space is in pages, and a page holds
+    # compressed_block_size rows.
     manager.impl.get_page_index_upper_bound = Mock(return_value=3)
     manager.compress_pool_ptrs = {4: addresses[main]}
     manager.compress_scale_pool_ptrs = {4: addresses[scale]}

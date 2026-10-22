@@ -148,12 +148,9 @@ public:
         TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc, MigrationRecorder const& migrationRecorder = {},
         DropRecorder const& dropRecorder = {});
 
+    // Allocate hot-level slots for all life cycles. A sparse life cycle allocates here too:
+    // its pages are host memory mapped into a hot-level pool, not a separate level.
     TypedVec<LifeCycleId, std::vector<Slot>> newGpuSlots(TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc,
-        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
-
-    // Allocate slots for all life cycles, each at its own residency level. Equivalent to
-    // newGpuSlots when no sparse life cycle is asking for slots.
-    TypedVec<LifeCycleId, std::vector<Slot>> newResidentSlots(TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc,
         MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
 
     // Allocate slots for a single pool group at the given cache level.
@@ -312,17 +309,11 @@ public:
     // Cache tier for a given level.
     CacheTier cacheTier(CacheLevel level) const;
 
-    //! What one pool group's memory actually is. Differs from cacheTier(level) only at the
-    //! hot level, where a sparse life cycle's pool group is host memory. Migration dispatches
-    //! on this, since it chooses the copy direction.
-    CacheTier cacheTier(CacheLevel level, PoolGroupIndex pgIdx) const;
-
     //! What one pool's pages actually are, which is what anything naming the medium of an
     //! address needs: a copy implementation, a registration, a page descriptor.
     //!
-    //! Prefer this to cacheTier(level, pgIdx): the two agree for every pool but a
-    //! host-backed one of a GPU-tier group, where the group's tier names device memory
-    //! for a host address.
+    //! Prefer this to cacheTier(level): the two agree for every pool but a host-backed one
+    //! of a GPU-tier group, where the level's tier names device memory for a host address.
     [[nodiscard]] CacheTier poolMedium(CacheLevel level, PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
 
     //! Host bytes the hot level holds in pools that are not its own medium.
@@ -337,7 +328,7 @@ public:
     float getOverallUtilization(CacheLevel level = kHotLevel) const;
 
     // Pool-group slot count (number of pages).
-    SlotCount numSlots(PoolGroupIndex pgIdx, CacheLevel level = kHotLevel) const;
+    [[nodiscard]] SlotCount numSlots(PoolGroupIndex pgIdx, CacheLevel level = kHotLevel) const;
 
     // Layer-to-lifecycle mapping (for KvCacheManager queries).
     std::unordered_map<LayerId, LifeCycleId> const& layerToLifeCycleIds() const noexcept
@@ -382,11 +373,12 @@ private:
     // lifecycle slot-count proportions.
     TypedVec<PoolGroupIndex, float> projectPoolGroupRatio(
         CacheLevel srcLevel, CacheLevel dstLevel, TypedVec<LifeCycleId, float> const& srcLifeCycleRatio) const;
-    //! Bytes a hot-level slot count costs, each pool rounded to the grain of the medium that
-    //! backs it: `deviceGranularity` for a dense pool, the host alignment for a sparse one.
+    //! Bytes a hot-level slot count costs, each pool rounded by hotPoolSizeGranularity() to
+    //! the grain of the medium backing it.
     //! This is the same measure as CacheLevelStorage::allBytes(), which the resulting ratio is
     //! compared against; the storage does not exist yet here, so `sparsePools` names the sparse
-    //! pools of each group instead of PoolGroupBase::poolMedium().
+    //! pools of each group instead of PoolGroupBase::poolMedium(), and the grain is predicted
+    //! rather than read off the pool.
     TypedVec<LifeCycleId, size_t> slotsToBytes(TypedVec<LifeCycleId, SlotCount> const& numSlots,
         size_t deviceGranularity, TypedVec<PoolGroupIndex, std::vector<PoolIndex>> const& sparsePools) const;
 
