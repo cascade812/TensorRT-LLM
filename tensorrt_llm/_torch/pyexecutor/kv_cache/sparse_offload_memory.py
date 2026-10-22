@@ -68,7 +68,7 @@ _MIB = float(1 << 20)
 SPARSE_ARENA_ALIGNMENT = 256
 # Every arena and Batch index array holds 32-bit entries (int32_t or uint32_t).
 _INDEX_BYTES = 4
-# A native SparseCacheView takes at most this many bytes; a lease aligns it to this size.
+# A native SparseCacheView takes at most this many bytes; a Batch aligns each to this size.
 _SPARSE_CACHE_VIEW_BYTES = 256
 # A Batch row holds two watermarks, history length and capacity.
 _BATCH_WATERMARKS_PER_ROW = 2
@@ -79,22 +79,11 @@ _HOST_PAGE_BYTES = 4096
 # A decode step writes one query token per request, which completes at most one
 # unit, so one unit per layer is in flight (_sparseCacheMaxInFlightUnits).
 _SPARSE_MAX_FLUSH_UNITS = 1
-# The GPU tier allocates pools in granules of 2 MiB, doubled for every doubling
-# of the quota above 1 GiB, at most four times.
-_GPU_GRANULE_BASE_BYTES = 2 << 20
-_GPU_GRANULE_MAX_DOUBLINGS = 4
 
 
 def _index_array_bytes(num_entries: int) -> int:
     """Return the aligned bytes of an arena array of ``num_entries`` 32-bit entries."""
     return pad_up(_INDEX_BYTES * num_entries, SPARSE_ARENA_ALIGNMENT)
-
-
-def gpu_pool_granule_bytes(quota: int) -> int:
-    """Return the granule the native GPU tier allocates the pools of a ``quota``-byte tier in."""
-    quota_gib = quota // (1 << 30)
-    doublings = 0 if quota_gib == 0 else min(_GPU_GRANULE_MAX_DOUBLINGS, quota_gib.bit_length() - 1)
-    return _GPU_GRANULE_BASE_BYTES << doublings
 
 
 def sparse_units_per_page(unit_tokens: int | None, tokens_per_block: int) -> int:
@@ -139,7 +128,7 @@ class SparseArenaShape:
             self.entries,  # residentOrdinal
             self.entries,  # lruOrder
         )
-        return sum(_index_array_bytes(n) for n in arrays) + _SPARSE_CACHE_VIEW_BYTES
+        return sum(_index_array_bytes(n) for n in arrays)
 
     @property
     def lease_bytes(self) -> int:

@@ -110,8 +110,8 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize, int max
     // It also doubles what a Batch costs in device memory, which is the price of letting
     // the host-to-device crossing overlap the previous step; a caller that already holds a
     // buffer of this shape could lend it instead.
-    mDevice = allocateDeviceMemory(_deviceBytes());
-    mDeviceStaging = allocateDeviceMemory(_deviceBytes());
+    mDevice = allocateDeviceMemory(_totalBytes());
+    mDeviceStaging = allocateDeviceMemory(_totalBytes());
     auto const device = reinterpret_cast<CUdeviceptr>(mDevice.get());
     auto const deviceStaging = reinterpret_cast<CUdeviceptr>(mDeviceStaging.get());
 
@@ -804,15 +804,16 @@ ConvertedIndexTable Batch::convertedIndexTable(IndexTableId tableId) const
 
 Batch::SparseIndexRun Batch::sparseIndexRun(LayerId layerId, DataRole const& role) const
 {
-    auto const [tableId, entry] = indexTableSlot(layerId, role);
+    auto const& slot = _bufferSlot(layerId, role, "Batch::sparseIndexRun");
+    auto const tableId = slot.table;
     SparseIndexRun run;
     // Row-major in the entries, so a row costs the whole table's entries and an entry costs
     // one row of blocks.
     auto const numBuffers = static_cast<int>(mIndexTables[static_cast<size_t>(tableId.value())].concatOffsets.size());
     run.bufferStride = mMaxBlocksPerSeq;
     run.rowStride = numBuffers * mMaxBlocksPerSeq;
-    run.table = indexTableAddress(tableId) + sizeof(int32_t) * static_cast<size_t>(entry) * run.bufferStride;
-    run.base = indexTableBase(layerId, role);
+    run.table = indexTableAddress(tableId) + sizeof(int32_t) * static_cast<size_t>(slot.entry) * run.bufferStride;
+    run.base = slot.base;
     return run;
 }
 
@@ -876,29 +877,25 @@ std::vector<IndexTableSpec> const& Batch::indexTable(IndexTableId tableId) const
     return mIndexTables[static_cast<size_t>(tableId.value())].served;
 }
 
-std::pair<IndexTableId, int> Batch::indexTableSlot(LayerId layerId, DataRole const& role) const
+Batch::BufferSlot const& Batch::_bufferSlot(LayerId layerId, DataRole const& role, char const* api) const
 {
     auto const found = mBufferSlots.find(std::make_pair(layerId, role));
     if (found == mBufferSlots.end())
     {
-        throw std::out_of_range("Batch::indexTableSlot: no index table spec named this buffer");
+        throw std::out_of_range(std::string(api) + ": no index table spec named this buffer");
     }
-    return {found->second.table, found->second.entry};
+    return found->second;
+}
+
+std::pair<IndexTableId, int> Batch::indexTableSlot(LayerId layerId, DataRole const& role) const
+{
+    auto const& slot = _bufferSlot(layerId, role, "Batch::indexTableSlot");
+    return {slot.table, slot.entry};
 }
 
 MemAddress Batch::indexTableBase(LayerId layerId, DataRole const& role) const
 {
-    auto const found = mBufferSlots.find(std::make_pair(layerId, role));
-    if (found == mBufferSlots.end())
-    {
-        throw std::out_of_range("Batch::indexTableBase: no index table spec named this buffer");
-    }
-    return found->second.base;
-}
-
-size_t Batch::_deviceBytes() const noexcept
-{
-    return _totalBytes();
+    return _bufferSlot(layerId, role, "Batch::indexTableBase").base;
 }
 
 void Batch::_drain() noexcept
@@ -1336,7 +1333,7 @@ void Batch::publish()
     // The staging now holds this step's tables, so carrying them across is all that is
     // left on the Batch's stream -- one copy, because the two layouts match.
     mPublished.waitInStream(reinterpret_cast<CudaStream>(mCudaStream));
-    cuCheck(cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(mDevice.get()), staging, _deviceBytes(), mCudaStream));
+    cuCheck(cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(mDevice.get()), staging, _totalBytes(), mCudaStream));
     _convertIndices(mCudaStream);
     mStagingRead = CachedCudaEvent{reinterpret_cast<CudaStream>(mCudaStream)};
 }

@@ -192,8 +192,6 @@ struct SparseResolveArgs
     int32_t entriesPerLayer, int32_t selectionWidth, int32_t maxInFlightUnits);
 
 //! Largest entriesPerLayer this kernel can serve on `device`, given its shared memory limit.
-[[nodiscard]] int32_t sparseResolveMaxEntries(int32_t selectionWidth, int32_t maxInFlightUnits, CUdevice device);
-
 //! Multiprocessors `device` has, which is the one part of the grid sizing below that costs
 //! a driver call and so the one part worth holding on to.
 [[nodiscard]] int32_t sparseCopyMultiprocessors(CUdevice device);
@@ -204,16 +202,6 @@ struct SparseResolveArgs
 //!
 //! Fixed before a graph captures the copy, so it follows the machine rather than the step.
 [[nodiscard]] int32_t sparseCopyGridCtas(int32_t workCapacity, int32_t smCount) noexcept;
-
-//! Byte layout of one selection unit inside a buffer, mirroring config.h's
-//! SelectionUnitLayout. Repeated here so this header stays free of the config types.
-struct SparseUnitLayout
-{
-    uint32_t numChunks = 1;
-    uint32_t chunkBytes = 0;
-    uint32_t chunkStride = 0;
-    uint32_t unitStride = 0;
-};
 
 //! Which way a unit moves between its cold page and its cache entry.
 enum class SparseCopyDirection : uint8_t
@@ -262,7 +250,7 @@ struct SparseCopyRun
     int32_t cellsPerBuffer = 0;
     int32_t cellsPerLease = 0;
     uint32_t hostPageStride = 0;
-    SparseUnitLayout layout;
+    SelectionUnitLayout layout;
     SparseCopyWidth width = SparseCopyWidth::kByte;
 };
 
@@ -308,7 +296,7 @@ struct alignas(16) SparseCopyDesc
     //! Bytes of one cell, which is one buffer's worth of pages.
     uint32_t cellBytes = 0;
 
-    SparseUnitLayout layout;
+    SelectionUnitLayout layout;
 
     SparseCopyWidth width = SparseCopyWidth::kByte;
 };
@@ -364,7 +352,7 @@ struct SparseUnitCopyArgs
 //! Widest vector a pool's layout admits, from its sizes alone. A layout admitting none
 //! falls to bytes, so there is never a tail to handle in the kernel.
 [[nodiscard]] SparseCopyWidth sparseCopyWidth(
-    SparseUnitLayout const& layout, uint64_t hostPageStride, uint64_t bufferBytes);
+    SelectionUnitLayout const& layout, uint64_t hostPageStride, uint64_t bufferBytes);
 
 //! Bytes one `width` moves, for the caller that has to check its bases against it.
 [[nodiscard]] size_t sparseCopyWidthBytes(SparseCopyWidth width) noexcept;

@@ -190,22 +190,6 @@ struct SlotDesc
     {
         return getUniformAttribute(variants, [poolIdx](auto const& v) { return v.isSparse(poolIdx); });
     }
-
-    //! Bytes of one slot that the GPU tier's quota pays for: the dense pools alone. A
-    //! sparse pool's pages are host memory, so they consume none of that budget.
-    [[nodiscard]] size_t denseSlotSize() const
-    {
-        auto const sizes = slotSizeList();
-        size_t total = 0;
-        for (PoolIndex p{0}; p < sizes.size(); ++p)
-        {
-            if (!isSparse(p))
-            {
-                total += sizes.at(p);
-            }
-        }
-        return total;
-    }
 };
 
 // ---------------------------------------------------------------------------

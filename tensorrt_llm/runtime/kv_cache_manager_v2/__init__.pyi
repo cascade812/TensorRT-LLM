@@ -1510,16 +1510,23 @@ class KVCacheManager:
         granularity, set by the layer's ``sparse_cache.unit_tokens``.
         """
 
-    def get_sparse_host_bytes(self) -> int:
-        """Host bytes held on behalf of sparse buffers, across every pool group.
+    def get_num_bytes(self, level: int, medium: CacheTier) -> int:
+        """Bytes this level holds in pools whose pages are ``medium``.
 
-        The hot level alone: sparsity is a property of a GPU-tier pool. These bytes are a
-        different medium from the one :meth:`get_quota` measures, so they are drawn from no
-        quota and appear in no other total a caller can read -- report them separately when
-        accounting for what a deployment pins.
+        A level's quota pays only for its own tier, so bytes of a second medium are drawn
+        from no quota and appear in no other total a caller can read -- :meth:`get_quota`
+        excludes them. Report them separately when accounting for what a deployment pins.
 
-        A sparse pool's row count follows from the device-backed pools of its group, since
-        a slot spans every pool, so this moves only when the hot level is resized.
+        Pair this with :meth:`sparse_backing_medium` to count what sparse buffers hold. A
+        sparse pool's row count follows from the device-backed pools of its group, since a
+        slot spans every pool, so that figure moves only when the hot level is resized.
+        """
+
+    def sparse_backing_medium(self) -> CacheTier | None:
+        """The medium a sparse buffer's pages are, or ``None`` when none is sparse.
+
+        The hot level's second medium: host memory the GPU reads through a device mapping,
+        which is what sparse loading pulls into the per-request GPU cache.
         """
 
     def get_sparse_cache_buffer_count(self, layer_id: LayerId) -> int:

@@ -270,7 +270,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// BatchedLockTarget — page, owner, and intended storage level for a lock.
+// BatchedLockTarget — one page to lock, named by beam, ordinal and life cycle.
 // ---------------------------------------------------------------------------
 struct BatchedLockTarget
 {

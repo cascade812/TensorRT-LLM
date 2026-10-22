@@ -268,6 +268,17 @@ public:
     //! sits in: two pools of one group can answer differently.
     [[nodiscard]] virtual size_t sizeGranularity() const noexcept = 0;
 
+    //! What this pool's pages are. A group asks its pools rather than holding the answer,
+    //! so a group of one tier may still hold a pool of another.
+    [[nodiscard]] virtual CacheTier medium() const noexcept = 0;
+
+    //! Block until the backing for every slot up to `slot` exists.
+    //!
+    //! Only a progressively filled pool has anything to wait for; the rest are backed when
+    //! they are built, so this does nothing for them. The owning group calls it once per
+    //! slot it hands out, which is the single point every later use passes through.
+    virtual void waitSlotUsable(SlotId) const {}
+
     virtual void destroy() = 0;
     virtual void resize(SlotCount newNumSlots) = 0;
     virtual Address slotAddress(SlotId slot) const = 0;
@@ -293,6 +304,11 @@ public:
     [[nodiscard]] size_t sizeGranularity() const noexcept override
     {
         return mVirtMem.physMemSize();
+    }
+
+    [[nodiscard]] CacheTier medium() const noexcept override
+    {
+        return CacheTier::GPU_MEM;
     }
 
     // Extend by exactly one physical memory chunk; returns new numSlots.
@@ -335,19 +351,14 @@ public:
         return mCommitUnit;
     }
 
-    //! Blocks until `slot` is backed by physical memory.
-    //!
-    //! Rethrows the fill worker's exception if the fill failed.
-    //!
-    //! For the owning pool group's allocate() to call, once per slot handed out.
-    //! Calling it anywhere else is redundant: backing is permanent, so a slot
-    //! that passed this check at handout stays usable for as long as it is held.
-    void waitSlotUsable(SlotId slot) const;
-
-    [[nodiscard]] HostMem const* hostMem() const noexcept
+    [[nodiscard]] CacheTier medium() const noexcept override
     {
-        return &mHostMem;
+        return CacheTier::HOST_MEM;
     }
+
+    //! Blocks until `slot` is backed by physical memory, rethrowing the fill worker's
+    //! exception if the fill failed. This is the pool that has a fill to wait on.
+    void waitSlotUsable(SlotId slot) const override;
 
 private:
     //! Declared before mHostMem: alignedSize() reads it while building mHostMem.
@@ -375,6 +386,11 @@ public:
     [[nodiscard]] size_t sizeGranularity() const noexcept override
     {
         return kDiskPoolSizeGranularity;
+    }
+
+    [[nodiscard]] CacheTier medium() const noexcept override
+    {
+        return CacheTier::DISK;
     }
 
     int fd() const noexcept
@@ -413,12 +429,12 @@ public:
     //! address needs: a copy implementation, an allocator, a rounding grain, a page
     //! descriptor.
     //!
-    //! This is cacheTier() for every pool of every group except a host-backed pool of a
-    //! GPU-tier group, where taking the group's tier would name device memory for a host
-    //! address. Ask per pool, not per group.
-    [[nodiscard]] virtual CacheTier poolMedium(PoolIndex) const noexcept
+    //! Read from the pool, so it is cacheTier() for every pool of every group except a
+    //! host-backed pool of a GPU-tier group, where the group's tier would name device
+    //! memory for a host address. Ask per pool, not per group.
+    [[nodiscard]] CacheTier poolMedium(PoolIndex poolIdx) const
     {
-        return cacheTier();
+        return mPools.at(poolIdx)->medium();
     }
 
     PoolIndex numPools() const noexcept
@@ -443,16 +459,23 @@ public:
         return mSlotAllocator;
     }
 
-    virtual Slot allocate();
-    virtual std::vector<Slot> allocateMultiple(SlotCount numSlots);
+    //! Allocate, then block until the slots handed back are backed.
+    //!
+    //! The wait is the whole of a group's fill synchronization, and this is the single
+    //! point every later use of a slot passes through. Nothing downstream -- not
+    //! slotAddress(), not a device mapping read from it -- needs to wait again, and a
+    //! wait added there would only pay for a check that cannot fail. A pool with no fill
+    //! to wait on answers at once, so a device-only group pays nothing but the call.
+    Slot allocate();
+    std::vector<Slot> allocateMultiple(SlotCount numSlots);
     void release(Slot slot);
     void destroy();
     void resizePools(std::optional<SlotCount> newNumSlots = std::nullopt);
 
     // Addresses for all pools at a given slot id.
-    [[nodiscard]] TypedVec<PoolIndex, Address> slotAddress(SlotId slotId) const;
+    TypedVec<PoolIndex, Address> slotAddress(SlotId slotId) const;
     // Sizes per pool.
-    [[nodiscard]] TypedVec<PoolIndex, size_t> slotSize() const;
+    TypedVec<PoolIndex, size_t> slotSize() const;
 
     //! The grain a pool of `medium` rounds its byte total to. Media of one group differ --
     //! a host-backed pool of a GPU group commits in host units, not in the device's VMM
@@ -516,6 +539,10 @@ protected:
     // Mirrors Python _get_num_slots_from_pools: min(p.num_slots for p in pools).
     [[nodiscard]] SlotCount getNumSlotsFromPools() const noexcept;
 
+    //! Block until every pool backs the range ending just past `slot`. A pool with no
+    //! fill to wait on returns at once.
+    void _waitSlotUsable(SlotId slot) const;
+
     SlotAllocator mSlotAllocator;
     TypedVec<PoolIndex, std::unique_ptr<SlotPoolBase>> mPools;
     bool mDestroyed = false;
@@ -542,47 +569,10 @@ public:
     {
         return CacheTier::GPU_MEM;
     }
-
-    //! Host memory for a pool declared sparse, device memory for the rest. A sparse
-    //! buffer's pages are host pages the GPU reads through a device mapping, so this is
-    //! the one group whose pools can disagree with its tier.
-    [[nodiscard]] CacheTier poolMedium(PoolIndex poolIndex) const noexcept override
-    {
-        return isHostBacked(poolIndex) ? CacheTier::HOST_MEM : CacheTier::GPU_MEM;
-    }
-
-    //! The host allocation behind a host-backed pool, or nullptr for a device-backed one.
-    [[nodiscard]] HostMem const* hostMem(PoolIndex poolIndex) const;
-
-    //! Sparse pools are host memory committed progressively on a background thread, so
-    //! both entry points block until the slots they return are usable, as HostPoolGroup
-    //! does. A group with no sparse pool has nothing to wait for.
-    //!
-    //! These two are the whole of this group's fill synchronization. Nothing downstream
-    //! of them -- not slotAddress(), not the device mapping the sparse cache reads the
-    //! pages through -- needs to wait again, and adding a wait there would only pay for
-    //! a check that cannot fail.
-    Slot allocate() override;
-    std::vector<Slot> allocateMultiple(SlotCount numSlots) override;
-
-private:
-    //! Blocks until every host-backed pool backs the byte range ending just past `slot`.
-    void waitSlotUsable(SlotId slot) const;
-
-    [[nodiscard]] bool isHostBacked(PoolIndex poolIndex) const noexcept
-    {
-        return poolIndex < mHostBacked.size() && mHostBacked[poolIndex];
-    }
-
-    //! One flag per pool, from the sparsity the buffer config declared.
-    TypedVec<PoolIndex, bool> mHostBacked;
-    //! Whether any pool is host-backed, so the common device-only group skips the wait.
-    bool mHasHostBackedPool = false;
 };
 
 //! Host pools are committed progressively on a background thread, so a slot may
-//! be handed out before its memory is backed. Both allocation entry points block
-//! until the slots they return are usable.
+//! be handed out before its memory is backed. PoolGroupBase::allocate waits for it.
 //!
 //! The wait is cheap in the steady state: fresh slot ids ascend from zero and
 //! recycled slots are reused first, so the Nth fresh allocation waits only for
@@ -599,19 +589,10 @@ public:
     HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t groupVmSize,
         HostMemBackingOptions const& options = {});
 
-    [[nodiscard]] HostMem const* hostMem(PoolIndex poolIndex) const;
-
     [[nodiscard]] CacheTier cacheTier() const noexcept override
     {
         return CacheTier::HOST_MEM;
     }
-
-    Slot allocate() override;
-    std::vector<Slot> allocateMultiple(SlotCount numSlots) override;
-
-private:
-    //! Blocks until every pool backs the byte range ending just past `slot`.
-    void waitSlotUsable(SlotId slot) const;
 };
 
 class DiskPoolGroup : public PoolGroupBase
@@ -722,6 +703,42 @@ public:
         for (auto const& pg : mPoolGroups)
             total += pg->roundedNumBytes(medium);
         return total;
+    }
+
+    //! The medium of this level's pools that are not of its own tier, if any group has
+    //! one. At most one across the level: every group here is of the level's tier, and a
+    //! group has at most one second medium.
+    [[nodiscard]] std::optional<CacheTier> secondaryMedium() const
+    {
+        for (auto const& pg : mPoolGroups)
+        {
+            if (auto const medium = pg->secondaryMedium())
+            {
+                return medium;
+            }
+        }
+        return std::nullopt;
+    }
+
+    //! The grain the second medium's pools round to, or 0 when this level has none.
+    //!
+    //! Distinct from poolSizeGranularity(), which is the quantum this level's own quota is
+    //! expressed in. The two media round differently, which is why a budget carries its own.
+    [[nodiscard]] size_t secondaryMediumGranularity() const
+    {
+        auto const medium = secondaryMedium();
+        if (!medium.has_value())
+        {
+            return 0;
+        }
+        for (auto const& pg : mPoolGroups)
+        {
+            if (pg->secondaryMedium() == medium)
+            {
+                return pg->poolSizeGranularity(*medium);
+            }
+        }
+        return 0;
     }
 
     //! Bytes this level holds in pools of a second medium, which its quota does not pay

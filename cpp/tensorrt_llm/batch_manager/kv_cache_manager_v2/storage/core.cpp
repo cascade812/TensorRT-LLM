@@ -17,6 +17,8 @@
 
 #include "kv_cache_manager_v2/storage/core.h"
 
+#include "kv_cache_manager_v2/utils/funcGuard.h"
+
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
 #include <cerrno>
@@ -26,6 +28,7 @@
 #include <fcntl.h>
 #include <limits>
 #include <numeric>
+#include <ranges>
 #include <set>
 #include <stdexcept>
 #include <unistd.h>
@@ -534,12 +537,36 @@ SlotCount PoolGroupBase::numSlots() const noexcept
 
 Slot PoolGroupBase::allocate()
 {
-    return mSlotAllocator.allocate();
+    Slot slot = mSlotAllocator.allocate();
+    // A failed fill surfaces out of _waitSlotUsable, after the slot is already taken, so it
+    // is returned to the allocator before the error propagates.
+    auto rollback = FuncGuard([&]() { release(std::move(slot)); });
+    _waitSlotUsable(slot.slotId());
+    rollback.cancel();
+    return slot;
+}
+
+void PoolGroupBase::_waitSlotUsable(SlotId slot) const
+{
+    for (auto const& pool : mPools)
+    {
+        pool->waitSlotUsable(slot);
+    }
 }
 
 std::vector<Slot> PoolGroupBase::allocateMultiple(SlotCount numSlots)
 {
-    return mSlotAllocator.allocateMultiple(numSlots);
+    if (numSlots == SlotCount{0})
+    {
+        return {};
+    }
+    std::vector<Slot> slots = mSlotAllocator.allocateMultiple(numSlots);
+    auto rollback
+        = FuncGuard([&]() { std::ranges::for_each(slots, [this](Slot& slot) { release(std::move(slot)); }); });
+    // Slot ids are not returned in order, so the highest one bounds them all.
+    _waitSlotUsable(std::ranges::max(slots | std::views::transform(&Slot::slotId)));
+    rollback.cancel();
+    return slots;
 }
 
 void PoolGroupBase::release(Slot slot)
@@ -598,15 +625,15 @@ TypedVec<PoolIndex, size_t> PoolGroupBase::slotSize() const
 GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
     PooledPhysMemAllocator& physMemAllocator, TypedVec<PoolIndex, bool> sparsity)
     : PoolGroupBase(numSlots)
-    , mHostBacked(std::move(sparsity))
 {
-    if (mHostBacked.empty())
+    // Only the pool class built here records which pools are host-backed; everything later
+    // asks the pool, through PoolGroupBase::poolMedium.
+    if (sparsity.empty())
     {
-        mHostBacked = TypedVec<PoolIndex, bool>(slotSizeList.size(), false);
+        sparsity = TypedVec<PoolIndex, bool>(slotSizeList.size(), false);
     }
     TLLM_CHECK_WITH_INFO(
-        mHostBacked.size() == slotSizeList.size(), "GpuPoolGroup: one sparsity flag per pool is required");
-    mHasHostBackedPool = std::any_of(mHostBacked.begin(), mHostBacked.end(), [](bool sparse) { return sparse; });
+        sparsity.size() == slotSizeList.size(), "GpuPoolGroup: one sparsity flag per pool is required");
     size_t physMemSize = physMemAllocator.physMemSize();
     // Query total GPU memory to size virtual address space (mirrors Python GpuPoolGroup).
     size_t totalGpuMem = 0;
@@ -631,7 +658,7 @@ GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const
         double sizeRatio = static_cast<double>(sz) / static_cast<double>(maxSlotSize);
         size_t vmSize = roundDown(static_cast<size_t>(static_cast<double>(totalGpuMem) * sizeRatio), physMemSize);
         vmSize = std::max(vmSize, roundUp(slotCountToSizeT(numSlots) * sz, physMemSize));
-        if (isHostBacked(p))
+        if (sparsity[p])
         {
             // A sparse pool's pages: host memory, device-mapped, so the sparse cache fills
             // from them without a host round trip. No device VA is reserved for them, and
@@ -646,75 +673,6 @@ GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const
         }
         mPools.push_back(std::make_unique<GpuSlotPool>(sz, vmSize, physMemAllocator, numSlots));
     }
-}
-
-HostMem const* GpuPoolGroup::hostMem(PoolIndex poolIndex) const
-{
-    if (!isHostBacked(poolIndex))
-    {
-        return nullptr;
-    }
-    return static_cast<HostSlotPool const&>(*mPools.at(poolIndex)).hostMem();
-}
-
-// Dense pools are device memory, mapped eagerly by GpuSlotPool, so only the sparse
-// ones have a fill to wait on.
-void GpuPoolGroup::waitSlotUsable(SlotId slot) const
-{
-    for (PoolIndex p{0}; p < mPools.size(); ++p)
-    {
-        if (isHostBacked(p))
-        {
-            static_cast<HostSlotPool const&>(*mPools.at(p)).waitSlotUsable(slot);
-        }
-    }
-}
-
-Slot GpuPoolGroup::allocate()
-{
-    Slot slot = PoolGroupBase::allocate();
-    if (!mHasHostBackedPool)
-    {
-        return slot;
-    }
-    try
-    {
-        waitSlotUsable(slot.slotId());
-    }
-    catch (...)
-    {
-        release(std::move(slot));
-        throw;
-    }
-    return slot;
-}
-
-std::vector<Slot> GpuPoolGroup::allocateMultiple(SlotCount numSlots)
-{
-    std::vector<Slot> slots = PoolGroupBase::allocateMultiple(numSlots);
-    if (!mHasHostBackedPool || slots.empty())
-    {
-        return slots;
-    }
-    // Slot ids are not returned in order, so the highest one bounds them all.
-    SlotId highest = slots.front().slotId();
-    for (auto const& slot : slots)
-    {
-        highest = std::max(highest, slot.slotId());
-    }
-    try
-    {
-        waitSlotUsable(highest);
-    }
-    catch (...)
-    {
-        for (auto& slot : slots)
-        {
-            release(std::move(slot));
-        }
-        throw;
-    }
-    return slots;
 }
 
 // ---------------------------------------------------------------------------
@@ -736,64 +694,6 @@ HostPoolGroup::HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> con
         auto const poolVmSize = static_cast<size_t>(static_cast<double>(groupVmSize) * sizeRatio);
         mPools.push_back(std::make_unique<HostSlotPool>(sz, numSlots, poolVmSize, options));
     }
-}
-
-HostMem const* HostPoolGroup::hostMem(PoolIndex poolIndex) const
-{
-    return static_cast<HostSlotPool const&>(*mPools.at(poolIndex)).hostMem();
-}
-
-void HostPoolGroup::waitSlotUsable(SlotId slot) const
-{
-    for (auto const& pool : mPools)
-    {
-        static_cast<HostSlotPool const&>(*pool).waitSlotUsable(slot);
-    }
-}
-
-// A failed fill surfaces out of waitSlotUsable, after the slots are already
-// taken, so they are returned to the allocator before the error propagates.
-Slot HostPoolGroup::allocate()
-{
-    Slot slot = PoolGroupBase::allocate();
-    try
-    {
-        waitSlotUsable(slot.slotId());
-    }
-    catch (...)
-    {
-        release(std::move(slot));
-        throw;
-    }
-    return slot;
-}
-
-std::vector<Slot> HostPoolGroup::allocateMultiple(SlotCount numSlots)
-{
-    std::vector<Slot> slots = PoolGroupBase::allocateMultiple(numSlots);
-    if (slots.empty())
-    {
-        return slots;
-    }
-    // Slot ids are not returned in order, so the highest one bounds them all.
-    SlotId highest = slots.front().slotId();
-    for (auto const& slot : slots)
-    {
-        highest = std::max(highest, slot.slotId());
-    }
-    try
-    {
-        waitSlotUsable(highest);
-    }
-    catch (...)
-    {
-        for (auto& slot : slots)
-        {
-            release(std::move(slot));
-        }
-        throw;
-    }
-    return slots;
 }
 
 // ---------------------------------------------------------------------------

@@ -136,24 +136,11 @@ public:
         return mView;
     }
 
-    //! A device copy of view(), as a one-row array.
-    //!
-    //! The copy kernel reads its per-row state through a view array, so that a batched fetch
-    //! can serve rows whose metadata belongs to different requests. A single-request
-    //! write-back takes the same path with one row rather than a second addressing mode.
-    [[nodiscard]] SparseCacheView const* deviceView() const noexcept
-    {
-        return mDeviceView;
-    }
-
     //! Return the cells early. Idempotent; the destructor does the same.
     void release() noexcept;
 
     //! Copy the resident ordinals back to the host. Test and debug use only; synchronises.
     [[nodiscard]] std::vector<int32_t> readResidentOrdinals() const;
-
-    //! Copy the per-layer write-back counts back to the host, -1 where no write-back has
-    //! run. Test and debug use only; synchronises.
 
 private:
     friend class SparseCellArena;
@@ -161,7 +148,6 @@ private:
     SparseCellArena* mArena = nullptr;
     int mIndex = -1;
     SparseCacheView mView;
-    SparseCacheView* mDeviceView = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -202,11 +188,6 @@ public:
 
     //! Base of one pool's cell region. Indices the fetch emits for a buffer are relative to
     //! its pool's base, which is what get_sparse_cache_base_address reports for that buffer.
-    [[nodiscard]] PoolIndex numPools() const noexcept
-    {
-        return mPoolBase.size();
-    }
-
     [[nodiscard]] CUdeviceptr base(PoolIndex pool) const
     {
         return mPoolBase.at(pool);
@@ -221,11 +202,6 @@ public:
     [[nodiscard]] int cellsPerLease(PoolIndex pool) const
     {
         return mShape.pools.at(static_cast<size_t>(pool.value())).second * mShape.cellsPerBuffer;
-    }
-
-    [[nodiscard]] int freeLeases() const noexcept
-    {
-        return static_cast<int>(mFree.size());
     }
 
     //! Device bytes this arena holds: every pool's cell region, the state its leases share,

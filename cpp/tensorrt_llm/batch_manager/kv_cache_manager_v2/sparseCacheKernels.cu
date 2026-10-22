@@ -793,7 +793,7 @@ void launchSparseFlushList(SparseFlushListArgs const& args, CUstream stream)
         "sparseFlushList", sparseFlushListKernel, grid, kThreads, 0, reinterpret_cast<cudaStream_t>(stream), args);
 }
 
-SparseCopyWidth sparseCopyWidth(SparseUnitLayout const& layout, uint64_t hostPageStride, uint64_t bufferBytes)
+SparseCopyWidth sparseCopyWidth(SelectionUnitLayout const& layout, uint64_t hostPageStride, uint64_t bufferBytes)
 {
     // Sizes only. Every offset a lane adds to a base is a sum of these, so a width dividing
     // all of them leaves every access aligned relative to the base -- and the bases
@@ -876,22 +876,6 @@ int32_t sparseCopyGridCtas(int32_t workCapacity, int32_t smCount) noexcept
 size_t sparseResolveSharedBytes(int32_t entriesPerLayer, int32_t selectionWidth, int32_t maxInFlightUnits)
 {
     return smemLayout(nextPow2(2 * entriesPerLayer), entriesPerLayer, maxInFlightUnits + selectionWidth).total;
-}
-
-int32_t sparseResolveMaxEntries(int32_t selectionWidth, int32_t maxInFlightUnits, CUdevice device)
-{
-    int limit = 0;
-    cuCheck(cuDeviceGetAttribute(&limit, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, device));
-    int32_t best = 0;
-    for (int32_t entries = 1; entries <= (1 << 20); entries <<= 1)
-    {
-        if (sparseResolveSharedBytes(entries, selectionWidth, maxInFlightUnits) > static_cast<size_t>(limit))
-        {
-            break;
-        }
-        best = entries;
-    }
-    return best;
 }
 
 void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)

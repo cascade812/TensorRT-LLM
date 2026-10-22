@@ -231,7 +231,17 @@ public:
     //! The hot level alone: sparsity is a property of a GPU-tier pool. These bytes are not
     //! drawn from that tier's quota -- they are a different medium -- so they appear in no
     //! other total a caller can read. Reported so a deployment can count what it pins.
-    [[nodiscard]] size_t getSparseHostBytes() const;
+    //! Bytes `level` holds in pools whose pages are `medium`. A device level's own tier
+    //! and its sparse backing medium are accounted separately, the quota paying only for
+    //! the former, so a caller counting what it pins asks for each in turn.
+    [[nodiscard]] size_t getNumBytes(CacheLevel level, CacheTier medium) const;
+
+    //! The medium a sparse buffer's pages are, or nullopt when no life cycle is sparse.
+    //!
+    //! The hot level's second medium: host memory that the GPU reads through a device
+    //! mapping, which is what sparse loading pulls into the per-request GPU cache. Pass it
+    //! to getNumBytes(kHotLevel, ...) to count what sparse buffers are holding.
+    [[nodiscard]] std::optional<CacheTier> sparseBackingMedium() const;
 
     // Scale factor: base_page_index * scale → kernel page index.
     int getPageIndexScale(LayerId layerId, DataRole role) const;

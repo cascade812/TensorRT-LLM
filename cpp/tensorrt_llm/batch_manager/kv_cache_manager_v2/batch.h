@@ -224,11 +224,12 @@ public:
     [[nodiscard]] std::vector<IndexTableSpec> const& indexTable(IndexTableId tableId) const;
 
     //! Which table serves this buffer, and its entry in that table's buffer dimension.
-    //! This is the normal query: a kernel asks where its indices are and at what entry.
+    //! Per-buffer introspection, and what the sparse copy path resolves a single buffer
+    //! with. An attention kernel takes a whole table instead; see convertedIndexTable().
     [[nodiscard]] std::pair<IndexTableId, int> indexTableSlot(LayerId layerId, DataRole const& role) const;
 
-    //! What a kernel adds to a converted index for this buffer. Every buffer of a request
-    //! shares it, because the request's own offsets are already in the entries.
+    //! What a converted index for this buffer is added to. Buffers sharing a pool share
+    //! it, their own offsets being already in the entries.
     [[nodiscard]] MemAddress indexTableBase(LayerId layerId, DataRole const& role) const;
 
     //! Where one table's converted indices live: int32[entries][max_batch][blocks].
@@ -565,9 +566,6 @@ private:
     //! Host-side page-index row for one (layer group, row), inside the pinned staging block.
     [[nodiscard]] int32_t* _stagingRow(LifeCycleId lifeCycleId, int row) const;
 
-    //! Bytes of a device block: the page table, the row state and the views.
-    [[nodiscard]] size_t _deviceBytes() const noexcept;
-
     //! Block until every transfer this Batch issued has retired, so its buffers can go.
     void _drain() noexcept;
 
@@ -612,6 +610,8 @@ private:
 
     //! Byte offset of the cache view region within the staged block.
     [[nodiscard]] size_t _viewsOffsetBytes() const noexcept;
+    //! Bytes of one staged block: the page table, the row state and the views. A device
+    //! block is the same size, being a copy of it.
     [[nodiscard]] size_t _totalBytes() const noexcept;
 
     //! Const: the manager is fixed at construction and outlives the Batch.
@@ -671,6 +671,9 @@ private:
     };
 
     std::map<std::pair<LayerId, DataRole>, BufferSlot> mBufferSlots;
+
+    //! The slot naming this buffer. Throws naming `api` when no index table spec has it.
+    [[nodiscard]] BufferSlot const& _bufferSlot(LayerId layerId, DataRole const& role, char const* api) const;
 
     //! Validate the requests, merge those whose converted indices coincide, and record
     //! where each buffer landed.

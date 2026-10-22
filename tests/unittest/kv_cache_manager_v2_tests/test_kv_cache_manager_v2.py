@@ -857,6 +857,11 @@ class TestSparseTierFlexibility(unittest.TestCase):
         )
         return KVCacheManager(config)
 
+    @staticmethod
+    def _sparse_pinned_bytes(manager: KVCacheManager) -> int:
+        """Bytes the hot level holds in the medium backing its sparse buffers."""
+        return manager.get_num_bytes(0, manager.sparse_backing_medium())
+
     def test_the_host_quota_bounds_what_the_sparse_pools_pin(self):
         """The host-backed pools have no budget of their own; this is the one that bounds them.
 
@@ -866,15 +871,15 @@ class TestSparseTierFlexibility(unittest.TestCase):
         tiers = [GpuCacheTierConfig(64 << 20)]
         unbounded = self._manager_with_host_quota(tiers, None)
         try:
-            pinned = unbounded.get_sparse_host_bytes()
+            pinned = self._sparse_pinned_bytes(unbounded)
         finally:
             unbounded.shutdown()
         self.assertGreater(pinned, 0)
 
         capped = self._manager_with_host_quota(tiers, pinned // 2)
         try:
-            self.assertLessEqual(capped.get_sparse_host_bytes(), pinned // 2)
-            self.assertLess(capped.get_sparse_host_bytes(), pinned)
+            self.assertLessEqual(self._sparse_pinned_bytes(capped), pinned // 2)
+            self.assertLess(self._sparse_pinned_bytes(capped), pinned)
         finally:
             capped.shutdown()
 
@@ -882,13 +887,13 @@ class TestSparseTierFlexibility(unittest.TestCase):
         tiers = [GpuCacheTierConfig(64 << 20)]
         unbounded = self._manager_with_host_quota(tiers, None)
         try:
-            pinned = unbounded.get_sparse_host_bytes()
+            pinned = self._sparse_pinned_bytes(unbounded)
         finally:
             unbounded.shutdown()
 
         generous = self._manager_with_host_quota(tiers, pinned * 4)
         try:
-            self.assertEqual(generous.get_sparse_host_bytes(), pinned)
+            self.assertEqual(self._sparse_pinned_bytes(generous), pinned)
         finally:
             generous.shutdown()
 

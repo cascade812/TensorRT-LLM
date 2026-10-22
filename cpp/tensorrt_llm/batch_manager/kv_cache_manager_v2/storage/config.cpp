@@ -206,7 +206,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
             var.coalescedBuffers.push_back(std::move(cb));
         }
         // Sort descending by size.
-        std::sort(var.coalescedBuffers.begin(), var.coalescedBuffers.end(),
+        std::ranges::sort(var.coalescedBuffers,
             [](CoalescedBuffer const& a, CoalescedBuffer const& b)
             {
                 // Size descending, then sparsity, so two pools of equal size keep a stable

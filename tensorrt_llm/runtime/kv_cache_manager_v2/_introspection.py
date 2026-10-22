@@ -618,3 +618,8 @@ def compute_slots_for_batch(
 ) -> list[int]:
     """Return the minimum per-pool-group slot counts to support ``batch``."""
     return list(_cpp().compute_slots_for_batch(manager, batch, tokens_per_block, swa_scratch_reuse))
+
+
+def tier_allocation_granularity(tier: Any, quota: int) -> int:
+    """Return the unit a ``tier`` of ``quota`` bytes allocates its pools in."""
+    return _cpp().tier_allocation_granularity(tier, quota)

@@ -49,11 +49,10 @@ struct LeaseLayout
 {
     size_t ordinal = 0;
     size_t lru = 0;
-    size_t view = 0;
 
     [[nodiscard]] size_t total() const noexcept
     {
-        return ordinal + lru + view;
+        return ordinal + lru;
     }
 };
 
@@ -63,7 +62,6 @@ LeaseLayout leaseLayout(SparseCacheInit const& shape)
     LeaseLayout out;
     out.ordinal = alignedBytes(sizeof(int32_t) * entries);
     out.lru = alignedBytes(sizeof(int32_t) * entries);
-    out.view = alignedBytes(sizeof(SparseCacheView));
     return out;
 }
 
@@ -208,7 +206,6 @@ std::optional<SparseCacheLease> SparseCellArena::acquire(CUstream stream)
     view.bufferSlotInPool = mSharedSlotInPool;
     view.residentOrdinal = carve(layout.ordinal);
     view.lruOrder = carve(layout.lru);
-    lease.mDeviceView = reinterpret_cast<SparseCacheView*>(bytes + carved);
 
     auto const entries = static_cast<size_t>(view.numEntries());
     // Every entry starts free.
@@ -216,8 +213,6 @@ std::optional<SparseCacheLease> SparseCellArena::acquire(CUstream stream)
         static_cast<unsigned int>(kBadBlockOrdinal.value()), entries, stream));
     cuCheck(cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(view.lruOrder), reinterpret_cast<CUdeviceptr>(mIdentity),
         sizeof(int32_t) * entries, stream));
-    // Last, so that it captures the carved pointers rather than a half-built view.
-    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(lease.mDeviceView), &view, sizeof(SparseCacheView)));
     return lease;
 }
 
@@ -242,7 +237,6 @@ SparseCacheLease::SparseCacheLease(SparseCacheLease&& other) noexcept
     : mArena(other.mArena)
     , mIndex(other.mIndex)
     , mView(other.mView)
-    , mDeviceView(other.mDeviceView)
 {
     other.mArena = nullptr;
     other.mIndex = -1;
@@ -256,7 +250,6 @@ SparseCacheLease& SparseCacheLease::operator=(SparseCacheLease&& other) noexcept
         mArena = other.mArena;
         mIndex = other.mIndex;
         mView = other.mView;
-        mDeviceView = other.mDeviceView;
         other.mArena = nullptr;
         other.mIndex = -1;
     }
@@ -271,7 +264,6 @@ void SparseCacheLease::release() noexcept
         mArena = nullptr;
         mIndex = -1;
         mView = SparseCacheView{};
-        mDeviceView = nullptr;
     }
 }
 

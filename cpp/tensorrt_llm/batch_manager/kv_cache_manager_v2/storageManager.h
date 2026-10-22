@@ -316,9 +316,13 @@ public:
     //! of a GPU-tier group, where the level's tier names device memory for a host address.
     [[nodiscard]] CacheTier poolMedium(CacheLevel level, PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
 
-    //! Host bytes the hot level holds in pools that are not its own medium.
-    //! Only the hot level has them: no other tier mixes media.
-    [[nodiscard]] size_t sparseHostBytes() const;
+    //! Bytes `level` holds in pools whose pages are `medium`, each rounded to that
+    //! medium's grain. Zero when the level has no pool of it.
+    [[nodiscard]] size_t getNumBytes(CacheLevel level, CacheTier medium) const;
+
+    //! The medium backing sparse buffers, or nullopt when no life cycle is sparse.
+    //! The hot level's second medium: host pages the GPU reads through a device mapping.
+    [[nodiscard]] std::optional<CacheTier> sparseBackingMedium() const;
 
     // NOTE: Python's get_statistics(level) returns a list over all pool groups.
     // C++ takes a single pgIdx for flexibility; the nanobind wrapper loops over
@@ -385,7 +389,11 @@ private:
     //! Allocation granularity for a tier, decided once from its configured
     //! quota. Fixed for the tier's lifetime, so every size derived from it stays
     //! consistent with what the pools were built for.
-    [[nodiscard]] size_t tierCommitUnit(CacheTierConfig const& tierConfig) const;
+    //!
+    //! `gpuPhysMemSize` is the shared GPU allocator's unit, which every GPU level reports
+    //! rather than one recomputed from its own quota. Taken as an argument so this depends
+    //! on nothing but its inputs, as the construction path needs.
+    [[nodiscard]] static size_t tierCommitUnit(CacheTierConfig const& tierConfig, size_t gpuPhysMemSize);
 
     //! Backing options for a tier: its fixed allocation unit together with the
     //! page-placement policy the tier's config asks for.
@@ -393,17 +401,41 @@ private:
 
     //! `slotSizeLists` holds every pool's size. The level's quota pays for all of them bar
     //! the ones `secondBudget` names, which are host memory charged to it instead.
-    TypedVec<PoolGroupIndex, SlotCount> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
+    [[nodiscard]] static TypedVec<PoolGroupIndex, SlotCount> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
-        std::optional<SecondaryPoolBudget> const& secondBudget = std::nullopt) const;
-    size_t minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-        size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
-        std::optional<SecondaryPoolBudget> const& secondBudget) const;
+        size_t gpuPhysMemSize, std::optional<SecondaryPoolBudget> const& secondBudget = std::nullopt);
+    //! For the config stage, which sizes a level before it exists. Static because that is
+    //! the whole difference from the overload below: this one cannot consult the manager,
+    //! so every fact it needs is named in the call.
+    [[nodiscard]] static size_t minQuotaForLevel(
+        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists, size_t granularity,
+        TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+        std::optional<SecondaryPoolBudget> const& secondBudget = std::nullopt);
+
+    //! The same floor for a level that exists. Its sizes, grain, second budget and slot
+    //! floors all follow from the level, so naming it is what keeps them one level's.
+    [[nodiscard]] size_t minQuotaForLevel(CacheLevel level) const;
+
+    //! Slot counts `quota` buys at `ratio`, for a level that exists.
+    [[nodiscard]] TypedVec<PoolGroupIndex, SlotCount> slotCountsForLevel(
+        CacheLevel level, size_t quota, TypedVec<PoolGroupIndex, float> const& ratio) const;
+
+    //! Slot floors for a level: the hot level's feasibility constraints, and elsewhere the
+    //! structural one slot per pool group.
+    [[nodiscard]] TypedVec<PoolGroupIndex, SlotCount> _minSlotsFor(CacheLevel level) const;
+
     //! The host memory budget for `sparsePools`, as the allocator takes it, or nullopt when
     //! `hostSparsePoolQuota` leaves them unbounded.
+    //!
+    //! For the config stage, which has no pools to ask. `granularity` is what they will
+    //! round to once built -- see hotPoolSizeGranularity().
     [[nodiscard]] std::optional<SecondaryPoolBudget> _hostSparsePoolBudget(
-        TypedVec<PoolGroupIndex, std::vector<PoolIndex>> sparsePools) const;
+        TypedVec<PoolGroupIndex, std::vector<PoolIndex>> sparsePools, size_t granularity) const;
+
+    //! The second medium's budget for a level that already exists, reading both the pools
+    //! and their grain off it rather than restating either.
+    [[nodiscard]] std::optional<SecondaryPoolBudget> _secondaryBudget(CacheLevelStorage const& level) const;
 
     // Internal helpers.
     // Register the slot descriptors for the next cache level and derive its slot-size table.

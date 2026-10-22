@@ -440,10 +440,7 @@ std::vector<SparseCopyRun> KvCacheManager::_sparseCopyTemplates(LifeCycleId life
         args.bufferBytes = static_cast<uint32_t>(arena.bufferBytes(pool));
         args.cellsPerBuffer = _sparseCacheSubSlotsPerBuffer(lifeCycle);
         args.cellsPerLease = arena.cellsPerLease(pool);
-        args.layout.numChunks = layout.numChunks;
-        args.layout.chunkBytes = layout.chunkBytes;
-        args.layout.chunkStride = layout.chunkStride;
-        args.layout.unitStride = layout.unitStride;
+        args.layout = layout;
         args.bufferBase = static_cast<int32_t>(begin);
         args.numBuffers = static_cast<int32_t>(end - begin);
         args.width = sparseCopyWidth(args.layout, args.hostPageStride, args.bufferBytes);
@@ -679,9 +676,14 @@ bool KvCacheManager::isSparse(LayerId layerId, DataRole role) const
     return mStorage->poolMedium(kHotLevel, pgIdx, attr.poolIndex) == CacheTier::HOST_MEM;
 }
 
-size_t KvCacheManager::getSparseHostBytes() const
+size_t KvCacheManager::getNumBytes(CacheLevel level, CacheTier medium) const
 {
-    return mStorage->sparseHostBytes();
+    return mStorage->getNumBytes(level, medium);
+}
+
+std::optional<CacheTier> KvCacheManager::sparseBackingMedium() const
+{
+    return mStorage->sparseBackingMedium();
 }
 
 int KvCacheManager::getPageStride(LayerId layerId, DataRole role) const

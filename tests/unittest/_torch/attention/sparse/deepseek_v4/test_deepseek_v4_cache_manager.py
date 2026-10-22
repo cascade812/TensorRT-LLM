@@ -4003,7 +4003,7 @@ def _v4_flash_offload_config(manager: DeepseekV4CacheManager) -> KVCacheManagerC
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(("cache_factor", "lease_bytes"), [(1.0, 3_793_280), (2.0, 7_362_944)])
+@pytest.mark.parametrize(("cache_factor", "lease_bytes"), [(1.0, 3_793_024), (2.0, 7_362_688)])
 def test_offload_splits_v4_flash_nvfp4_history_by_memory_kind(
     cache_factor: float, lease_bytes: int
 ) -> None:

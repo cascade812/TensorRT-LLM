@@ -2671,6 +2671,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("second_granularity").none() = std::nullopt, nb::arg("second_pools").none() = std::nullopt,
         nb::call_guard<nb::gil_scoped_release>());
 
+    mIntrospection.def("tier_allocation_granularity", &kv::tierAllocationGranularity, nb::arg("tier"), nb::arg("quota"),
+        "The unit a tier of this quota allocates its pools in. Reached through _introspection "
+        "because it carries no stability promise: it exists so a test can size against the rule "
+        "the native tier actually applies rather than restating it.");
+
     // CUDA virtual-memory primitives, reached through _introspection because they carry no
     // stability promise: the native disaggregated bounce buffer reserves one contiguous fabric
     // region with them and maps physical chunks into it up front.
@@ -2789,15 +2794,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 return nb::make_tuple(tableId.value(), slot);
             },
             nb::arg("layer_id"), nb::arg("role"),
-            "(table, entry) serving this buffer. The normal query: a kernel asks where its "
-            "indices are and at what entry.")
+            "(table, entry) serving this buffer. Per-buffer introspection, and how the sparse "
+            "copy path resolves one buffer. An attention kernel takes a whole table instead: "
+            "see converted_index_table.")
         .def(
             "index_table_base",
             [](kv::Batch const& self, int layerId, kv::DataRole const& role)
             { return self.indexTableBase(kv::LayerId{layerId}, role); },
             nb::arg("layer_id"), nb::arg("role"),
-            "What a kernel adds to a converted index for this buffer. Every buffer of a request "
-            "shares it, because the request's own offsets are already in the entries.")
+            "What a converted index for this buffer is added to. Buffers sharing a pool share it, "
+            "their own offsets being already in the entries.")
         .def(
             "converted_index_table",
             [](nb::object self, int tableId)
@@ -3227,11 +3233,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "Every buffer locks its pages at the hot level, sparse or not. What a sparse buffer "
             "changes is the medium: its pages are host memory, device-mapped, and are read through "
             "the per-request GPU cache rather than directly.")
-        .def("get_sparse_host_bytes", &kv::KvCacheManager::getSparseHostBytes, nb::call_guard<nb::gil_scoped_release>(),
-            "Host bytes held on behalf of sparse buffers, across every pool group.\n\n"
-            "These are not drawn from the GPU tier's quota -- they are a different medium -- so "
-            "they appear in no other total a caller can read, and get_quota(GPU_LEVEL) excludes "
-            "them. Reported so a deployment can count what it is actually pinning.")
+        .def(
+            "get_num_bytes",
+            [](kv::KvCacheManager const& self, int cacheLevel, kv::CacheTier medium)
+            { return self.getNumBytes(kv::CacheLevel{cacheLevel}, medium); },
+            nb::arg("level"), nb::arg("medium"), nb::call_guard<nb::gil_scoped_release>(),
+            "Bytes this level holds in pools whose pages are `medium`.\n\n"
+            "A level's quota pays only for its own tier, so bytes of a second medium appear in no "
+            "other total a caller can read and get_quota(level) excludes them. Pair this with "
+            "sparse_backing_medium() to count what sparse buffers are pinning.")
+        .def("sparse_backing_medium", &kv::KvCacheManager::sparseBackingMedium,
+            nb::call_guard<nb::gil_scoped_release>(),
+            "The medium a sparse buffer's pages are, or None when no life cycle is sparse.\n\n"
+            "The hot level's second medium: host memory the GPU reads through a device mapping, "
+            "which is what sparse loading pulls into the per-request GPU cache.")
         .def(
             "resize",
             [](kv::KvCacheManager& self, int cacheLevel, size_t quota, bool bestEfforts)

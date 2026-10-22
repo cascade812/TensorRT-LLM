@@ -20,7 +20,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import (
     LifeCyclePage,
     SparseArenaShape,
     SparseBatchShape,
-    gpu_pool_granule_bytes,
     life_cycle_pages,
     plan_host_history_bytes,
     solve_sparse_offload_capacity,
@@ -39,6 +38,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BatchDesc,
     BufferConfig,
+    CacheTier,
     DataRole,
     GpuCacheTierConfig,
     KVCacheDesc,
@@ -152,12 +152,12 @@ def test_units_per_page(unit_tokens: int | None, units_per_page: int) -> None:
     ("cells", "lease_bytes"),
     [
         # 21 layers x cells x (9216 B data + 1152 B scale), plus two int32 arrays
-        # per cached row and the view. A lease holds the reservation and nothing of
-        # the step: the work lists belong to the Batch, sized by the batch rather
-        # than by whoever is seated.
-        (17, 3_793_280),
-        (32, 7_139_584),
-        (33, 7_362_944),
+        # per cached row. A lease holds the reservation and nothing of the step: the
+        # work lists belong to the Batch, sized by the batch rather than by whoever
+        # is seated.
+        (17, 3_793_024),
+        (32, 7_139_328),
+        (33, 7_362_688),
     ],
 )
 def test_lease_matches_native_layout(cells: int, lease_bytes: int) -> None:
@@ -185,7 +185,7 @@ def test_arena_follows_the_largest_constraint() -> None:
     (shape,) = sparse_arena_shapes(config.layers, tokens_per_block=TOKENS_PER_BLOCK)
 
     assert shape == V4_FLASH_ARENA
-    assert shape.lease_bytes == 7_362_944
+    assert shape.lease_bytes == 7_362_688
     assert sparse_arena_leases(config) == 513
     assert sparse_arena_bytes(config) == shape.arena_bytes(513)
 
@@ -242,7 +242,7 @@ def test_no_arena_without_a_fetch_path_or_leases() -> None:
     ],
 )
 def test_gpu_pool_granule_follows_the_quota(quota: int, granule_bytes: int) -> None:
-    assert gpu_pool_granule_bytes(quota) == granule_bytes
+    assert _introspection.tier_allocation_granularity(CacheTier.GPU_MEM, quota) == granule_bytes
 
 
 @pytest.mark.cpu_only
@@ -526,7 +526,7 @@ def _native_slots(life_cycles: list[LifeCyclePage], ratio: list[float], quota: i
 
     It rounds the quota up to a whole granule, then splits it by ``ratio``.
     """
-    granule = gpu_pool_granule_bytes(quota)
+    granule = _introspection.tier_allocation_granularity(CacheTier.GPU_MEM, quota)
     return _introspection.ratio_to_slot_count_list(
         ceil_div(quota, granule) * granule,
         [list(life_cycle.device_pool_bytes) for life_cycle in life_cycles],
@@ -632,7 +632,7 @@ def test_capacity_names_the_binding_limit_and_the_batch_that_fits() -> None:
     assert capacity.by_limit == {"max_batch_size": 256, "host": 4, "gpu": 794}
     assert capacity.limited_by == "host"
     assert capacity.fits == 4
-    assert capacity.lease_bytes == 7_362_944
+    assert capacity.lease_bytes == 7_362_688
     assert capacity.arena_bytes == V4_FLASH_ARENA.arena_bytes(513)
     # The 50 GiB host budget holds 240 requests of 128K tokens; the GPU budget
     # would hold more even with two leases per request.
