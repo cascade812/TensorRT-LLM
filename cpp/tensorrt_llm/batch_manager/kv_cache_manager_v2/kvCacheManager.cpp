@@ -676,7 +676,7 @@ bool KvCacheManager::isSparse(LayerId layerId, DataRole role) const
 {
     auto const& attr = mStorage->getBufferAttr(layerId, role);
     auto const pgIdx = mStorage->getPoolGroupIndex(kHotLevel, attr.lifeCycleId);
-    return mStorage->isSparsePool(kHotLevel, pgIdx, attr.poolIndex);
+    return mStorage->poolMedium(kHotLevel, pgIdx, attr.poolIndex) == CacheTier::HOST_MEM;
 }
 
 size_t KvCacheManager::getSparseHostBytes() const

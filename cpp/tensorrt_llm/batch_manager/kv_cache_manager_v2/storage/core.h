@@ -365,19 +365,24 @@ public:
     explicit PoolGroupBase(SlotCount numSlots);
     virtual ~PoolGroupBase();
 
-    //! What this pool group's memory actually is.
+    //! The tier this pool group belongs to, which is what names it to the levels above:
+    //! which quota pays for it, which budget it is rebalanced within.
     //!
     //! A property of the pool group rather than of its level, because groups of one level
-    //! can differ in medium. A GPU-tier group reports GPU_MEM even when some of its pools
-    //! are host-backed; isSparse(PoolIndex) names those, and anything choosing a copy
-    //! implementation must ask per pool rather than per group.
+    //! can differ. This is not necessarily the medium of any given pool's pages -- see
+    //! poolMedium().
     [[nodiscard]] virtual CacheTier cacheTier() const noexcept = 0;
 
-    //! Whether this pool's pages are host memory rather than this tier's own medium.
-    //! True only for a sparse pool of the GPU tier.
-    [[nodiscard]] virtual bool isSparse(PoolIndex) const noexcept
+    //! What one pool's pages actually are, which is what anything naming the medium of an
+    //! address needs: a copy implementation, an allocator, a rounding grain, a page
+    //! descriptor.
+    //!
+    //! This is cacheTier() for every pool of every group except a host-backed pool of a
+    //! GPU-tier group, where taking the group's tier would name device memory for a host
+    //! address. Ask per pool, not per group.
+    [[nodiscard]] virtual CacheTier poolMedium(PoolIndex) const noexcept
     {
-        return false;
+        return cacheTier();
     }
 
     PoolIndex numPools() const noexcept
@@ -432,29 +437,18 @@ public:
         return total;
     }
 
-    //! The part of roundedNumBytes that is host memory: the sparse pools alone. The
-    //! complement of denseNumBytes.
-    size_t sparseNumBytes(size_t granularity) const noexcept
+    //! The part of roundedNumBytes whose pages are `medium`, pools of any other medium
+    //! contributing nothing. Summed over the media it reaches, this is roundedNumBytes.
+    //!
+    //! Bytes are only ever comparable within one medium, so a caller measuring them says
+    //! which: numBytes(cacheTier(), g) is what this tier's own quota pays for, and
+    //! numBytes(HOST_MEM, g) on a GPU-tier group is what it holds in host pages instead.
+    size_t roundedNumBytes(CacheTier medium, size_t granularity) const noexcept
     {
         size_t total = 0;
         for (PoolIndex pool{0}; pool < mPools.size(); ++pool)
         {
-            if (isSparse(pool))
-            {
-                total += roundUp(mPools.at(pool)->numBytes(), granularity);
-            }
-        }
-        return total;
-    }
-
-    //! The part of roundedNumBytes this tier's quota pays for: the dense pools. Sparse
-    //! pools are host memory and are not counted.
-    size_t denseNumBytes(size_t granularity) const noexcept
-    {
-        size_t total = 0;
-        for (PoolIndex pool{0}; pool < mPools.size(); ++pool)
-        {
-            if (!isSparse(pool))
+            if (poolMedium(pool) == medium)
             {
                 total += roundUp(mPools.at(pool)->numBytes(), granularity);
             }
@@ -493,12 +487,15 @@ public:
         return CacheTier::GPU_MEM;
     }
 
-    [[nodiscard]] bool isSparse(PoolIndex poolIndex) const noexcept override
+    //! Host memory for a pool declared sparse, device memory for the rest. A sparse
+    //! buffer's pages are host pages the GPU reads through a device mapping, so this is
+    //! the one group whose pools can disagree with its tier.
+    [[nodiscard]] CacheTier poolMedium(PoolIndex poolIndex) const noexcept override
     {
-        return poolIndex < mSparsity.size() && mSparsity[poolIndex];
+        return isHostBacked(poolIndex) ? CacheTier::HOST_MEM : CacheTier::GPU_MEM;
     }
 
-    //! The host allocation behind a sparse pool, or nullptr for a device-backed one.
+    //! The host allocation behind a host-backed pool, or nullptr for a device-backed one.
     [[nodiscard]] HostMem const* hostMem(PoolIndex poolIndex) const;
 
     //! Sparse pools are host memory committed progressively on a background thread, so
@@ -513,13 +510,18 @@ public:
     std::vector<Slot> allocateMultiple(SlotCount numSlots) override;
 
 private:
-    //! Blocks until every sparse pool backs the byte range ending just past `slot`.
+    //! Blocks until every host-backed pool backs the byte range ending just past `slot`.
     void waitSlotUsable(SlotId slot) const;
 
-    //! One flag per pool.
-    TypedVec<PoolIndex, bool> mSparsity;
-    //! Whether any pool is sparse, so the common dense-only group skips the wait.
-    bool mHasSparsePool = false;
+    [[nodiscard]] bool isHostBacked(PoolIndex poolIndex) const noexcept
+    {
+        return poolIndex < mHostBacked.size() && mHostBacked[poolIndex];
+    }
+
+    //! One flag per pool, from the sparsity the buffer config declared.
+    TypedVec<PoolIndex, bool> mHostBacked;
+    //! Whether any pool is host-backed, so the common device-only group skips the wait.
+    bool mHasHostBackedPool = false;
 };
 
 //! Host pools are committed progressively on a background thread, so a slot may
@@ -612,8 +614,9 @@ public:
 
     virtual CacheTier cacheTier() const noexcept = 0;
 
-    //! What one pool group's memory actually is. Differs from cacheTier() only at the hot
-    //! level, where a sparse life cycle's pool group is host memory.
+    //! One pool group's tier. Groups of a level can differ, so this is not the level's own
+    //! cacheTier(). For the medium of an individual pool's pages, which can differ again,
+    //! ask that group's poolMedium().
     [[nodiscard]] CacheTier cacheTier(PoolGroupIndex pgIdx) const
     {
         return mPoolGroups.at(pgIdx)->cacheTier();
@@ -666,25 +669,28 @@ public:
         return std::get<MemAddress>(mPoolGroups.at(pgIdx)->slotAddress(slotId).at(poolIdx));
     }
 
-    //! Host bytes this level holds for sparse pools, which its quota does not pay for.
+    //! Host bytes this level holds in pools that are not its own medium, which its quota
+    //! does not pay for. Meaningful on a device level; a host level has no such pool and
+    //! answers with its whole size.
     size_t sparseHostBytes() const noexcept
     {
         size_t granularity = poolSizeGranularity();
         size_t total = 0;
         for (auto const& pg : mPoolGroups)
-            total += pg->sparseNumBytes(granularity);
+            total += pg->roundedNumBytes(CacheTier::HOST_MEM, granularity);
         return total;
     }
 
-    //! Bytes this level's quota is paying for. Host-backed sparse pools are excluded: the
-    //! quota measures one medium, and a rebalance that defaulted to an inflated figure
-    //! would hand the level more slots than the device can hold.
+    //! Bytes this level's quota is paying for: the pools on its own medium. Host-backed
+    //! pools of a device level are excluded -- the quota measures one medium, and a
+    //! rebalance that defaulted to an inflated figure would hand the level more slots
+    //! than the device can hold.
     size_t totalQuota() const noexcept
     {
         size_t granularity = poolSizeGranularity();
         size_t total = 0;
         for (auto const& pg : mPoolGroups)
-            total += pg->denseNumBytes(granularity);
+            total += pg->roundedNumBytes(pg->cacheTier(), granularity);
         return total;
     }
 
@@ -717,7 +723,7 @@ public:
             std::vector<PoolIndex> sparse;
             for (PoolIndex pool{0}; pool < pg->slotSize().size(); ++pool)
             {
-                if (pg->isSparse(pool))
+                if (pg->poolMedium(pool) != pg->cacheTier())
                 {
                     sparse.push_back(pool);
                 }
@@ -759,7 +765,8 @@ public:
             size_t total = 0;
             for (PoolIndex pool{0}; pool < pg->slotSize().size(); ++pool)
             {
-                auto const grain = pg->isSparse(pool) ? HostMem::kAlignment : poolSizeGranularity();
+                auto const grain
+                    = pg->poolMedium(pool) == CacheTier::HOST_MEM ? HostMem::kAlignment : poolSizeGranularity();
                 total += roundUp(slotCountToSizeT(slotCounts[pgIdx]) * pg->slotSize().at(pool), grain);
             }
             ret[pgIdx] = total;

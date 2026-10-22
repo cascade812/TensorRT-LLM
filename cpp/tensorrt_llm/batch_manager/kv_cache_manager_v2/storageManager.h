@@ -317,12 +317,16 @@ public:
     //! on this, since it chooses the copy direction.
     CacheTier cacheTier(CacheLevel level, PoolGroupIndex pgIdx) const;
 
-    //! Whether this pool's pages are host memory rather than its tier's own medium: true
-    //! for a sparse pool of the GPU tier, which the sparse cache reads through.
-    [[nodiscard]] bool isSparsePool(CacheLevel level, PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
+    //! What one pool's pages actually are, which is what anything naming the medium of an
+    //! address needs: a copy implementation, a registration, a page descriptor.
+    //!
+    //! Prefer this to cacheTier(level, pgIdx): the two agree for every pool but a
+    //! host-backed one of a GPU-tier group, where the group's tier names device memory
+    //! for a host address.
+    [[nodiscard]] CacheTier poolMedium(CacheLevel level, PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
 
-    //! Host bytes held for sparse pools, across every pool group of the hot level.
-    //! Only the hot level has them: sparsity is a property of a GPU-tier pool.
+    //! Host bytes the hot level holds in pools that are not its own medium.
+    //! Only the hot level has them: no other tier mixes media.
     [[nodiscard]] size_t sparseHostBytes() const;
 
     // NOTE: Python's get_statistics(level) returns a list over all pool groups.
@@ -382,7 +386,7 @@ private:
     //! backs it: `deviceGranularity` for a dense pool, the host alignment for a sparse one.
     //! This is the same measure as CacheLevelStorage::allBytes(), which the resulting ratio is
     //! compared against; the storage does not exist yet here, so `sparsePools` names the sparse
-    //! pools of each group instead of PoolGroupBase::isSparse().
+    //! pools of each group instead of PoolGroupBase::poolMedium().
     TypedVec<LifeCycleId, size_t> slotsToBytes(TypedVec<LifeCycleId, SlotCount> const& numSlots,
         size_t deviceGranularity, TypedVec<PoolGroupIndex, std::vector<PoolIndex>> const& sparsePools) const;
 

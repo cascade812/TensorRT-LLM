@@ -693,11 +693,6 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
     TLLM_CHECK_DEBUG(pageIndices != nullptr && numPages > 0);
     PoolGroupIndex const srcPgIdx = getPoolGroupIndex(srcLevel, batchingLayerGroupId);
     PoolGroupIndex const dstPgIdx = getPoolGroupIndex(dstLevel, batchingLayerGroupId);
-    // Per pool group, not per level: pool groups of one level can differ in medium. The
-    // copy below refines this per pool, since a GPU-tier group's sparse pools are host
-    // memory while its dense ones are device memory.
-    CacheTier const srcTier = cacheTier(srcLevel, srcPgIdx);
-    CacheTier const dstTier = cacheTier(dstLevel, dstPgIdx);
     bool const srcIsHot = srcLevel == kHotLevel;
     bool const dstIsHot = dstLevel == kHotLevel;
     auto& srcPoolGroup = poolGroup(srcLevel, srcPgIdx);
@@ -727,17 +722,17 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
             // the medium. Taking the group's tier would run a device-to-device kernel over
             // host pointers -- legal, since the host memory is registered, but tuned for a
             // bandwidth it does not have.
-            auto const poolTier = [&](PoolGroupBase const& pg, CacheTier groupTier)
-            { return pg.isSparse(poolIdx) ? CacheTier::HOST_MEM : groupTier; };
-            mCopyEngine->transfer(
-                poolTier(dstPoolGroup, dstTier), poolTier(srcPoolGroup, srcTier), srcSizes.at(poolIdx), tasks, stream);
+            mCopyEngine->transfer(poolMedium(dstLevel, dstPgIdx, poolIdx), poolMedium(srcLevel, srcPgIdx, poolIdx),
+                srcSizes.at(poolIdx), tasks, stream);
         }
         return;
     }
 
     CacheLevel const coldLevel = srcIsHot ? dstLevel : srcLevel;
     PoolGroupIndex const coldPgIdx = srcIsHot ? dstPgIdx : srcPgIdx;
-    CacheTier const coldTier = srcIsHot ? dstTier : srcTier;
+    // The group's tier, not poolMedium(): only a GPU-tier pool is ever host-backed, and a
+    // cold level has none, so the two agree here and this asks about the level's own medium.
+    CacheTier const coldTier = cacheTier(coldLevel, coldPgIdx);
     size_t const coldPageBytes = slotSize(coldLevel, coldPgIdx).at(PoolIndex{0});
     PageIndexLocation const pageIndexLocation = mPageIndexLocations.at(batchingLayerGroupId);
     auto encodeBatch = [this, batchingLayerGroupId, pageIndexLocation](
@@ -856,9 +851,9 @@ CacheTier StorageManager::cacheTier(CacheLevel level, PoolGroupIndex pgIdx) cons
     return mLevels.at(level).storage->cacheTier(pgIdx);
 }
 
-bool StorageManager::isSparsePool(CacheLevel level, PoolGroupIndex pgIdx, PoolIndex poolIdx) const
+CacheTier StorageManager::poolMedium(CacheLevel level, PoolGroupIndex pgIdx, PoolIndex poolIdx) const
 {
-    return mLevels.at(level).storage->poolGroup(pgIdx).isSparse(poolIdx);
+    return mLevels.at(level).storage->poolGroup(pgIdx).poolMedium(poolIdx);
 }
 
 size_t StorageManager::sparseHostBytes() const
@@ -1676,10 +1671,8 @@ TypedVec<PoolGroupIndex, PoolGroupDesc> StorageManager::poolGroupDescs() const
         pools.reserve(slotSizeList.size());
         for (PoolIndex poolIdx{0}; poolIdx < slotSizeList.size(); ++poolIdx)
         {
-            // A sparse pool's pages are host memory whatever its group's tier says.
-            auto const medium
-                = isSparsePool(kHotLevel, pgIdx, poolIdx) ? CacheTier::HOST_MEM : cacheTier(kHotLevel, pgIdx);
-            pools.push_back(PoolDesc{poolIdx, getMemPoolBaseAddress(pgIdx, poolIdx), slotSizeList.at(poolIdx), medium});
+            pools.push_back(PoolDesc{poolIdx, getMemPoolBaseAddress(pgIdx, poolIdx), slotSizeList.at(poolIdx),
+                poolMedium(kHotLevel, pgIdx, poolIdx)});
         }
         result.push_back(PoolGroupDesc{pgIdx, numSlots(pgIdx, kHotLevel), descList.at(pgIdx), std::move(pools)});
     }

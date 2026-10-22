@@ -598,15 +598,15 @@ TypedVec<PoolIndex, size_t> PoolGroupBase::slotSize() const
 GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
     PooledPhysMemAllocator& physMemAllocator, TypedVec<PoolIndex, bool> sparsity)
     : PoolGroupBase(numSlots)
-    , mSparsity(std::move(sparsity))
+    , mHostBacked(std::move(sparsity))
 {
-    if (mSparsity.empty())
+    if (mHostBacked.empty())
     {
-        mSparsity = TypedVec<PoolIndex, bool>(slotSizeList.size(), false);
+        mHostBacked = TypedVec<PoolIndex, bool>(slotSizeList.size(), false);
     }
     TLLM_CHECK_WITH_INFO(
-        mSparsity.size() == slotSizeList.size(), "GpuPoolGroup: one sparsity flag per pool is required");
-    mHasSparsePool = std::any_of(mSparsity.begin(), mSparsity.end(), [](bool sparse) { return sparse; });
+        mHostBacked.size() == slotSizeList.size(), "GpuPoolGroup: one sparsity flag per pool is required");
+    mHasHostBackedPool = std::any_of(mHostBacked.begin(), mHostBacked.end(), [](bool sparse) { return sparse; });
     size_t physMemSize = physMemAllocator.physMemSize();
     // Query total GPU memory to size virtual address space (mirrors Python GpuPoolGroup).
     size_t totalGpuMem = 0;
@@ -631,7 +631,7 @@ GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const
         double sizeRatio = static_cast<double>(sz) / static_cast<double>(maxSlotSize);
         size_t vmSize = roundDown(static_cast<size_t>(static_cast<double>(totalGpuMem) * sizeRatio), physMemSize);
         vmSize = std::max(vmSize, roundUp(slotCountToSizeT(numSlots) * sz, physMemSize));
-        if (isSparse(p))
+        if (isHostBacked(p))
         {
             // A sparse pool's pages: host memory, device-mapped, so the sparse cache fills
             // from them without a host round trip. No device VA is reserved for them, and
@@ -650,7 +650,7 @@ GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const
 
 HostMem const* GpuPoolGroup::hostMem(PoolIndex poolIndex) const
 {
-    if (!isSparse(poolIndex))
+    if (!isHostBacked(poolIndex))
     {
         return nullptr;
     }
@@ -663,7 +663,7 @@ void GpuPoolGroup::waitSlotUsable(SlotId slot) const
 {
     for (PoolIndex p{0}; p < mPools.size(); ++p)
     {
-        if (isSparse(p))
+        if (isHostBacked(p))
         {
             static_cast<HostSlotPool const&>(*mPools.at(p)).waitSlotUsable(slot);
         }
@@ -673,7 +673,7 @@ void GpuPoolGroup::waitSlotUsable(SlotId slot) const
 Slot GpuPoolGroup::allocate()
 {
     Slot slot = PoolGroupBase::allocate();
-    if (!mHasSparsePool)
+    if (!mHasHostBackedPool)
     {
         return slot;
     }
@@ -692,7 +692,7 @@ Slot GpuPoolGroup::allocate()
 std::vector<Slot> GpuPoolGroup::allocateMultiple(SlotCount numSlots)
 {
     std::vector<Slot> slots = PoolGroupBase::allocateMultiple(numSlots);
-    if (!mHasSparsePool || slots.empty())
+    if (!mHasHostBackedPool || slots.empty())
     {
         return slots;
     }

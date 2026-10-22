@@ -220,9 +220,10 @@ public:
     //! Whether this buffer was declared sparse, i.e. whether its pages are host memory
     //! read through the sparse GPU cache rather than device memory read directly.
     //!
-    //! Answered from the pool the buffer landed in, which is the same fact: buffers
-    //! coalesce only with others of matching size *and* sparsity, so a pool is uniformly
-    //! one or the other.
+    //! Answered as "are this buffer's pages host memory", which is the same fact: a
+    //! GPU-tier pool is host-backed exactly when it was built for sparse buffers, and
+    //! buffers coalesce only with others of matching size *and* sparsity, so a pool is
+    //! uniformly one or the other.
     [[nodiscard]] bool isSparse(LayerId layerId, DataRole role) const;
 
     //! Host bytes held on behalf of sparse buffers, across every pool group.
