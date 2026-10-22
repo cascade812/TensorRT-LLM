@@ -44,9 +44,9 @@ states intent; the offset is a consequence.
 
 | axis | decided by |
 |---|---|
-| buffers **within** one request | always encoded in the entry -- this is the buffer dimension |
+| buffers **within** one spec | always encoded in the entry -- this is the buffer dimension |
 | **across layers** | the index mode |
-| **across requests**, same layer | equal `scale` |
+| **across specs**, same layer | equal `scale` |
 
 The third is what lets a quantised layer's `{K,V}` table serve `{KScale,VScale}` as well:
 both pools coalesce two buffers, the pool group mirrors their slots, so the entries coincide
@@ -106,7 +106,7 @@ it stays in release builds.
 
 ## Requests and tables
 
-A request names buffers that must be addressable from one table under one base -- a kernel
+A spec names buffers that must be addressable from one table under one base -- a kernel
 requirement, not an optimisation. Requests are per layer, since a `BufferId` is
 `(layer, role)`.
 
@@ -115,12 +115,12 @@ using IndexTableId = StrongIndex<int, struct IndexTableIdTag>;
 
 //! Buffers concatenated into one table's buffer dimension, under one base.
 //! Order defines the dimension.
-struct IndexTableRequest { std::vector<BufferId> buffers; };
+struct IndexTableSpec { std::vector<BufferId> buffers; };
 
 IndexTableId numIndexTables() const;
-//! Every request this table satisfies. Each request's buffer order is its own mapping
+//! Every spec this table satisfies. Each spec's buffer order is its own mapping
 //! into the buffer dimension, so K and KScale both sit at entry 0.
-std::vector<IndexTableRequest> const& indexTable(IndexTableId) const;
+std::vector<IndexTableSpec> const& indexTable(IndexTableId) const;
 CUdeviceptr indexTableAddress(IndexTableId) const;
 //! What a kernel adds to a converted index for this buffer in this table.
 MemAddress indexTableBase(IndexTableId, LayerId, DataRole) const;
@@ -133,11 +133,11 @@ So `{{K},{V}}` on one table means K and V read identical entries through differe
 share storage.
 
 `indexTableSlot` is the normal query: a kernel asks where its indices are and at what entry,
-binds the address and base, and never iterates the request list. `numIndexTables` and
+binds the address and base, and never iterates the spec list. `numIndexTables` and
 `indexTable` answer the introspection question -- how many tables exist and what each covers.
 
-Every request merged onto one table has the same buffer count; unequal sizes could not have
-coinciding entries. A request spanning life cycles or scales is a hard error at
+Every spec merged onto one table has the same buffer count; unequal sizes could not have
+coinciding entries. A spec spanning life cycles or scales is a hard error at
 construction: no single table can serve it, and splitting silently would break the caller's
 assumption that one table addresses the set.
 
@@ -176,8 +176,17 @@ The GPU-side cache stops needing to know that a page coalesces several buffers, 
 never its concern -- it caches a buffer, not a page.
 
 A run of buffers is copied in one launch from one base, so each buffer reads its own entry
-of the table: `entry = buffer - bufferBase`, with `pageTableEntryStride` spanning the whole
-table's rows. That is the same `numEntries` dimension a `{K, V}` request already produced.
+of the table: `entry = buffer - bufferBase`. That is the same `numEntries` dimension a
+`{K, V}` spec already produced.
+
+A table is laid out `[numRows][numEntries][blocksPerRow]`, so a row's entries are adjacent
+and a buffer strides between rows by `numEntries * blocksPerRow`. Entry-major would have
+been the obvious shape -- it makes one buffer's rows contiguous, which is what the copy
+walks -- but it puts `numRows * blocksPerRow` between a request's K and V. Attention
+kernels take the pair together: XQA's `kvCachePageList` is
+`[batchSize][beamWidth][2][maxNbPagesPerSeq]`, K's page list immediately followed by V's.
+Row-major is that shape, so a table can be handed to such a kernel as it stands rather than
+repacked per step, and the copy pays an ordinary strided read instead.
 
 Both producers of page indices read that one table, at different extents. The fetch passes
 it from row zero across the batch. The write-back passes it positioned at its own row,
@@ -187,13 +196,13 @@ slot ids instead, which was a second addressing mode for the same kernel.
 Two constraints follow and are checked when the Batch is built, because a run that cannot be
 addressed produces wrong page addresses at step time rather than an error:
 
-- every sparse buffer must be named by some request -- a fetch with no converted indices
+- every sparse buffer must be named by some spec -- a fetch with no converted indices
   would read the wrong pages rather than fail;
-- a `(layer, pool)` run must sit at consecutive entries of **one** request. Split across
+- a `(layer, pool)` run must sit at consecutive entries of **one** spec. Split across
   two, a single launch would need two base pointers.
 
 That shape is not a choice -- it follows from the pool layout -- so
-`KvCacheManager::sparseIndexTableRequests()` hands it out. A Batch still has to be given it:
+`KvCacheManager::sparseIndexTableSpecs()` hands it out. A Batch still has to be given it:
 the declaration stays explicit, and only the re-derivation is saved.
 
 ## Not in scope

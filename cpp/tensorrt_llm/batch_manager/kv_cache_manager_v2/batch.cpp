@@ -58,8 +58,7 @@ std::pair<int, int> deriveBounds(KVCacheManagerConfig const& config)
 } // namespace
 
 Batch::Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize, int maxBlocksPerSeq,
-    std::optional<PageIndexMode> mode, std::vector<IndexTableRequest> indexTables,
-    std::optional<int> maxTotalInputTokens)
+    std::optional<PageIndexMode> mode, std::vector<IndexTableSpec> indexTables, std::optional<int> maxTotalInputTokens)
     : mManager(&manager)
     , mCudaStream(stream)
     , mMaxTotalInputTokens(maxTotalInputTokens)
@@ -155,8 +154,8 @@ void Batch::_allocateCopyDesc()
         for (auto const& run : runs)
         {
             // A run is consecutive buffers of one pool, which can span layers: a pool holds
-            // every layer's buffer of one size. An index table request covers one layer's
-            // run of a pool (sparseIndexTableRequests), so each buffer names its own table,
+            // every layer's buffer of one size. An index table spec covers one layer's
+            // run of a pool (sparseIndexTableSpecs), so each buffer names its own table,
             // already offset to its entry, and the base that table's indices are relative to.
             for (int32_t i = 0; i < run.numBuffers; ++i)
             {
@@ -169,7 +168,9 @@ void Batch::_allocateCopyDesc()
                 // Pre-offset to this buffer's entry, so the kernel indexes the row alone.
                 desc.pageTable = reinterpret_cast<int32_t const*>(table.table);
                 desc.pageTableStride = static_cast<uint32_t>(table.rowStride);
-                desc.numBlocks = static_cast<uint32_t>(table.rowStride);
+                // Not the row stride: a row now spans every entry of the table, while the
+                // blocks this run may address are still one row's worth of one entry.
+                desc.numBlocks = static_cast<uint32_t>(mMaxBlocksPerSeq);
                 // The buffer's own slot in the pool, folded in so the kernel need not read
                 // it through a view it loads per work item.
                 desc.deviceBase = run.deviceBase
@@ -368,7 +369,7 @@ PageIndexMode Batch::indexMode(LifeCycleId lifeCycleId) const
     return mIndexModes[lifeCycleId];
 }
 
-void Batch::_buildIndexTables(std::vector<IndexTableRequest> const& requests)
+void Batch::_buildIndexTables(std::vector<IndexTableSpec> const& specs)
 {
     // The offset of a buffer relative to a chosen base, in page-index units. Mirrors the
     // runtime's kv_offset: a base difference divided by the page stride, which must divide
@@ -384,11 +385,11 @@ void Batch::_buildIndexTables(std::vector<IndexTableRequest> const& requests)
         return static_cast<int>(delta / stride);
     };
 
-    for (auto const& request : requests)
+    for (auto const& spec : specs)
     {
-        TLLM_CHECK_WITH_INFO(!request.buffers.empty(), "An index table request names no buffers");
+        TLLM_CHECK_WITH_INFO(!spec.buffers.empty(), "An index table spec names no buffers");
 
-        auto const& first = request.buffers.front();
+        auto const& first = spec.buffers.front();
         auto const lifeCycle = mManager->bufferAttr(first.layerId, first.role).lifeCycleId;
         // Substitution replaces one layer's page, so every layer of the life cycle can no
         // longer read one table. SHARED is exactly the claim that they can.
@@ -399,7 +400,7 @@ void Batch::_buildIndexTables(std::vector<IndexTableRequest> const& requests)
         auto const scale = mManager->getPageIndexScale(first.layerId, first.role);
         auto const mode = mIndexModes[lifeCycle];
 
-        // Under SHARED the base carries the per-layer offset, so the request's own offsets
+        // Under SHARED the base carries the per-layer offset, so the spec's own offsets
         // are relative to its first buffer. Under PER_LAYER the base is the pool group's
         // and carries none, so every offset is absolute within the slot.
         auto const base = mode == PageIndexMode::SHARED
@@ -407,8 +408,8 @@ void Batch::_buildIndexTables(std::vector<IndexTableRequest> const& requests)
             : mManager->getMemPoolBaseAddress(first.layerId, first.role, PageIndexMode::PER_LAYER);
 
         std::vector<int> offsets;
-        offsets.reserve(request.buffers.size());
-        for (auto const& buffer : request.buffers)
+        offsets.reserve(spec.buffers.size());
+        for (auto const& buffer : spec.buffers)
         {
             auto const& attr = mManager->bufferAttr(buffer.layerId, buffer.role);
             // The reference converter emits `expansion` entries per block. Nothing in the
@@ -419,15 +420,15 @@ void Batch::_buildIndexTables(std::vector<IndexTableRequest> const& requests)
                 "Index conversion does not implement page index expansion, so a buffer with a tokens-per-block "
                 "override cannot have converted index tables");
             TLLM_CHECK_WITH_INFO(attr.lifeCycleId == lifeCycle,
-                "An index table request spans life cycles; their slot ids differ, so no one table can serve it");
+                "An index table spec spans life cycles; their slot ids differ, so no one table can serve it");
             TLLM_CHECK_WITH_INFO(mManager->getPageIndexScale(buffer.layerId, buffer.role) == scale,
-                "An index table request spans page index scales; their converted indices differ, so no one table "
+                "An index table spec spans page index scales; their converted indices differ, so no one table "
                 "can serve it");
             offsets.push_back(pageOffset(buffer, base));
         }
 
-        // Requests coincide when their entries do. Under PER_LAYER the table is per layer,
-        // so requests for different layers never merge however alike their entries look.
+        // Specs coincide when their entries do. Under PER_LAYER the table is per layer,
+        // so specs for different layers never merge however alike their entries look.
         auto const sameTable = [&](IndexTable const& table)
         {
             if (table.lifeCycle != lifeCycle || table.scale != scale || table.concatOffsets != offsets)
@@ -444,18 +445,18 @@ void Batch::_buildIndexTables(std::vector<IndexTableRequest> const& requests)
             found = std::prev(mIndexTables.end());
         }
         IndexTableId const tableId{static_cast<int>(std::distance(mIndexTables.begin(), found))};
-        found->served.push_back(request);
+        found->served.push_back(spec);
 
-        for (size_t slot = 0; slot < request.buffers.size(); ++slot)
+        for (size_t slot = 0; slot < spec.buffers.size(); ++slot)
         {
-            auto const& buffer = request.buffers[slot];
+            auto const& buffer = spec.buffers[slot];
             auto const key = std::make_pair(buffer.layerId, buffer.role);
             BufferSlot const resolved{tableId, static_cast<int>(slot), base};
             auto const [it, inserted] = mBufferSlots.emplace(key, resolved);
             TLLM_CHECK_WITH_INFO(inserted
                     || (it->second.table == resolved.table && it->second.entry == resolved.entry
                         && it->second.base == resolved.base),
-                "A buffer appears in two index table requests that resolved differently");
+                "A buffer appears in two index table specs that resolved differently");
         }
     }
 }
@@ -619,7 +620,7 @@ void Batch::_checkSparseRunsAreAddressable() const
             {
                 auto const found = mBufferSlots.find(std::make_pair(entry.id.layerId, entry.id.role));
                 TLLM_CHECK_WITH_INFO(found != mBufferSlots.end(),
-                    "A sparse buffer has no index table request; the fetch reads converted indices, so every "
+                    "A sparse buffer has no index table spec; the fetch reads converted indices, so every "
                     "sparse buffer needs one");
                 return found->second;
             };
@@ -630,7 +631,7 @@ void Batch::_checkSparseRunsAreAddressable() const
                 auto const slot = slotOf(plan[i]);
                 TLLM_CHECK_WITH_INFO(slot.table == first.table && slot.base == first.base,
                     "Sparse buffers sharing a pool are copied in one launch, from one base pointer, so they must "
-                    "share one index table request");
+                    "share one index table spec");
                 TLLM_CHECK_WITH_INFO(slot.entry == first.entry + static_cast<int>(i - begin),
                     "Sparse buffers sharing a pool must sit at consecutive entries of their request, in the order "
                     "the pool holds them");
@@ -737,7 +738,7 @@ void Batch::_allocateIndexTables()
             rawBase + sizeof(int32_t) * _rowElements() * static_cast<size_t>(table.lifeCycle.value()));
         desc.converted = reinterpret_cast<int32_t*>(memory + sizeof(int32_t) * table.elementOffset);
         desc.offsets = reinterpret_cast<int32_t const*>(offsetsBase + sizeof(int32_t) * offsetHost.size());
-        desc.numEntries = static_cast<int32_t>(table.concatOffsets.size());
+        desc.numBuffers = static_cast<int32_t>(table.concatOffsets.size());
         desc.scale = table.scale;
         if (static_cast<int>(descHost.size()) >= mNumPlainTables)
         {
@@ -794,9 +795,9 @@ ConvertedIndexTable Batch::convertedIndexTable(IndexTableId tableId) const
     }
     ConvertedIndexTable view;
     view.data = indexTableAddress(tableId);
-    // A table's entries are its requests' buffers: the offsets it converts with, one each.
-    view.entries = static_cast<int32_t>(mIndexTables[static_cast<size_t>(tableId.value())].concatOffsets.size());
     view.numRows = mMaxBatchSize;
+    // A table's entries are its requests' buffers: the offsets it converts with, one each.
+    view.numBuffers = static_cast<int32_t>(mIndexTables[static_cast<size_t>(tableId.value())].concatOffsets.size());
     view.blocksPerRow = mMaxBlocksPerSeq;
     return view;
 }
@@ -805,9 +806,12 @@ Batch::SparseIndexRun Batch::sparseIndexRun(LayerId layerId, DataRole const& rol
 {
     auto const [tableId, entry] = indexTableSlot(layerId, role);
     SparseIndexRun run;
-    run.rowStride = mMaxBlocksPerSeq;
-    run.entryStride = mMaxBatchSize * mMaxBlocksPerSeq;
-    run.table = indexTableAddress(tableId) + sizeof(int32_t) * static_cast<size_t>(entry) * run.entryStride;
+    // Row-major in the entries, so a row costs the whole table's entries and an entry costs
+    // one row of blocks.
+    auto const numBuffers = static_cast<int>(mIndexTables[static_cast<size_t>(tableId.value())].concatOffsets.size());
+    run.bufferStride = mMaxBlocksPerSeq;
+    run.rowStride = numBuffers * mMaxBlocksPerSeq;
+    run.table = indexTableAddress(tableId) + sizeof(int32_t) * static_cast<size_t>(entry) * run.bufferStride;
     run.base = indexTableBase(layerId, role);
     return run;
 }
@@ -863,7 +867,7 @@ IndexTableId Batch::numIndexTables() const noexcept
     return IndexTableId{static_cast<int>(mIndexTables.size())};
 }
 
-std::vector<IndexTableRequest> const& Batch::indexTable(IndexTableId tableId) const
+std::vector<IndexTableSpec> const& Batch::indexTable(IndexTableId tableId) const
 {
     if (tableId.value() < 0 || tableId >= numIndexTables())
     {
@@ -877,7 +881,7 @@ std::pair<IndexTableId, int> Batch::indexTableSlot(LayerId layerId, DataRole con
     auto const found = mBufferSlots.find(std::make_pair(layerId, role));
     if (found == mBufferSlots.end())
     {
-        throw std::out_of_range("Batch::indexTableSlot: no index table request named this buffer");
+        throw std::out_of_range("Batch::indexTableSlot: no index table spec named this buffer");
     }
     return {found->second.table, found->second.entry};
 }
@@ -887,7 +891,7 @@ MemAddress Batch::indexTableBase(LayerId layerId, DataRole const& role) const
     auto const found = mBufferSlots.find(std::make_pair(layerId, role));
     if (found == mBufferSlots.end())
     {
-        throw std::out_of_range("Batch::indexTableBase: no index table request named this buffer");
+        throw std::out_of_range("Batch::indexTableBase: no index table spec named this buffer");
     }
     return found->second.base;
 }

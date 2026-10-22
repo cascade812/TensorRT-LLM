@@ -92,12 +92,12 @@ struct BufferId
 //!
 //! This states a kernel's requirement, not a preference: some attention ops take a single
 //! block table covering K and V rather than one each. Order defines the table's buffer
-//! dimension, so a kernel reads buffer `i` of this request at entry `i`.
+//! dimension, so a kernel reads buffer `i` of this spec at entry `i`.
 //!
 //! Every buffer must share a life cycle and a page-index scale, since no one table can
-//! serve buffers whose converted indices differ. A request that spans either is refused
+//! serve buffers whose converted indices differ. A spec that spans either is refused
 //! when the Batch is constructed.
-struct IndexTableRequest
+struct IndexTableSpec
 {
     std::vector<BufferId> buffers;
 };

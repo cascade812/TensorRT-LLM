@@ -2694,32 +2694,32 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         "KVCacheManager construction attempt consumes an explicitly supplied codec, including an attempt that fails.");
 
     // ---- Batch -------------------------------------------------------------
-    nb::class_<kv::IndexTableRequest>(m, "IndexTableRequest")
+    nb::class_<kv::IndexTableSpec>(m, "IndexTableSpec")
         .def(nb::init<>())
         .def(
             "__init__",
-            [](kv::IndexTableRequest* self, std::vector<kv::BufferId> buffers)
-            { new (self) kv::IndexTableRequest{std::move(buffers)}; },
+            [](kv::IndexTableSpec* self, std::vector<kv::BufferId> buffers)
+            { new (self) kv::IndexTableSpec{std::move(buffers)}; },
             nb::arg("buffers"),
             "Buffers a consumer must address from one table, under one base pointer.\n\n"
             "States a kernel's requirement, not a preference: some attention ops take a single "
             "block table covering K and V rather than one each. Order defines the buffer "
             "dimension, so a kernel reads buffer i of this request at entry i. Every buffer must "
             "share a life cycle and a page index scale, or the request is refused.")
-        .def_rw("buffers", &kv::IndexTableRequest::buffers);
+        .def_rw("buffers", &kv::IndexTableSpec::buffers);
 
     nb::class_<kv::Batch>(m, "Batch")
         .def(
             "__init__",
             [](kv::Batch* self, kv::KvCacheManager& manager, intptr_t stream, int maxBatchSize, int maxBlocksPerSeq,
-                std::optional<kv::PageIndexMode> mode, std::vector<kv::IndexTableRequest> indexTables,
+                std::optional<kv::PageIndexMode> mode, std::vector<kv::IndexTableSpec> indexTables,
                 std::optional<int> maxTotalInputTokens)
             {
                 new (self) kv::Batch(manager, reinterpret_cast<CUstream>(stream), maxBatchSize, maxBlocksPerSeq, mode,
                     std::move(indexTables), maxTotalInputTokens);
             },
             nb::arg("manager"), nb::arg("stream"), nb::arg("max_batch_size") = 0, nb::arg("max_blocks_per_seq") = 0,
-            nb::arg("mode") = nb::none(), nb::arg("index_tables") = std::vector<kv::IndexTableRequest>{},
+            nb::arg("mode") = nb::none(), nb::arg("index_tables") = std::vector<kv::IndexTableSpec>{},
             nb::arg("max_total_input_tokens") = nb::none(), nb::keep_alive<1, 2>(),
             "The KV caches stepped together, and their device-side page tables.\n\n"
             "max_batch_size and max_blocks_per_seq bound device arrays whose shape must not change "
@@ -2805,12 +2805,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 auto const& batch = nb::cast<kv::Batch const&>(self);
                 auto const view = batch.convertedIndexTable(kv::IndexTableId{tableId});
                 // The Batch owns the memory; self keeps it alive for the array's lifetime.
-                return makeDeviceArray3D(view.data, view.entries, view.numRows, view.blocksPerRow, self);
+                return makeDeviceArray3D(view.data, view.numRows, view.numBuffers, view.blocksPerRow, self);
             },
             nb::arg("table_id"),
-            "int32[entries, max_batch, max_blocks_per_seq] converted page indices for one "
+            "int32[max_batch, num_buffers, max_blocks_per_seq] converted page indices for one "
             "table, as a DLPack array on the device. A buffer reads the entry index_table_slot "
-            "gives it.\n\n"
+            "gives it; a row's entries are adjacent, which is the shape an attention kernel "
+            "takes a key and value page list in.\n\n"
             "The address is stable for the Batch's lifetime, so a captured graph may bake it; "
             "the array keeps the Batch alive meanwhile.")
         .def(
@@ -3115,8 +3116,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("get_mem_pool_base_address", &kv::KvCacheManager::getMemPoolBaseAddress, nb::arg("layer_id"),
             nb::arg("data_role"), nb::arg("index_mode") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def("get_page_stride", &kv::KvCacheManager::getPageStride, nb::arg("layer_id"), nb::arg("data_role"))
-        .def("sparse_index_table_requests", &kv::KvCacheManager::sparseIndexTableRequests,
-            "The index table requests every sparse life cycle needs, one per (layer, pool) run.\n\n"
+        .def("sparse_index_table_specs", &kv::KvCacheManager::sparseIndexTableSpecs,
+            "The index table specs every sparse life cycle needs, one per (layer, pool) run.\n\n"
             "A Batch still has to be given these: it refuses a sparse buffer it was told nothing about, "
             "because a fetch with no converted indices would read the wrong pages rather than fail. Their "
             "shape is not a choice, so this saves a caller re-deriving the pool layout to restate it.")

@@ -3018,7 +3018,7 @@ def test_sparse_arena_retains_padding_with_full_live_batch(
         stream,
         max_batch_size=max_batch_size,
         max_blocks_per_seq=1,
-        index_tables=core.sparse_index_table_requests(),
+        index_tables=core.sparse_index_table_specs(),
     )
     try:
         # A lease follows membership, so padding caches outside the Batch hold none and a
@@ -3124,7 +3124,7 @@ def test_sparse_arena_bytes_match_the_native_allocation(dense_size: int) -> None
             CudaStream(torch.cuda.current_stream().cuda_stream),
             max_batch_size=2,
             max_blocks_per_seq=1,
-            index_tables=core.sparse_index_table_requests(),
+            index_tables=core.sparse_index_table_specs(),
         )
         assert batch.sparse_arena_bytes == shape.arena_bytes(leases)
         assert batch.sparse_arena_bytes > 0

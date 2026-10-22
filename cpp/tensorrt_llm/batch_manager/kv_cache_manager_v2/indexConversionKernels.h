@@ -26,18 +26,18 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 
 //! One converted index table, as the conversion sees it.
 //!
-//! A table holds `numEntries` values per (row, block): one per buffer of the requests it
-//! serves, differing only by the offset baked into them. Merged requests share these
-//! entries and are told apart by their base pointers, which the conversion never sees.
+//! A table holds `numBuffers` values per (row, block): one per buffer of the specs it
+//! serves, differing only by the offset baked into them. Merged specs share these values
+//! and are told apart by their base pointers, which the conversion never sees.
 struct IndexTableDesc
 {
     //! Raw slot ids for this table's life cycle: [numRows][rawRowStride].
     int32_t const* raw = nullptr;
-    //! Destination: [numEntries][numRows][blocksPerRow].
+    //! Destination: [numRows][numBuffers][blocksPerRow], so a row's buffers are adjacent.
     int32_t* converted = nullptr;
-    //! Offset added to each entry, in page-index units. Length numEntries.
+    //! Offset added to each buffer's indices, in page-index units. Length numBuffers.
     int32_t const* offsets = nullptr;
-    int32_t numEntries = 0;
+    int32_t numBuffers = 0;
     //! Slot id to page index, i.e. how many buffers the pool coalesces.
     int32_t scale = 1;
 
@@ -65,10 +65,10 @@ struct IndexTableDesc
 //! the sentinel separates an absent block from slot zero.
 //!
 //! @param descs        device array of numTables descriptors
-//! @param maxEntries    widest table's numEntries; narrower tables return immediately,
-//!                      which costs less than giving each its own launch
+//! @param maxBuffers    widest table's numBuffers; narrower tables return immediately,
+//!                     which costs less than giving each its own launch
 //! @param rawRowStride  elements between consecutive rows of a raw table
-void launchIndexConversion(IndexTableDesc const* descs, int32_t numTables, int32_t maxEntries, int32_t numRows,
+void launchIndexConversion(IndexTableDesc const* descs, int32_t numTables, int32_t maxBuffers, int32_t numRows,
     int32_t blocksPerRow, int32_t rawRowStride, CUstream stream);
 
 //! The same, for tables whose life cycle substitutes scratch slots.
@@ -79,7 +79,7 @@ void launchIndexConversion(IndexTableDesc const* descs, int32_t numTables, int32
 //!
 //! Scratch is a PER_LAYER-only concern. Under SHARED every layer of a life cycle reads one
 //! table, which substitution would break.
-void launchIndexConversionWithScratch(IndexTableDesc const* descs, int32_t numTables, int32_t maxEntries,
+void launchIndexConversionWithScratch(IndexTableDesc const* descs, int32_t numTables, int32_t maxBuffers,
     int32_t numRows, int32_t blocksPerRow, int32_t rawRowStride, CUstream stream);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

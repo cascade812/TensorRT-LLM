@@ -299,9 +299,9 @@ std::vector<BufferId> KvCacheManager::sparseBufferIds(LifeCycleId lifeCycle) con
     return ids;
 }
 
-std::vector<IndexTableRequest> KvCacheManager::sparseIndexTableRequests() const
+std::vector<IndexTableSpec> KvCacheManager::sparseIndexTableSpecs() const
 {
-    std::vector<IndexTableRequest> requests;
+    std::vector<IndexTableSpec> specs;
     for (LifeCycleId lcId{0}; lcId < mStorage->numLifeCycles(); ++lcId)
     {
         auto const plan = sparseBufferPlan(lcId);
@@ -313,16 +313,16 @@ std::vector<IndexTableRequest> KvCacheManager::sparseIndexTableRequests() const
             {
                 ++end;
             }
-            IndexTableRequest request;
+            IndexTableSpec spec;
             for (size_t i = begin; i < end; ++i)
             {
-                request.buffers.push_back(plan[i].id);
+                spec.buffers.push_back(plan[i].id);
             }
-            requests.push_back(std::move(request));
+            specs.push_back(std::move(spec));
             begin = end;
         }
     }
-    return requests;
+    return specs;
 }
 
 void KvCacheManager::_buildSparseArenas()

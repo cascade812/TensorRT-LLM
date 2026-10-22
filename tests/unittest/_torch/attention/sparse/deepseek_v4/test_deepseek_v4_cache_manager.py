@@ -76,7 +76,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BufferConfig,
     BufferId,
     GpuCacheTierConfig,
-    IndexTableRequest,
+    IndexTableSpec,
     KVCacheDesc,
     KVCacheManagerConfig,
     PageIndexMode,
@@ -105,13 +105,13 @@ class _SparseRuntime:
         for layer_id in (41, 19):
             self.configure_buffers(layer_id, [(DeepseekV4AttentionType.COMPRESS.role, 0)])
 
-    def sparse_index_table_requests(self):
+    def sparse_index_table_specs(self):
         """One request per (layer, pool) run, as the native manager derives them.
 
         The fake's sparse buffers are one per layer, so each is its own run.
         """
         return [
-            IndexTableRequest([BufferId(layer_id, role)])
+            IndexTableSpec([BufferId(layer_id, role)])
             for layer_id in sorted(self.sparse)
             for role in (DeepseekV4AttentionType.COMPRESS.role,)
         ]
@@ -923,7 +923,7 @@ def test_sparse_batch_publishes_schedule_and_reuses_allocation(sparse_scheduling
     assert call.args == (manager.impl, manager._stream.cuda_stream)
     assert call.kwargs["max_batch_size"] == 4
     assert call.kwargs["max_blocks_per_seq"] == 6
-    # By content: IndexTableRequest has no value equality, so comparing against a freshly
+    # By content: IndexTableSpec has no value equality, so comparing against a freshly
     # derived list would only ever compare object identity and never hold.
     assert [
         [(buffer.layer_id, buffer.role) for buffer in request.buffers]

@@ -49,15 +49,23 @@ struct GpuCoalescedPageTable
 };
 
 //! One index table's converted page indices as the device sees them, laid out
-//! [entries][numRows][blocksPerRow]. A buffer reads the entry `index_table_slot` gives it.
+//! [numRows][numBuffers][blocksPerRow]. A buffer reads the entry `index_table_slot` gives
+//! it.
+//!
+//! Row-major in the entries so a request's buffers sit together: an attention kernel takes
+//! a key and value page list as one pair -- XQA's is
+//! [batchSize][beamWidth][2][maxNbPagesPerSeq] -- and this is that shape, so a table can be
+//! handed over as it stands instead of being repacked every step.
 //!
 //! Packed, like the tables either side of it: the Batch allocates it, so there is no stride
 //! a caller has to be told separately.
 struct ConvertedIndexTable
 {
     CUdeviceptr data = 0;
-    int32_t entries = 0;
     int32_t numRows = 0;
+    //! One per buffer of the requests this table serves; they differ only by the offset
+    //! baked into them.
+    int32_t numBuffers = 0;
     int32_t blocksPerRow = 0;
 };
 
@@ -195,7 +203,7 @@ public:
     //! crosses at most one unit boundary. Pass it once a step can ingest more than that,
     //! which is what chunked prefill under in-flight batching does.
     explicit Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize = 0, int maxBlocksPerSeq = 0,
-        std::optional<PageIndexMode> mode = std::nullopt, std::vector<IndexTableRequest> indexTables = {},
+        std::optional<PageIndexMode> mode = std::nullopt, std::vector<IndexTableSpec> indexTables = {},
         std::optional<int> maxTotalInputTokens = std::nullopt);
 
     //! The stream the Batch and every member run on, fixed at construction.
@@ -213,7 +221,7 @@ public:
 
     //! Every request one table satisfies. A request's buffer order is its own mapping into
     //! the buffer dimension, so the first buffer of each sits at entry zero.
-    [[nodiscard]] std::vector<IndexTableRequest> const& indexTable(IndexTableId tableId) const;
+    [[nodiscard]] std::vector<IndexTableSpec> const& indexTable(IndexTableId tableId) const;
 
     //! Which table serves this buffer, and its entry in that table's buffer dimension.
     //! This is the normal query: a kernel asks where its indices are and at what entry.
@@ -235,15 +243,15 @@ public:
     //! How a sparse copy addresses a run of buffers that begins at `first`.
     //!
     //! The run's buffers occupy consecutive entries of one request, which construction
-    //! checked, so naming the first is enough: the rest follow by entry.
+    //! checked, so naming the first is enough: the rest follow by BufferId.
     struct SparseIndexRun
     {
-        //! The run's first entry, for row zero.
+        //! The run's first buffer, for row zero.
         CUdeviceptr table = 0;
         //! What a converted index is added to. Shared by the whole run.
         MemAddress base = 0;
-        //! Elements between consecutive entries, and between consecutive rows.
-        int entryStride = 0;
+        //! Elements between consecutive buffers, and between consecutive rows.
+        int bufferStride = 0;
         int rowStride = 0;
     };
 
@@ -578,11 +586,11 @@ private:
     //! cannot hold scratch takes SHARED and the single smaller table that implies.
     TypedVec<LifeCycleId, PageIndexMode> mIndexModes;
 
-    //! One converted index table: the requests it serves, and what a consumer needs to read
+    //! One converted index table: the specs it serves, and what a consumer needs to read
     //! it. `concatOffsets` is in page-index units, parallel to a request's buffers.
     struct IndexTable
     {
-        std::vector<IndexTableRequest> served;
+        std::vector<IndexTableSpec> served;
         LifeCycleId lifeCycle{0};
         int scale = 1;
         std::vector<int> concatOffsets;
@@ -606,7 +614,7 @@ private:
 
     //! Validate the requests, merge those whose converted indices coincide, and record
     //! where each buffer landed.
-    void _buildIndexTables(std::vector<IndexTableRequest> const& requests);
+    void _buildIndexTables(std::vector<IndexTableSpec> const& specs);
 
     //! Refuse a sparse life cycle whose buffers no single launch can address.
     //!

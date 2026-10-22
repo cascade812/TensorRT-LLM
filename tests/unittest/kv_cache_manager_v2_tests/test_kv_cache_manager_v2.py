@@ -53,7 +53,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         DiskCacheTierConfig,
         GpuCacheTierConfig,
         HostCacheTierConfig,
-        IndexTableRequest,
+        IndexTableSpec,
         KVCacheDesc,
         KVCacheEventManager,
         KVCacheManager,
@@ -114,7 +114,7 @@ else:
         DiskCacheTierConfig,
         GpuCacheTierConfig,
         HostCacheTierConfig,
-        IndexTableRequest,
+        IndexTableSpec,
         KVCacheDesc,
         KVCacheEventManager,
         KVCacheManager,
@@ -1118,7 +1118,7 @@ class TestSparseCacheReservation(unittest.TestCase):
                     handle,
                     max_batch_size=1,
                     max_blocks_per_seq=4,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 self.assertTrue(cache.resume(handle))
                 # The lease comes with membership, so the cache state exists from the add.
@@ -1143,7 +1143,7 @@ class TestSparseCacheReservation(unittest.TestCase):
                     handle,
                     max_batch_size=1,
                     max_blocks_per_seq=4,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
@@ -1177,7 +1177,7 @@ class TestSparseCacheReservation(unittest.TestCase):
                     handle,
                     max_batch_size=3,
                     max_blocks_per_seq=4,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 self.assertTrue(cache.resume(handle))
                 self.assertEqual(batch.add_kv_cache(cache, 2), 2)
@@ -1307,7 +1307,7 @@ class TestSparseCacheReservation(unittest.TestCase):
                     handle,
                     max_batch_size=2,
                     max_blocks_per_seq=4,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 for _ in range(2):
                     cache = manager.create_kv_cache()
@@ -1341,7 +1341,7 @@ class TestSparseCacheReservation(unittest.TestCase):
                         handle,
                         max_batch_size=1,
                         max_blocks_per_seq=4,
-                        index_tables=manager.sparse_index_table_requests(),
+                        index_tables=manager.sparse_index_table_specs(),
                     )
                     self.assertTrue(cache.resume(handle))
                     # Resuming alone takes none: a request that is not being stepped cannot
@@ -1381,7 +1381,7 @@ class TestSparseCacheReservation(unittest.TestCase):
                     handle,
                     max_batch_size=1,
                     max_blocks_per_seq=4,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 self.assertTrue(cache.resume(handle))
                 lc_id = manager.get_layer_group_id(0)
@@ -1436,7 +1436,7 @@ class TestSparseCacheReservation(unittest.TestCase):
                     handle,
                     max_batch_size=3,
                     max_blocks_per_seq=4,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 lc_id = manager.get_layer_group_id(0)
                 for _ in range(2):
@@ -1483,7 +1483,7 @@ class TestSparseCacheReservation(unittest.TestCase):
                     handle,
                     max_batch_size=1,
                     max_blocks_per_seq=4,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 cache = manager.create_kv_cache()
                 self.assertTrue(cache.resume(handle))
@@ -1982,7 +1982,7 @@ class TestSparseFetch(unittest.TestCase):
                     handle,
                     max_batch_size=rows,
                     max_blocks_per_seq=blocks,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 cache = manager.create_kv_cache()
                 self.assertTrue(cache.resume(handle))
@@ -2191,9 +2191,9 @@ class TestSparseFetch(unittest.TestCase):
 
 
 class TestIndexTables(unittest.TestCase):
-    """Which converted index tables a Batch builds, and which requests share one.
+    """Which converted index tables a Batch builds, and which specs share one.
 
-    A request states what a kernel must address together. Two requests share a table when
+    A spec states what a kernel must address together. Two specs share a table when
     their converted entries coincide, which needs the same life cycle, the same page index
     scale, and the same offsets -- the condition a quantised layer's data and block scales
     satisfy because their pool group mirrors their slots.
@@ -2220,24 +2220,51 @@ class TestIndexTables(unittest.TestCase):
         )
 
     @staticmethod
-    def _batch(manager, requests):
+    def _batch(manager, specs, max_batch_size=1):
         return Batch(
-            manager, NULL_STREAM, max_batch_size=1, max_blocks_per_seq=4, index_tables=requests
+            manager,
+            NULL_STREAM,
+            max_batch_size=max_batch_size,
+            max_blocks_per_seq=4,
+            index_tables=specs,
         )
 
-    def test_the_view_is_shaped_for_the_entries_the_table_serves(self):
-        """One entry per buffer of the request, each a full batch-by-blocks plane."""
+    def test_a_rows_entries_sit_together(self):
+        """A row holds its entries side by side, rather than one plane per entry.
+
+        The shape an attention kernel takes a key and value page list in: XQA's
+        kvCachePageList is [batchSize][beamWidth][2][maxNbPagesPerSeq]. A single-row
+        batch cannot tell the two layouts apart, so this one has several.
+        """
         try:
             import torch
         except ImportError:  # pragma: no cover - fast mode without torch
             raise unittest.SkipTest("torch is needed to read the view")
         manager = self._manager(roles=("key", "value"))
         try:
-            request = IndexTableRequest([BufferId(0, "key"), BufferId(0, "value")])
-            batch = self._batch(manager, [request])
+            spec = IndexTableSpec([BufferId(0, "key"), BufferId(0, "value")])
+            batch = self._batch(manager, [spec], max_batch_size=3)
             view = torch.from_dlpack(batch.converted_index_table(0))
-            # Two buffers in the request, so two entries; the rest is the Batch's bounds.
-            self.assertEqual(tuple(view.shape), (2, 1, 4))
+            self.assertEqual(tuple(view.shape), (3, 2, 4))
+            # One row spans every entry; one entry spans one row of blocks.
+            self.assertEqual(view.stride(), (2 * 4, 4, 1))
+        finally:
+            manager.shutdown()
+
+    def test_the_view_is_shaped_for_the_entries_the_table_serves(self):
+        """One entry per buffer of the spec, adjacent within each row."""
+        try:
+            import torch
+        except ImportError:  # pragma: no cover - fast mode without torch
+            raise unittest.SkipTest("torch is needed to read the view")
+        manager = self._manager(roles=("key", "value"))
+        try:
+            spec = IndexTableSpec([BufferId(0, "key"), BufferId(0, "value")])
+            batch = self._batch(manager, [spec])
+            view = torch.from_dlpack(batch.converted_index_table(0))
+            # Row-major in the entries, so a row carries both buffers side by side: two
+            # buffers in the spec gives [max_batch, 2, max_blocks_per_seq].
+            self.assertEqual(tuple(view.shape), (1, 2, 4))
             self.assertEqual(view.dtype, torch.int32)
             self.assertTrue(view.is_cuda)
             # The entry a buffer reads is the one index_table_slot names.
@@ -2247,16 +2274,16 @@ class TestIndexTables(unittest.TestCase):
         finally:
             manager.shutdown()
 
-    def test_a_request_is_reachable_from_every_buffer_it_names(self):
-        """Entry order follows the request's buffer order, which is what a kernel indexes."""
+    def test_a_spec_is_reachable_from_every_buffer_it_names(self):
+        """Entry order follows the spec's buffer order, which is what a kernel indexes."""
         manager = self._manager(roles=("key", "value"))
         try:
-            request = IndexTableRequest([BufferId(0, "key"), BufferId(0, "value")])
-            batch = self._batch(manager, [request])
+            spec = IndexTableSpec([BufferId(0, "key"), BufferId(0, "value")])
+            batch = self._batch(manager, [spec])
             self.assertEqual(batch.num_index_tables, 1)
             self.assertEqual(batch.index_table_slot(0, "key"), (0, 0))
             self.assertEqual(batch.index_table_slot(0, "value"), (0, 1))
-            # One base for the whole request: the offsets are already in the entries.
+            # One base for the whole spec: the offsets are already in the entries.
             self.assertEqual(batch.index_table_base(0, "key"), batch.index_table_base(0, "value"))
         finally:
             manager.shutdown()
@@ -2266,14 +2293,14 @@ class TestIndexTables(unittest.TestCase):
         manager = self._manager(roles=("key",), layers=2)
         try:
             lg = manager.get_layer_group_id(0)
-            requests = [IndexTableRequest([BufferId(layer, "key")]) for layer in range(2)]
-            batch = self._batch(manager, requests)
+            specs = [IndexTableSpec([BufferId(layer, "key")]) for layer in range(2)]
+            batch = self._batch(manager, specs)
             self.assertEqual(batch.index_mode(lg), PageIndexMode.SHARED)
             self.assertEqual(batch.num_index_tables, 1)
             self.assertEqual(
                 batch.index_table_slot(0, "key")[0], batch.index_table_slot(1, "key")[0]
             )
-            # Two requests merged onto it, one per layer.
+            # Two specs merged onto it, one per layer.
             self.assertEqual(len(batch.index_table(0)), 2)
         finally:
             manager.shutdown()
@@ -2282,14 +2309,14 @@ class TestIndexTables(unittest.TestCase):
         """However alike the entries look, a PER_LAYER table serves one layer."""
         manager = self._manager(roles=("key",), layers=2)
         try:
-            requests = [IndexTableRequest([BufferId(layer, "key")]) for layer in range(2)]
+            specs = [IndexTableSpec([BufferId(layer, "key")]) for layer in range(2)]
             batch = Batch(
                 manager,
                 NULL_STREAM,
                 max_batch_size=1,
                 max_blocks_per_seq=4,
                 mode=PageIndexMode.PER_LAYER,
-                index_tables=requests,
+                index_tables=specs,
             )
             self.assertEqual(batch.num_index_tables, 2)
             self.assertNotEqual(
@@ -2333,8 +2360,8 @@ class TestIndexTables(unittest.TestCase):
             self.assertEqual(
                 manager.get_page_index_scale(0, "key"), manager.get_page_index_scale(0, "k_scale")
             )
-            data = IndexTableRequest([BufferId(0, "key"), BufferId(0, "value")])
-            scales = IndexTableRequest([BufferId(0, "k_scale"), BufferId(0, "v_scale")])
+            data = IndexTableSpec([BufferId(0, "key"), BufferId(0, "value")])
+            scales = IndexTableSpec([BufferId(0, "k_scale"), BufferId(0, "v_scale")])
             batch = self._batch(manager, [data, scales])
 
             self.assertEqual(batch.num_index_tables, 1)
@@ -2351,8 +2378,8 @@ class TestIndexTables(unittest.TestCase):
         finally:
             manager.shutdown()
 
-    def test_a_request_spanning_scales_is_refused(self):
-        """A request whose buffers disagree on scale cannot be served by one table.
+    def test_a_spec_spanning_scales_is_refused(self):
+        """A spec whose buffers disagree on scale cannot be served by one table.
 
         Scale sets the entry stride, so buffers with different scales have different
         converted indices for the same slot.
@@ -2363,14 +2390,12 @@ class TestIndexTables(unittest.TestCase):
             lone_scale = manager.get_page_index_scale(0, "k_scale")
             self.assertNotEqual(data_scale, lone_scale, "config does not produce differing scales")
             with self.assertRaises(Exception) as caught:
-                self._batch(
-                    manager, [IndexTableRequest([BufferId(0, "key"), BufferId(0, "k_scale")])]
-                )
+                self._batch(manager, [IndexTableSpec([BufferId(0, "key"), BufferId(0, "k_scale")])])
             self.assertIn("scales", str(caught.exception))
         finally:
             manager.shutdown()
 
-    def test_a_request_spanning_life_cycles_is_refused(self):
+    def test_a_spec_spanning_life_cycles_is_refused(self):
         """Different life cycles number their slots separately, so the entries cannot agree."""
         manager = KVCacheManager(
             KVCacheManagerConfig(
@@ -2395,7 +2420,7 @@ class TestIndexTables(unittest.TestCase):
         try:
             self.assertNotEqual(manager.get_layer_group_id(0), manager.get_layer_group_id(1))
             with self.assertRaises(Exception) as caught:
-                self._batch(manager, [IndexTableRequest([BufferId(0, "key"), BufferId(1, "key")])])
+                self._batch(manager, [IndexTableSpec([BufferId(0, "key"), BufferId(1, "key")])])
             self.assertIn("life cycles", str(caught.exception))
         finally:
             manager.shutdown()
@@ -2406,10 +2431,10 @@ class TestIndexTables(unittest.TestCase):
         """Rebuild the concat table from PageIndexConverter and compare entry for entry.
 
         The reference gives each buffer its own table and puts the per-role offset in that
-        table's base. A concat request shares one base across its buffers, so it must carry
+        table's base. A concat spec shares one base across its buffers, so it must carry
         the offset in the entry instead:
 
-            expected[i] = reference[i] + (role_base[i] - request_base) / stride
+            expected[i] = reference[i] + (role_base[i] - spec_base) / stride
 
         Under SHARED that difference is the K-to-V gap; under PER_LAYER both bases are the
         pool group's, so it is zero and the reference's own layer_offset already separates
@@ -2434,13 +2459,16 @@ class TestIndexTables(unittest.TestCase):
                 manager.get_page_index_converter(layer, role)(raw[:blocks], mode, scratch)
             )
             want = [x if x == BAD_PAGE_INDEX else x + shift for x in reference]
-            got = converted[entry * rows * blocks : entry * rows * blocks + blocks]
+            # Row-major in the entries: a row carries every entry before the next row
+            # starts, which is what puts a spec's key and value planes side by side.
+            base = (0 * len(roles) + entry) * blocks
+            got = converted[base : base + blocks]
             self.assertEqual(got, want, f"entry {entry} ({role})")
 
     @contextlib.contextmanager
     def _published(self, manager, mode):
-        """A one-member batch whose {key, value} request has been converted once."""
-        request = IndexTableRequest([BufferId(0, "key"), BufferId(0, "value")])
+        """A one-member batch whose {key, value} spec has been converted once."""
+        spec = IndexTableSpec([BufferId(0, "key"), BufferId(0, "value")])
         cache = None
         batch = None
         try:
@@ -2452,7 +2480,7 @@ class TestIndexTables(unittest.TestCase):
                     max_batch_size=1,
                     max_blocks_per_seq=4,
                     mode=mode,
-                    index_tables=[request],
+                    index_tables=[spec],
                 )
                 cache = manager.create_kv_cache()
                 self.assertTrue(cache.resume(handle))
@@ -2482,7 +2510,7 @@ class TestIndexTables(unittest.TestCase):
     def test_per_layer_entries_match_the_reference_converter(self):
         """A separate case because the base differs between the modes.
 
-        The pool group's base here, carrying no per-layer offset, against the request's
+        The pool group's base here, carrying no per-layer offset, against the spec's
         first buffer under SHARED, which carries one. Same formula, different entries.
         """
         manager = self._manager(roles=("key", "value"), layers=1)
@@ -2497,7 +2525,7 @@ class TestIndexTables(unittest.TestCase):
     def test_scratch_blocks_match_the_reference_converter(self):
         """The substituting path, against PageIndexConverter given the same ScratchDesc.
 
-        A scratch block's slot comes from the request rather than the page table, and the
+        A scratch block's slot comes from the spec rather than the page table, and the
         layer's offset wraps inside the shared slot instead of being added to it. Both are
         easy to transcribe wrongly, and neither shows up on a config without scratch, so
         this drives a real scratch range and defers the arithmetic to the reference.
@@ -2539,7 +2567,7 @@ class TestIndexTables(unittest.TestCase):
                 "config never wraps the layer offset, so the scratch path is only half tested",
             )
 
-            request = IndexTableRequest([BufferId(layer, "key"), BufferId(layer, "value")])
+            spec = IndexTableSpec([BufferId(layer, "key"), BufferId(layer, "value")])
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
                 batch = Batch(
@@ -2548,7 +2576,7 @@ class TestIndexTables(unittest.TestCase):
                     max_batch_size=1,
                     max_blocks_per_seq=div_up(prompt_len, tpb),
                     mode=PageIndexMode.PER_LAYER,
-                    index_tables=[request],
+                    index_tables=[spec],
                 )
                 cache = manager.create_kv_cache(None, [TokenId(i) for i in range(prompt_len)])
                 self.assertTrue(cache.resume(handle))
@@ -2581,14 +2609,14 @@ class TestIndexTables(unittest.TestCase):
     def test_an_unrequested_buffer_has_no_slot(self):
         manager = self._manager(roles=("key", "value"))
         try:
-            batch = self._batch(manager, [IndexTableRequest([BufferId(0, "key")])])
+            batch = self._batch(manager, [IndexTableSpec([BufferId(0, "key")])])
             with self.assertRaises(Exception) as caught:
                 batch.index_table_slot(0, "value")
-            self.assertIn("no index table request", str(caught.exception))
+            self.assertIn("no index table spec", str(caught.exception))
         finally:
             manager.shutdown()
 
-    def test_no_requests_means_no_tables(self):
+    def test_no_specs_means_no_tables(self):
         manager = self._manager(roles=("key",))
         try:
             self.assertEqual(self._batch(manager, []).num_index_tables, 0)
@@ -2736,7 +2764,7 @@ class TestBatchPageTable(unittest.TestCase):
                     handle,
                     max_batch_size=self.ROWS,
                     max_blocks_per_seq=self.BLOCKS,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 yield torch, manager, batch, handle
         finally:
@@ -2932,7 +2960,7 @@ class TestSparseDataPath(unittest.TestCase):
                     handle,
                     max_batch_size=1,
                     max_blocks_per_seq=8,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
@@ -2989,7 +3017,7 @@ class TestSparseDataPath(unittest.TestCase):
                     handle,
                     max_batch_size=1,
                     max_blocks_per_seq=8,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
@@ -3114,7 +3142,7 @@ class TestSparseWriteIndices(unittest.TestCase):
                     handle,
                     max_batch_size=1,
                     max_blocks_per_seq=8,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
@@ -3170,7 +3198,7 @@ class TestSparseWriteIndices(unittest.TestCase):
                     handle,
                     max_batch_size=1,
                     max_blocks_per_seq=8,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
@@ -3208,7 +3236,7 @@ class TestSparseWriteIndices(unittest.TestCase):
                     handle,
                     max_batch_size=2,
                     max_blocks_per_seq=8,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
@@ -3284,7 +3312,7 @@ class TestSparseWriteIndices(unittest.TestCase):
                     handle,
                     max_batch_size=1,
                     max_blocks_per_seq=8,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
@@ -3359,7 +3387,7 @@ class TestSparseWriteIndices(unittest.TestCase):
                     handle,
                     max_batch_size=1,
                     max_blocks_per_seq=8,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
@@ -3425,7 +3453,7 @@ class TestSparseWriteIndices(unittest.TestCase):
                     handle,
                     max_batch_size=1,
                     max_blocks_per_seq=8,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
@@ -3574,7 +3602,7 @@ class TestSparseQuantisedDataPath(unittest.TestCase):
                     handle,
                     max_batch_size=1,
                     max_blocks_per_seq=8,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
@@ -3643,7 +3671,7 @@ class TestSparseQuantisedDataPath(unittest.TestCase):
                     handle,
                     max_batch_size=1,
                     max_blocks_per_seq=8,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
@@ -3905,7 +3933,7 @@ class TestBatch(unittest.TestCase):
                     handle,
                     max_batch_size=2,
                     max_blocks_per_seq=4,
-                    index_tables=manager.sparse_index_table_requests(),
+                    index_tables=manager.sparse_index_table_specs(),
                 )
                 # Before anyone resumes, no reservation exists, so no view does either.
                 batch.publish()

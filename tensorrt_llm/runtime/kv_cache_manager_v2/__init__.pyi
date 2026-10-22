@@ -935,15 +935,15 @@ def create_default_kv_cache_cold_page_codec() -> IKvCacheColdPageCodec:
     consumes an explicitly supplied codec, including an attempt that fails.
     """
 
-class IndexTableRequest:
+class IndexTableSpec:
     """Buffers a consumer must address from one table, under one base pointer.
 
     States a kernel's requirement, not a preference: some attention ops take a single block
     table covering K and V rather than one each. Order defines the table's buffer dimension,
-    so a kernel reads buffer ``i`` of this request at entry ``i``.
+    so a kernel reads buffer ``i`` of this spec at entry ``i``.
 
     Every buffer must share a life cycle and a page-index scale, since no one table can
-    serve buffers whose converted indices differ. A request spanning either is refused when
+    serve buffers whose converted indices differ. A spec spanning either is refused when
     the ``Batch`` is constructed.
     """
 
@@ -977,7 +977,7 @@ class Batch:
         max_batch_size: int = 0,
         max_blocks_per_seq: int = 0,
         mode: PageIndexMode | None = None,
-        index_tables: Sequence[IndexTableRequest] = (),
+        index_tables: Sequence[IndexTableSpec] = (),
         max_total_input_tokens: int | None = None,
     ) -> None:
         """Bound the device arrays, whose shape must not change between steps.
@@ -1066,7 +1066,7 @@ class Batch:
 
     @property
     def num_index_tables(self) -> int: ...
-    def index_table(self, table_id: int) -> list[IndexTableRequest]:
+    def index_table(self, table_id: int) -> list[IndexTableSpec]:
         """Every request this table satisfies.
 
         A request's buffer order is its own mapping into the buffer dimension, so the first
@@ -1391,8 +1391,8 @@ class KVCacheManager:
         """
 
     def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int: ...
-    def sparse_index_table_requests(self) -> list[IndexTableRequest]:
-        """The index table requests every sparse life cycle needs, one per (layer, pool) run.
+    def sparse_index_table_specs(self) -> list[IndexTableSpec]:
+        """The index table specs every sparse life cycle needs, one per (layer, pool) run.
 
         A :class:`Batch` still has to be given these: it refuses a sparse buffer it was told
         nothing about, because a fetch with no converted indices would read the wrong pages

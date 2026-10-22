@@ -31,21 +31,23 @@ namespace
 
 constexpr int kThreads = 256;
 
-//! One CTA row per (table, entry, row); threads walk the blocks of that row.
+//! One CTA row per (table, buffer, row); threads walk the blocks of that row.
 __global__ __launch_bounds__(kThreads) void indexConversionKernel(
     IndexTableDesc const* descs, int32_t numRows, int32_t blocksPerRow, int32_t rawRowStride)
 {
     auto const& desc = descs[blockIdx.z];
-    int32_t const entry = static_cast<int32_t>(blockIdx.y);
-    if (entry >= desc.numEntries)
+    int32_t const buffer = static_cast<int32_t>(blockIdx.y);
+    if (buffer >= desc.numBuffers)
     {
         return;
     }
     int32_t const row = static_cast<int32_t>(blockIdx.x);
 
     int32_t const* raw = desc.raw + static_cast<ptrdiff_t>(row) * rawRowStride;
-    int32_t* out = desc.converted + (static_cast<ptrdiff_t>(entry) * numRows + row) * blocksPerRow;
-    int32_t const offset = desc.offsets[entry];
+    // Row-major in the entries: a row's entries are adjacent, so a request's K and V
+    // sit together the way an attention kernel's page list wants them.
+    int32_t* out = desc.converted + (static_cast<ptrdiff_t>(row) * desc.numBuffers + buffer) * blocksPerRow;
+    int32_t const offset = desc.offsets[buffer];
 
     for (int32_t block = static_cast<int32_t>(threadIdx.x); block < blocksPerRow; block += kThreads)
     {
@@ -55,22 +57,24 @@ __global__ __launch_bounds__(kThreads) void indexConversionKernel(
     }
 }
 
-//! One CTA row per (table, entry, row), as above, but scratch blocks take their slot from
+//! One CTA row per (table, buffer, row), as above, but scratch blocks take their slot from
 //! the request rather than the page table.
 __global__ __launch_bounds__(kThreads) void indexConversionScratchKernel(
     IndexTableDesc const* descs, int32_t numRows, int32_t blocksPerRow, int32_t rawRowStride)
 {
     auto const& desc = descs[blockIdx.z];
-    int32_t const entry = static_cast<int32_t>(blockIdx.y);
-    if (entry >= desc.numEntries)
+    int32_t const buffer = static_cast<int32_t>(blockIdx.y);
+    if (buffer >= desc.numBuffers)
     {
         return;
     }
     int32_t const row = static_cast<int32_t>(blockIdx.x);
 
     int32_t const* raw = desc.raw + static_cast<ptrdiff_t>(row) * rawRowStride;
-    int32_t* out = desc.converted + (static_cast<ptrdiff_t>(entry) * numRows + row) * blocksPerRow;
-    int32_t const offset = desc.offsets[entry];
+    // Row-major in the entries: a row's entries are adjacent, so a request's K and V
+    // sit together the way an attention kernel's page list wants them.
+    int32_t* out = desc.converted + (static_cast<ptrdiff_t>(row) * desc.numBuffers + buffer) * blocksPerRow;
+    int32_t const offset = desc.offsets[buffer];
 
     int32_t const scratchBeg = desc.scratchBegs[row];
     int32_t const scratchEnd = desc.scratchEnds[row];
@@ -95,30 +99,30 @@ __global__ __launch_bounds__(kThreads) void indexConversionScratchKernel(
 
 } // namespace
 
-void launchIndexConversion(IndexTableDesc const* descs, int32_t numTables, int32_t maxEntries, int32_t numRows,
+void launchIndexConversion(IndexTableDesc const* descs, int32_t numTables, int32_t maxBuffers, int32_t numRows,
     int32_t blocksPerRow, int32_t rawRowStride, CUstream stream)
 {
-    if (numTables <= 0 || maxEntries <= 0 || numRows <= 0 || blocksPerRow <= 0)
+    if (numTables <= 0 || maxBuffers <= 0 || numRows <= 0 || blocksPerRow <= 0)
     {
         return;
     }
-    // The grid's entry extent is the widest table's, since descs lives on the device and
+    // The grid's buffer extent is the widest table's, since descs lives on the device and
     // the host cannot read it back to size the grid per table.
     dim3 const grid(
-        static_cast<unsigned>(numRows), static_cast<unsigned>(maxEntries), static_cast<unsigned>(numTables));
+        static_cast<unsigned>(numRows), static_cast<unsigned>(maxBuffers), static_cast<unsigned>(numTables));
     indexConversionKernel<<<grid, kThreads, 0, stream>>>(descs, numRows, blocksPerRow, rawRowStride);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
-void launchIndexConversionWithScratch(IndexTableDesc const* descs, int32_t numTables, int32_t maxEntries,
+void launchIndexConversionWithScratch(IndexTableDesc const* descs, int32_t numTables, int32_t maxBuffers,
     int32_t numRows, int32_t blocksPerRow, int32_t rawRowStride, CUstream stream)
 {
-    if (numTables <= 0 || maxEntries <= 0 || numRows <= 0 || blocksPerRow <= 0)
+    if (numTables <= 0 || maxBuffers <= 0 || numRows <= 0 || blocksPerRow <= 0)
     {
         return;
     }
     dim3 const grid(
-        static_cast<unsigned>(numRows), static_cast<unsigned>(maxEntries), static_cast<unsigned>(numTables));
+        static_cast<unsigned>(numRows), static_cast<unsigned>(maxBuffers), static_cast<unsigned>(numTables));
     indexConversionScratchKernel<<<grid, kThreads, 0, stream>>>(descs, numRows, blocksPerRow, rawRowStride);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
