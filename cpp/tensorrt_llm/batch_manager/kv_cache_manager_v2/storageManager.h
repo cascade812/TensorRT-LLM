@@ -364,6 +364,8 @@ private:
         BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const;
 
     // Constraint floors apply only to the hot level. Lifecycle demands remain available only as ratio weights.
+    //
+    // Both read the hot pool-group mapping and slot descs, so they run after those are built.
     TypedVec<PoolGroupIndex, SlotCount> computePoolGroupMinSlotsFromConstraints(
         std::vector<BatchDesc> const& constraints, int tokensPerBlock,
         std::optional<SwaScratchReuseConfig> const& swaScratchReuse, float maxUtilForResume = 1.0f) const;
@@ -396,8 +398,10 @@ private:
     [[nodiscard]] static size_t tierCommitUnit(CacheTierConfig const& tierConfig, size_t gpuPhysMemSize);
 
     //! Backing options for a tier: its fixed allocation unit together with the
-    //! page-placement policy the tier's config asks for.
-    [[nodiscard]] HostMemBackingOptions tierBackingOptions(CacheTierConfig const& tierConfig) const;
+    //! page-placement policy the tier's config asks for. `gpuPhysMemSize` is the shared
+    //! GPU allocator's unit, as tierCommitUnit takes it.
+    [[nodiscard]] static HostMemBackingOptions tierBackingOptions(
+        CacheTierConfig const& tierConfig, size_t gpuPhysMemSize);
 
     //! `slotSizeLists` holds every pool's size. The level's quota pays for all of them bar
     //! the ones `secondBudget` names, which are host memory charged to it instead.
@@ -519,7 +523,9 @@ private:
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotDesc>> mSlotDescLists;
     // Slot sizes per (level, pool group), built from mSlotDescLists.
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>>> mSlotSizes;
-    TypedVec<PoolGroupIndex, SlotCount> mMinSlots;
+    //! Hot-level slot floors, from the batch constraints and scaled by 1/maxUtilForResume.
+    //! Other levels take the structural one-slot floor instead; see _minSlotsFor.
+    TypedVec<PoolGroupIndex, SlotCount> mHotMinSlots;
 
     //! Host memory the hot level's host-backed pools may take, when the configuration bounds
     //! it. Kept because a rebalance moves the slot counts those pools follow, so the bound

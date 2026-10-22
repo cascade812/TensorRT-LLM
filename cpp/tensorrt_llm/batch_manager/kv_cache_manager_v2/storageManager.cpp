@@ -298,7 +298,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     // Constraints are hot-level feasibility floors. They are scaled by
     // 1/maxUtilForResume because KvCache::resume rejects a pool group above that
     // utilization. Other levels need only the structural one-slot floor.
-    mMinSlots
+    mHotMinSlots
         = computePoolGroupMinSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
 
     // Derive hot-tier lifecycle byte weights. Cold initialization preserves the slot-count proportions implied by
@@ -358,10 +358,10 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     // Derived from the descriptors here because the level's storage does not exist yet; every
     // path afterwards asks the pool groups themselves, which carry the same sparsity.
     auto gpuSlotCounts
-        = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mMinSlots, gpuGranularity,
+        = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mHotMinSlots, gpuGranularity,
             _hostSparsePoolBudget(sparsePools, hotPoolSizeGranularity(CacheTier::HOST_MEM, gpuGranularity)));
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
-        gpuSlotCounts, mGpuPhysMemAllocator.get(), tierBackingOptions(config.cacheTiers[kHotLevel]));
+        gpuSlotCounts, mGpuPhysMemAllocator.get(), tierBackingOptions(config.cacheTiers[kHotLevel], gpuGranularity));
 
     auto const gpuDescs = poolGroupDescs();
     TLLM_CHECK_WITH_INFO(
@@ -491,7 +491,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         auto* gpuPhysMemAllocator
             = cacheTierOf(config.cacheTiers[level]) == CacheTier::GPU_MEM ? mGpuPhysMemAllocator.get() : nullptr;
         mLevels.emplace_back(lifeCycleGrouping(level), level, config.cacheTiers[level], slotDescList(level), slotCounts,
-            gpuPhysMemAllocator, tierBackingOptions(config.cacheTiers[level]));
+            gpuPhysMemAllocator, tierBackingOptions(config.cacheTiers[level], gpuGranularity));
     }
 
     for (CacheLevel level{0}; level < mLevels.size(); ++level)
@@ -2206,10 +2206,10 @@ size_t StorageManager::tierCommitUnit(CacheTierConfig const& tierConfig, size_t 
         : tierAllocationGranularity(cacheTierOf(tierConfig), cacheTierQuota(tierConfig));
 }
 
-HostMemBackingOptions StorageManager::tierBackingOptions(CacheTierConfig const& tierConfig) const
+HostMemBackingOptions StorageManager::tierBackingOptions(CacheTierConfig const& tierConfig, size_t gpuPhysMemSize)
 {
     HostMemBackingOptions options;
-    options.commitUnit = tierCommitUnit(tierConfig, mGpuPhysMemAllocator->physMemSize());
+    options.commitUnit = tierCommitUnit(tierConfig, gpuPhysMemSize);
     if (auto const* host = std::get_if<HostCacheTierConfig>(&tierConfig))
     {
         options.allowRemoteNumaFallback = host->allowRemoteNumaFallback;
@@ -2224,7 +2224,7 @@ HostMemBackingOptions StorageManager::tierBackingOptions(CacheTierConfig const& 
 TypedVec<PoolGroupIndex, SlotCount> StorageManager::_minSlotsFor(CacheLevel level) const
 {
     // Constraints are hot-level feasibility floors; other levels need only the structural one.
-    return level == kHotLevel ? mMinSlots : TypedVec<PoolGroupIndex, SlotCount>(numPoolGroups(level), SlotCount{1});
+    return level == kHotLevel ? mHotMinSlots : TypedVec<PoolGroupIndex, SlotCount>(numPoolGroups(level), SlotCount{1});
 }
 
 size_t StorageManager::minQuotaForLevel(CacheLevel level) const
