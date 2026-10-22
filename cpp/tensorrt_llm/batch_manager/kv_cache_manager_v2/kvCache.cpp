@@ -429,52 +429,6 @@ SharedPtr<Page> KvCache::_page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycl
     return blockPageGetPage(blockPage);
 }
 
-bool KvCache::_hasSparseCache() const
-{
-    LifeCycleId const numLc = mManager->storage().numLifeCycles();
-    for (LifeCycleId lc{0}; lc < numLc; ++lc)
-    {
-        if (mManager->sparseCacheMaxUnits(lc) > 0)
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-std::vector<KvCache::SparseBufferRef> KvCache::_sparseBuffers(LifeCycleId lifeCycle) const
-{
-    // Same walk, in the same order, that sized the cache in _computeSparseCacheShape, so
-    // buffer i here is buffer i of SparseCacheView.
-    std::vector<SparseBufferRef> refs;
-    auto const& config = mManager->config();
-    for (auto const& layer : config.layers)
-    {
-        auto const* attn = std::get_if<AttentionLayerConfig>(&layer);
-        if (attn == nullptr || mManager->lifeCycles().getId(makeLifeCycle(layer, config.tokensPerBlock)) != lifeCycle)
-        {
-            continue;
-        }
-        for (auto const& buf : attn->buffers)
-        {
-            // A sparse buffer in a layer with no sparse_cache has storage and locking but
-            // no fetch path, so it contributes no cells and no layout.
-            if (!buf.isSparse || !attn->sparseCache.has_value())
-            {
-                continue;
-            }
-            refs.push_back(SparseBufferRef{
-                BufferId{attn->layerId, buf.role}, buf.sparseLayout(attn->sparseCache->unitsPerPage(mTokensPerBlock))});
-        }
-    }
-    return refs;
-}
-
-int KvCache::_sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const
-{
-    return mManager->sparseCacheSubSlotsPerBuffer(lifeCycle);
-}
-
 std::optional<int> KvCache::maxInputLength() const
 {
     // One token, not the reservation's spare width. A sparse request contributes exactly one
@@ -482,7 +436,7 @@ std::optional<int> KvCache::maxInputLength() const
     // attention kernel indexes its selection per query token; the two agree only at one
     // token each. Prefill and speculative decoding break that and are out of scope, so the
     // bound is a property of the supported shape rather than of how wide a cache is.
-    return _hasSparseCache() ? std::optional<int>{1} : std::nullopt;
+    return mManager->hasSparseCache() ? std::optional<int>{1} : std::nullopt;
 }
 
 void KvCache::activate()
@@ -1605,7 +1559,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     // Blocks above the watermark are in flight: their data lives only in sparse cache cells,
     // so the gap cannot exceed what the reservation can pin. The host-side counterpart of
     // the resolve kernel's in-flight overflow report.
-    if (newCap != newHist && _hasSparseCache())
+    if (newCap != newHist && mManager->hasSparseCache())
     {
         auto const bound = maxInputLength();
         if (bound.has_value() && newCap - newHist > *bound)

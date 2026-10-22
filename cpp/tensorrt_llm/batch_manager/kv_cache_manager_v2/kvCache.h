@@ -580,34 +580,6 @@ private:
     // Internal — called by resume(). Not public (mirrors Python where activate() doesn't exist).
     void activate();
 
-    // Cache pages this request needs for one life cycle: history entries plus one per
-    // in-flight unit, converted to pages. Zero when the life cycle has no fetch path.
-    //! Cache cells one sparse buffer needs: the history it caches plus every in-flight
-    //! unit, which holds its only copy until a flush reaches it.
-    //!
-    //! This is also the number of slots to reserve. The two coincide because a life cycle's
-    //! buffers of one size coalesce into that pool's slot, so reserving this many slots
-    //! yields exactly this many cells per buffer.
-    [[nodiscard]] int _sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const;
-
-    //! One sparse buffer of a life cycle, in the order SparseCacheView indexes them.
-    struct SparseBufferRef
-    {
-        BufferId id;
-        SelectionUnitLayout layout;
-    };
-
-    [[nodiscard]] std::vector<SparseBufferRef> _sparseBuffers(LifeCycleId lifeCycle) const;
-
-    //! Write the cells holding units [fromUnits, toUnits) back to their host pages, on this
-    //! request's stream. Enqueues and returns: stream order is what guarantees a later fetch
-    //! reads the written-back page, and a copy that fails is a broken invariant, not a
-    //! recoverable condition.
-
-    // Whether any life cycle has a configured sparse fetch path, and so whether
-    // max_input_length is required.
-    [[nodiscard]] bool _hasSparseCache() const;
-
     // Internal helpers.
     // Turn the per-block cache levels observed while holding the matched pages into logical token
     // counts. Called at the end of _setupForReuse, which collects them in the same walk.

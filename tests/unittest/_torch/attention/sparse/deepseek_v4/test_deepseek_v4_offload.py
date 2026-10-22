@@ -332,15 +332,18 @@ def test_metadata_routes_only_sparse_main_table(enabled):
 class _FetchDouble:
     """Compact, per-role physical indices; deliberately accepts only the native ABI."""
 
-    def __init__(self):
+    def __init__(self, batch):
+        # Attached as an attribute of the Batch, which does not bind a receiver, so the
+        # batch the call is standing in for is supplied here instead.
+        self.batch = batch
         self.calls = []
 
-    def __call__(self, *, batch, buffers, selected, out, stream):
-        assert selected.shape == (batch.max_batch_size, 8)
-        assert out.shape == (batch.max_batch_size, len(buffers), 8)
+    def __call__(self, *, buffers, selected, out, stream):
+        assert selected.shape == (self.batch.max_batch_size, 8)
+        assert out.shape == (self.batch.max_batch_size, len(buffers), 8)
         assert selected.is_contiguous() and out.is_contiguous()
         assert stream == torch.cuda.current_stream().cuda_stream
-        self.calls.append((batch, buffers, selected, out, stream))
+        self.calls.append((self.batch, buffers, selected, out, stream))
         for i, buffer in enumerate(buffers):
             # Paired data/scale roles share indices; padding has separate cells.
             offset = (0 if buffer.layer_id == 41 else 1000) + (
@@ -372,7 +375,7 @@ def _fetch_case(multiple_roles=False, rows=None):
     _publish(manager, [20, 10], rows)
     state = _metadata(manager).sparse_offload_state
     manager.prepare_sparse_offload(state, [20, 10], beam_width=1)
-    manager._sparse_batch.fetch_sparse_pages = _FetchDouble()
+    manager._sparse_batch.fetch_sparse_pages = _FetchDouble(manager._sparse_batch)
     topk = torch.tensor(
         [[2, -1, 0, 1, -2, 3, 99, -1], [1, 0, -1, 2, -1, -1, -1, -1]],
         dtype=torch.int32,
@@ -408,10 +411,10 @@ def test_prepare_writes_and_attention_merge_on_ordered_streams(rows):
     producer = torch.cuda.Stream()
     seen = []
 
-    def prepare(*, batch, buffers, out, stream):
+    def prepare(*, buffers, out, stream):
         assert out.shape == (4, 1) and out.is_contiguous()
         assert stream == producer.cuda_stream
-        assert batch is case.state.batch and buffers == case.state.layers[2].buffer_ids
+        assert buffers == case.state.layers[2].buffer_ids
         seen.append(out.data_ptr())
         out.fill_(-1)
         # Request 20 has history 7 and capacity 8, so its unit 1 is newly complete.
@@ -484,7 +487,7 @@ def test_compressor_writes_check_once_that_scales_share_the_data_row():
     descriptor = case.state.layers[2]
     scale_row = {"value": 77}
 
-    def prepare(*, batch, buffers, out, stream):
+    def prepare(*, buffers, out, stream):
         out.fill_(-1)
         out[0, descriptor.data_buffer_index] = 77
         out[0, descriptor.scale_buffer_index] = scale_row["value"]

@@ -31,6 +31,7 @@
 #include "kv_cache_manager_v2/utils/poison.h"
 #include "kv_cache_manager_v2/utils/reentrantSharedMutex.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -389,6 +390,17 @@ public:
     [[nodiscard]] int sparseCacheMaxUnits(LifeCycleId lifeCycle) const noexcept
     {
         return lifeCycle < mSparseCacheMaxUnits.size() ? mSparseCacheMaxUnits[lifeCycle] : 0;
+    }
+
+    //! Whether any life cycle has a configured sparse fetch path. A property of the
+    //! configuration, so it is the same for every cache this manager holds, and it decides
+    //! whether max_input_length is required.
+    //!
+    //! Derived rather than stored: there are a handful of life cycles, so the scan costs
+    //! less than a second copy of the same fact could drift.
+    [[nodiscard]] bool hasSparseCache() const noexcept
+    {
+        return std::ranges::any_of(mSparseCacheMaxUnits, [](int units) { return units > 0; });
     }
 
     //! Units a step selects per buffer of this life cycle. The cache must hold a whole

@@ -2017,7 +2017,7 @@ class TestSparseFetch(unittest.TestCase):
         with self._fixture(roles) as (torch, manager, batch, _cache, handle):
             selected = torch.tensor([[0, -1], [-1, -1]], dtype=torch.int32, device="cuda")
             out = self._out(torch, 2, len(roles))
-            manager.fetch_sparse_pages(batch, self._buffers(roles), selected, out, handle)
+            batch.fetch_sparse_pages(self._buffers(roles), selected, out, handle)
             torch.cuda.synchronize()
 
             # Slot 0 carried a selection and resolved for both buffers of the member's row.
@@ -2039,18 +2039,18 @@ class TestSparseFetch(unittest.TestCase):
 
             # Row 0 selects two real units; row 1 holds no reservation and resolves nothing.
             both = torch.tensor([[0, 1], [-1, -1]], dtype=torch.int32, device="cuda")
-            manager.fetch_sparse_pages(batch, buffers, both, out, handle)
+            batch.fetch_sparse_pages(buffers, both, out, handle)
             torch.cuda.synchronize()
             self.assertEqual(batch.peek_hit_miss_counter(), (0, 2), "a cold cache misses both")
 
             # The same units are resident now, so the second fetch copies nothing.
-            manager.fetch_sparse_pages(batch, buffers, both, out, handle)
+            batch.fetch_sparse_pages(buffers, both, out, handle)
             torch.cuda.synchronize()
             self.assertEqual(batch.peek_hit_miss_counter(), (2, 2))
 
             # One real selection and one padded: the padding moves neither figure.
             padded = torch.tensor([[0, -1], [-1, -1]], dtype=torch.int32, device="cuda")
-            manager.fetch_sparse_pages(batch, buffers, padded, out, handle)
+            batch.fetch_sparse_pages(buffers, padded, out, handle)
             torch.cuda.synchronize()
             self.assertEqual(batch.peek_hit_miss_counter(), (3, 2))
 
@@ -2065,7 +2065,7 @@ class TestSparseFetch(unittest.TestCase):
             buffers = self._buffers(roles)
             out = self._out(torch, 2, len(roles))
             both = torch.tensor([[0, 1], [-1, -1]], dtype=torch.int32, device="cuda")
-            manager.fetch_sparse_pages(batch, buffers, both, out, handle)
+            batch.fetch_sparse_pages(buffers, both, out, handle)
             torch.cuda.synchronize()
             before = batch.peek_hit_miss_counter()
 
@@ -2083,12 +2083,12 @@ class TestSparseFetch(unittest.TestCase):
         with self._fixture(roles) as (torch, manager, batch, _cache, handle):
             forward = torch.tensor([[0, 1], [-1, -1]], dtype=torch.int32, device="cuda")
             first = self._out(torch, 2, len(roles))
-            manager.fetch_sparse_pages(batch, self._buffers(roles), forward, first, handle)
+            batch.fetch_sparse_pages(self._buffers(roles), forward, first, handle)
 
             # The same two units, named in the other order: the indices must follow.
             reverse = torch.tensor([[1, 0], [-1, -1]], dtype=torch.int32, device="cuda")
             second = self._out(torch, 2, len(roles))
-            manager.fetch_sparse_pages(batch, self._buffers(roles), reverse, second, handle)
+            batch.fetch_sparse_pages(self._buffers(roles), reverse, second, handle)
             torch.cuda.synchronize()
 
             self.assertEqual(int(first[0, 0, 0]), int(second[0, 0, 1]))
@@ -2099,7 +2099,7 @@ class TestSparseFetch(unittest.TestCase):
         with self._fixture(roles) as (torch, manager, batch, _cache, handle):
             selected = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32, device="cuda")
             out = self._out(torch, 2, len(roles))
-            manager.fetch_sparse_pages(batch, self._buffers(roles), selected, out, handle)
+            batch.fetch_sparse_pages(self._buffers(roles), selected, out, handle)
             torch.cuda.synchronize()
             self.assertTrue(
                 bool((out[1] == BAD_PAGE_INDEX).all()),
@@ -2117,7 +2117,7 @@ class TestSparseFetch(unittest.TestCase):
         with self._fixture(roles) as (torch, manager, batch, _cache, handle):
             selected = torch.tensor([[0, 1], [-1, -1]], dtype=torch.int32, device="cuda")
             out = self._out(torch, 2, len(roles))
-            manager.fetch_sparse_pages(batch, self._buffers(roles), selected, out, handle)
+            batch.fetch_sparse_pages(self._buffers(roles), selected, out, handle)
             torch.cuda.synchronize()
 
             for slot in (0, 1):
@@ -2131,9 +2131,9 @@ class TestSparseFetch(unittest.TestCase):
         with self._fixture(roles) as (torch, manager, batch, _cache, handle):
             selected = torch.tensor([[0, -1], [-1, -1]], dtype=torch.int32, device="cuda")
             first = self._out(torch, 2, len(roles))
-            manager.fetch_sparse_pages(batch, self._buffers(roles), selected, first, handle)
+            batch.fetch_sparse_pages(self._buffers(roles), selected, first, handle)
             second = self._out(torch, 2, len(roles))
-            manager.fetch_sparse_pages(batch, self._buffers(roles), selected, second, handle)
+            batch.fetch_sparse_pages(self._buffers(roles), selected, second, handle)
             torch.cuda.synchronize()
             self.assertEqual(int(first[0, 0, 0]), int(second[0, 0, 0]))
 
@@ -2148,7 +2148,7 @@ class TestSparseFetch(unittest.TestCase):
 
             selected = torch.tensor([[0, 1], [-1, -1]], dtype=torch.int32, device="cuda")
             out = self._out(torch, 2, len(roles))
-            manager.fetch_sparse_pages(batch, self._buffers(roles), selected, out, handle)
+            batch.fetch_sparse_pages(self._buffers(roles), selected, out, handle)
             torch.cuda.synchronize()
 
             after = _introspection.sparse_cache_resident_ordinals(cache, lg_id)
@@ -2162,8 +2162,8 @@ class TestSparseFetch(unittest.TestCase):
             # A subset would leave the buffers it omits stale while the metadata, which the
             # resolve updates for the whole layer, claimed they were resident.
             with self.assertRaises(ValueError):
-                manager.fetch_sparse_pages(
-                    batch, [BufferId(0, "key")], selected, self._out(torch, 2, 1), handle
+                batch.fetch_sparse_pages(
+                    [BufferId(0, "key")], selected, self._out(torch, 2, 1), handle
                 )
 
     def test_selected_must_carry_one_row_per_batch_row(self):
@@ -2178,15 +2178,15 @@ class TestSparseFetch(unittest.TestCase):
             selected = torch.full((4, self.SELECTED), -1, dtype=torch.int32, device="cuda")
             out = self._out(torch, 4, len(roles))
             with self.assertRaises(ValueError):
-                manager.fetch_sparse_pages(batch, self._buffers(roles), selected, out, handle)
+                batch.fetch_sparse_pages(self._buffers(roles), selected, out, handle)
 
     def test_out_must_carry_one_row_per_buffer(self):
         roles = ("key", "value")
         with self._fixture(roles) as (torch, manager, batch, _cache, handle):
             selected = torch.tensor([[0, -1], [-1, -1]], dtype=torch.int32, device="cuda")
             with self.assertRaises(ValueError):
-                manager.fetch_sparse_pages(
-                    batch, self._buffers(roles), selected, self._out(torch, 2, 1), handle
+                batch.fetch_sparse_pages(
+                    self._buffers(roles), selected, self._out(torch, 2, 1), handle
                 )
 
 
@@ -2976,7 +2976,7 @@ class TestSparseDataPath(unittest.TestCase):
                 batch.publish()
                 selected = torch.tensor([[ordinal, -1]], dtype=torch.int32, device="cuda")
                 out = torch.full((1, 1, self.SELECTED), 12345, dtype=torch.int32, device="cuda")
-                manager.fetch_sparse_pages(batch, [BufferId(0, "key")], selected, out, handle)
+                batch.fetch_sparse_pages([BufferId(0, "key")], selected, out, handle)
                 torch.cuda.synchronize()
 
                 index = int(out[0][0][0])
@@ -3027,7 +3027,7 @@ class TestSparseDataPath(unittest.TestCase):
                 batch.publish()
                 selected = torch.tensor([[-1, -1]], dtype=torch.int32, device="cuda")
                 out = torch.full((1, 1, self.SELECTED), 12345, dtype=torch.int32, device="cuda")
-                manager.fetch_sparse_pages(batch, [BufferId(0, "key")], selected, out, handle)
+                batch.fetch_sparse_pages([BufferId(0, "key")], selected, out, handle)
                 torch.cuda.synchronize()
 
                 resident = _introspection.sparse_cache_resident_ordinals(cache, lg)
@@ -3152,7 +3152,7 @@ class TestSparseWriteIndices(unittest.TestCase):
                 batch.publish()
 
                 out = torch.full((1, 1), 12345, dtype=torch.int32, device="cuda")
-                manager.prepare_sparse_write_indices(batch, [BufferId(0, "key")], out, handle)
+                batch.prepare_sparse_write_indices([BufferId(0, "key")], out, handle)
                 torch.cuda.synchronize()
                 index = int(out[0][0])
                 self.assertNotEqual(index, BAD_PAGE_INDEX, "a unit is in flight")
@@ -3208,7 +3208,7 @@ class TestSparseWriteIndices(unittest.TestCase):
                 seen = []
                 for _ in range(3):
                     out = torch.full((1, 1), 12345, dtype=torch.int32, device="cuda")
-                    manager.prepare_sparse_write_indices(batch, [BufferId(0, "key")], out, handle)
+                    batch.prepare_sparse_write_indices([BufferId(0, "key")], out, handle)
                     torch.cuda.synchronize()
                     seen.append(int(out[0][0]))
                 self.assertNotEqual(seen[0], BAD_PAGE_INDEX)
@@ -3244,7 +3244,7 @@ class TestSparseWriteIndices(unittest.TestCase):
                 batch.publish()
 
                 out = torch.full((2, 1), 12345, dtype=torch.int32, device="cuda")
-                manager.prepare_sparse_write_indices(batch, [BufferId(0, "key")], out, handle)
+                batch.prepare_sparse_write_indices([BufferId(0, "key")], out, handle)
                 torch.cuda.synchronize()
                 self.assertEqual(
                     int(out[0][0]), BAD_PAGE_INDEX, "capacity holds no unit above history"
@@ -3320,8 +3320,8 @@ class TestSparseWriteIndices(unittest.TestCase):
                 batch.publish()
 
                 out = torch.full((1, 2), 12345, dtype=torch.int32, device="cuda")
-                manager.prepare_sparse_write_indices(
-                    batch, [BufferId(0, "key"), BufferId(0, "value")], out, handle
+                batch.prepare_sparse_write_indices(
+                    [BufferId(0, "key"), BufferId(0, "value")], out, handle
                 )
                 torch.cuda.synchronize()
                 got = [int(out[0][0]), int(out[0][1])]
@@ -3397,8 +3397,8 @@ class TestSparseWriteIndices(unittest.TestCase):
                 indices = []
                 for layer in range(layers):
                     out = torch.full((1, 1), 12345, dtype=torch.int32, device="cuda")
-                    manager.prepare_sparse_write_indices(
-                        batch, [BufferId(LayerId(layer), "key")], out, handle
+                    batch.prepare_sparse_write_indices(
+                        [BufferId(LayerId(layer), "key")], out, handle
                     )
                     torch.cuda.synchronize()
                     indices.append(int(out[0][0]))
@@ -3464,7 +3464,7 @@ class TestSparseWriteIndices(unittest.TestCase):
                 batch.publish()
 
                 out = torch.full((1, 1), 12345, dtype=torch.int32, device="cuda")
-                manager.prepare_sparse_write_indices(batch, [BufferId(0, "key")], out, handle)
+                batch.prepare_sparse_write_indices([BufferId(0, "key")], out, handle)
                 torch.cuda.synchronize()
                 index = int(out[0][0])
                 self.assertNotEqual(index, BAD_PAGE_INDEX)
@@ -3493,11 +3493,11 @@ class TestSparseWriteIndices(unittest.TestCase):
                 # cell the reservation has beyond the one in flight.
                 selected = torch.tensor([[0, 1]], dtype=torch.int32, device="cuda")
                 fetched = torch.full((1, 1, self.SELECTED), 12345, dtype=torch.int32, device="cuda")
-                manager.fetch_sparse_pages(batch, [BufferId(0, "key")], selected, fetched, handle)
+                batch.fetch_sparse_pages([BufferId(0, "key")], selected, fetched, handle)
                 torch.cuda.synchronize()
 
                 after = torch.full((1, 1), 12345, dtype=torch.int32, device="cuda")
-                manager.prepare_sparse_write_indices(batch, [BufferId(0, "key")], after, handle)
+                batch.prepare_sparse_write_indices([BufferId(0, "key")], after, handle)
                 torch.cuda.synchronize()
                 self.assertEqual(int(after[0][0]), index, "the fetch moved the in-flight cell")
 
@@ -3622,8 +3622,7 @@ class TestSparseQuantisedDataPath(unittest.TestCase):
                 batch.publish()
                 selected = torch.tensor([[ordinal, -1]], dtype=torch.int32, device="cuda")
                 out = torch.full((1, 2, self.SELECTED), 12345, dtype=torch.int32, device="cuda")
-                manager.fetch_sparse_pages(
-                    batch,
+                batch.fetch_sparse_pages(
                     [BufferId(0, "key"), BufferId(0, "key_scale")],
                     selected,
                     out,
@@ -3681,8 +3680,7 @@ class TestSparseQuantisedDataPath(unittest.TestCase):
                 batch.publish()
                 selected = torch.tensor([[-1, -1]], dtype=torch.int32, device="cuda")
                 out = torch.full((1, 2, self.SELECTED), 12345, dtype=torch.int32, device="cuda")
-                manager.fetch_sparse_pages(
-                    batch,
+                batch.fetch_sparse_pages(
                     [BufferId(0, "key"), BufferId(0, "key_scale")],
                     selected,
                     out,
