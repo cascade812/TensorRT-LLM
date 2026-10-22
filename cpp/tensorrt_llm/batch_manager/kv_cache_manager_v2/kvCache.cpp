@@ -1027,6 +1027,14 @@ void KvCache::close()
     TLLM_CHECK_DEBUG(_checkSanity());
     if (mStatus == Status::CLOSED)
         return;
+    // Clearing the blocks below writes kBadPageIndex through the bound Span, which for a
+    // member is the Batch's staged row, and the row would then name a cache that no longer
+    // holds anything. Refused for the same reason suspend() and resume() are; the
+    // destructor detaches first, so it never arrives here seated.
+    if (mBatch != nullptr)
+    {
+        throw LogicError("A KvCache in a Batch cannot be closed; remove it from the Batch first");
+    }
 
     mOptionalCandidates.clear();
     discardPendingStats();
@@ -1619,8 +1627,12 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     }
 
     bool const recordGenerationAllocStats = mGenerationAllocReady && newCap > mCapacity;
-    if (!enableScratch && _shortcutSetCapacity(newCap) && _shortcutSetHistoryLength(newHist))
+    // Both asked before either is applied: taking the capacity and then finding the history
+    // needs blocks would drop into the slow path below with mCapacity already advanced.
+    if (!enableScratch && _canShortcutCapacity(newCap) && _canShortcutHistoryLength(newHist))
     {
+        mCapacity = newCap;
+        mHistoryLength = newHist;
         _refreshGenerationAllocReady();
         return true;
     }
@@ -1881,18 +1893,15 @@ void KvCache::setHistoryLength(int hist)
     (void) success;
 }
 
-bool KvCache::_shortcutSetCapacity(int newCap)
+bool KvCache::_canShortcutCapacity(int newCap) const
 {
     if (newCap == mCapacity)
         return true;
     // No shortcut if block count changes.
-    if (divUp(newCap, mTokensPerBlock) != divUp(mCapacity, mTokensPerBlock))
-        return false;
-    mCapacity = newCap;
-    return true;
+    return divUp(newCap, mTokensPerBlock) == divUp(mCapacity, mTokensPerBlock);
 }
 
-bool KvCache::_shortcutSetHistoryLength(int newHist)
+bool KvCache::_canShortcutHistoryLength(int newHist) const
 {
     if (newHist == mHistoryLength)
         return true;
@@ -1921,7 +1930,6 @@ bool KvCache::_shortcutSetHistoryLength(int newHist)
         if (changed)
             return false;
     }
-    mHistoryLength = newHist;
     return true;
 }
 

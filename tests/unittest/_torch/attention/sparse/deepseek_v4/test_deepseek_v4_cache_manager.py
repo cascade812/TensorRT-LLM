@@ -752,20 +752,23 @@ def test_sparse_descriptors_allow_different_groups_and_pool_geometry() -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    ("first", "last"), [(True, False), (False, False), (False, True), (True, True)]
-)
+@pytest.mark.parametrize("gen_init", [False, True])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_chunked_prefill_checked_from_scheduled_request(first, last, enabled):
+def test_prefill_rejected_from_scheduled_request(gen_init, enabled):
+    """Offload serves generation only, so a context request that runs a forward is refused.
+
+    A disaggregated gen-init request is the exception: it is resized and its KV
+    transferred before it joins the Batch, so it runs no forward this step.
+    """
     manager = _manager()
     manager._enable_kv_cache_offload = enabled
     batch = SimpleNamespace(
         context_requests=[
             SimpleNamespace(
                 py_request_id=20,
-                is_first_context_chunk=first,
-                is_last_context_chunk=last,
-                is_disagg_generation_init_state=False,
+                is_first_context_chunk=True,
+                is_last_context_chunk=True,
+                is_disagg_generation_init_state=gen_init,
             )
         ],
         generation_requests=[],
@@ -774,18 +777,16 @@ def test_chunked_prefill_checked_from_scheduled_request(first, last, enabled):
         patch.object(KVCacheManagerV2, "prepare_resources") as prepare,
         patch.object(manager, "_prepare_sparse_batch") as publish,
     ):
-        if enabled and not (first and last):
-            with pytest.raises(NotImplementedError, match="chunked prefill"):
+        if enabled and not gen_init:
+            with pytest.raises(NotImplementedError, match="generation only"):
                 manager.prepare_resources(batch)
             prepare.assert_not_called()
             publish.assert_not_called()
         else:
             manager.prepare_resources(batch)
             prepare.assert_called_once_with(batch)
-            if enabled:
-                publish.assert_called_once_with([20])
-            else:
-                publish.assert_not_called()
+            # Nothing runs a forward here, so no batch is published either way.
+            publish.assert_not_called()
 
 
 class _SchedulingBatch:
@@ -1309,11 +1310,17 @@ def test_sparse_batch_publishes_updated_history_on_next_step(sparse_scheduling_c
     cache.history_length, cache.capacity = 7, 8
     request.context_current_position = 8
     request.max_beam_num_tokens = 9  # The sampled output token does not yet have KV.
+    # Offload serves generation only, so the context side of this is reached solely by a
+    # disaggregated gen-init request: resized and transferred before it joins the Batch, it
+    # runs no forward and nothing is published for it until it becomes a generation request.
+    request.is_disagg_generation_init_state = context
     case.scheduled.context_requests = [request] if context else []
     case.scheduled.generation_requests = [] if context else [request]
     manager.prepare_resources(case.scheduled)
-    batch = manager.get_sparse_batch([20])
-    assert batch.snapshots[-1][0][1:3] == (7, 8)
+    batch = None
+    if not context:
+        batch = manager.get_sparse_batch([20])
+        assert batch.snapshots[-1][0][1:3] == (7, 8)
 
     if context:
         manager.update_context_resources(case.scheduled)
@@ -1322,15 +1329,19 @@ def test_sparse_batch_publishes_updated_history_on_next_step(sparse_scheduling_c
         manager.update_resources(case.scheduled)
     assert cache.history_length == cache.capacity == 8
     assert cache.page_index_owner == ("runtime" if context else "batch")
-    assert not batch.upload_pending
+    if batch is not None:
+        assert not batch.upload_pending
 
     # Scheduling reserves the next input token after the completed history update.
     assert cache.resize(9, None)
+    request.is_disagg_generation_init_state = False
     case.scheduled.context_requests = []
     case.scheduled.generation_requests = [request]
     manager.prepare_resources(case.scheduled)
-    assert manager.get_sparse_batch([20]) is batch
-    assert batch.snapshots[-1][0][1:3] == (8, 9)
+    stepped = manager.get_sparse_batch([20])
+    if batch is not None:
+        assert stepped is batch
+    assert stepped.snapshots[-1][0][1:3] == (8, 9)
 
 
 @pytest.mark.cpu_only

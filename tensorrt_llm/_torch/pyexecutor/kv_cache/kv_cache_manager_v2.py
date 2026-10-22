@@ -1765,26 +1765,6 @@ class KVCacheManagerV2(BaseResourceManager):
         ):
             quota = int(kv_cache_config.max_gpu_total_bytes)
             logger.info(f"max_gpu_total_bytes is provided. New quota is {quota / (1 << 30)}GiB")
-            if reserved_bytes > 0:
-                reserved = (
-                    f"{reserved_arena_bytes / (1 << 30):.2f}GiB of sparse cache arena for "
-                    f"{self.max_batch_size} leases and "
-                    f"{self._sparse_batch_buffer_bytes / (1 << 30):.2f}GiB of offload buffers for "
-                    f"max_batch_size={self.max_batch_size}"
-                )
-                if reserved_bytes >= quota:
-                    # Raised below, once every rank has sized its offload.
-                    offload_error = ValueError(
-                        f"Sparse KV cache offload needs {reserved}, more than the "
-                        f"{quota / (1 << 30):.2f}GiB device KV budget. Lower max_batch_size or "
-                        "the sparse cache size, or raise the device KV budget."
-                    )
-                else:
-                    quota -= reserved_bytes
-                    logger.info(
-                        f"Reserved {reserved} from the device KV budget. "
-                        f"New quota is {quota / (1 << 30)}GiB"
-                    )
         if kv_cache_config.max_tokens is not None:
             quota_from_max_tokens = int(
                 math.ceil(
@@ -1798,6 +1778,30 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"Allowed quota from max_tokens is {quota_from_max_tokens / (1 << 30)}GiB. "
                 f"New quota is {quota / (1 << 30)}GiB"
             )
+
+        # Taken from whichever budget bound above, rather than from max_gpu_total_bytes
+        # alone: the arenas and buffers sit beside the pools either way, so a quota that
+        # came from max_tokens has to pay for them too.
+        if reserved_bytes > 0 and quota < sys.maxsize:
+            reserved = (
+                f"{reserved_arena_bytes / (1 << 30):.2f}GiB of sparse cache arena for "
+                f"{self.max_batch_size} leases and "
+                f"{self._sparse_batch_buffer_bytes / (1 << 30):.2f}GiB of offload buffers for "
+                f"max_batch_size={self.max_batch_size}"
+            )
+            if reserved_bytes >= quota:
+                # Raised below, once every rank has sized its offload.
+                offload_error = ValueError(
+                    f"Sparse KV cache offload needs {reserved}, more than the "
+                    f"{quota / (1 << 30):.2f}GiB device KV budget. Lower max_batch_size or "
+                    "the sparse cache size, or raise the device KV budget."
+                )
+            else:
+                quota -= reserved_bytes
+                logger.info(
+                    f"Reserved {reserved} from the device KV budget. "
+                    f"New quota is {quota / (1 << 30)}GiB"
+                )
 
         assert quota < sys.maxsize, (
             "Quota not set. Check kv_cache_config.max_tokens or kv_cache_config.max_gpu_total_bytes"
@@ -6730,6 +6734,10 @@ class KVCacheManagerV2(BaseResourceManager):
         return bool(has_invalid_values)
 
     def shutdown(self):
+        # Before the caches close: a lender waiting on a lease has to be told to stop while
+        # the caches it lent against are still alive.
+        if self._sharing is not None:
+            self._sharing._on_shutdown()
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()

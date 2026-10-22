@@ -1035,6 +1035,11 @@ int Batch::addKvCache(KvCache& kvCache, int requestedRow)
     }
 
     _seedRowWatermarks(row, kvCache.historyLength(), kvCache.capacity());
+    // A seating member brings no in-flight units: its lease is fresh, so everything its
+    // history names already lives in the pages behind it. Seeding from the history is what
+    // lets the row be reused -- the departing member leaves this equal to its own history,
+    // and without this the next occupant would inherit that number.
+    mFlushedHistory[static_cast<size_t>(row)] = kvCache.historyLength();
 
     // Joining is a stream change, so it carries the same cross-stream sync a direct move
     // would: work the member already enqueued has to retire before the Batch's stream
@@ -1090,6 +1095,19 @@ std::shared_ptr<KvCache> Batch::removeKvCache(KvCache& kvCache)
     }
     waitPublished();
     int const row = kvCache.mBatchRow;
+    // Checked before anything is touched, so a rejected removal leaves the batch as it was.
+    //
+    // Flushing a history the member never takes up is pointless, so the two agreeing is what
+    // a member that has written back everything it means to keep looks like. The leases
+    // released below discard the GPU cache, and the next occupant seeds its own watermark
+    // from its own history, so anything still pending here has no later chance to be noticed.
+    if (std::ranges::any_of(kvCache.mSparseCache, [](SparseCacheLease const& lease) { return !lease.empty(); }))
+    {
+        TLLM_CHECK_WITH_INFO(kvCache.historyLength() == mFlushedHistory[static_cast<size_t>(row)],
+            "A sparse KvCache leaving row %d has history %d against %d written back; call "
+            "Batch::flushSparseUnits() with the current history before removing it",
+            row, kvCache.historyLength(), mFlushedHistory[static_cast<size_t>(row)]);
+    }
     // Held until the end: clearing the row below drops the Batch's reference, and the rest
     // of this runs against the member.
     auto leaving = std::move(mRows[static_cast<size_t>(row)]);

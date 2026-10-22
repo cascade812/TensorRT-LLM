@@ -2644,6 +2644,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             std::optional<kv::SecondaryPoolBudget> second;
             if (secondQuota.has_value() || secondPools.has_value())
             {
+                // Omitting the pools means every pool, which would charge the whole layout to
+                // the second budget and leave `quota` paying for nothing. That is never what a
+                // caller naming a second quota wants, so it has to say which pools it covers.
+                TLLM_CHECK_WITH_INFO(secondPools.has_value(),
+                    "second_quota needs second_pools: without it every pool is charged to the "
+                    "second budget and the primary quota pays for nothing");
                 kv::SecondaryPoolBudget budget;
                 budget.quota = secondQuota;
                 budget.granularity = secondGranularity.value_or(granularity);
@@ -2726,6 +2732,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "consumer that needs the same numbers, which leaves one buffer with one writer and a "
             "member's binding alive for the whole decode.")
         .def("add_kv_cache", &kv::Batch::addKvCache, nb::arg("kv_cache"), nb::arg("row") = -1,
+            nb::call_guard<nb::gil_scoped_release>(),
             "Seat a cache in `row`, or in the lowest free row when it is negative, returning the "
             "row. Raises when the row is taken or out of range, the batch is full, or the cache "
             "already belongs to a batch.\n\n"
@@ -2739,7 +2746,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "pressure, not as an error.")
         .def(
             "remove_kv_cache", [](kv::Batch& self, kv::KvCache& kvCache) { return self.removeKvCache(kvCache); },
-            nb::arg("kv_cache"),
+            nb::arg("kv_cache"), nb::call_guard<nb::gil_scoped_release>(),
             "Free the cache's row, leaving a hole for reuse, and return the cache. Raises when it "
             "is not a member.\n\n"
             "Returns the arena lease, which discards whatever the GPU cache held: a lease comes "
@@ -2747,6 +2754,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "keeping.")
         .def(
             "remove_row", [](kv::Batch& self, int row) { return self.removeKvCache(row); }, nb::arg("row"),
+            nb::call_guard<nb::gil_scoped_release>(),
             "The same, by the row add_kv_cache returned. None when nothing is seated there, so a "
             "caller sweeping rows need not ask twice about each one.")
         .def("move", &kv::Batch::move, nb::arg("dst_row"), nb::arg("src_row"), nb::call_guard<nb::gil_scoped_release>(),
@@ -3155,7 +3163,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 nb::gil_scoped_release rel;
                 self.prepareSparseWriteIndices(batch, buffers, outPtr, handle);
             },
-            nb::arg("batch"), nb::arg("buffers"), nb::arg("out"), nb::arg("stream") = nb::none(),
+            nb::arg("batch"), nb::arg("buffers"), nb::arg("out").noconvert(), nb::arg("stream") = nb::none(),
             "Give each request's in-flight unit a cell, and report where to write it.\n\n"
             "The unit between the two watermarks is the one the model is about to produce. It has no "
             "host copy yet -- a unit reaches its page only when resize() carries the watermark past "
@@ -3206,7 +3214,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 nb::gil_scoped_release rel;
                 self.fetchSparsePages(batch, buffers, selectedPtr, width, outPtr, handle);
             },
-            nb::arg("batch"), nb::arg("buffers"), nb::arg("selected"), nb::arg("out"), nb::arg("stream") = nb::none(),
+            nb::arg("batch"), nb::arg("buffers"), nb::arg("selected"), nb::arg("out").noconvert(),
+            nb::arg("stream") = nb::none(),
             "Resolve a batch's selections against each buffer's per-request history cache.\n\n"
             "buffers must be exactly one layer's sparse buffers, in the cache's order. One layer, "
             "not one layer group, because a layer's selection is computed from the previous "

@@ -665,8 +665,11 @@ private:
     std::vector<ActivePage> _activePages() const;
     SharedPtr<Page> _page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycleId lcId) const;
 
-    bool _shortcutSetCapacity(int capacity);
-    bool _shortcutSetHistoryLength(int historyLength);
+    //! Whether the new value can be taken without touching blocks. Both are asked before
+    //! either is applied, so a resize that only one of them can shortcut leaves neither
+    //! changed and the slow path still sees the original state.
+    [[nodiscard]] bool _canShortcutCapacity(int capacity) const;
+    [[nodiscard]] bool _canShortcutHistoryLength(int historyLength) const;
     bool _shouldRecordManagerStats() const;
     bool _shouldRecordRequestStats() const;
     bool _shouldRecordStats() const;

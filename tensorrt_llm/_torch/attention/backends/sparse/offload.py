@@ -354,13 +354,18 @@ class SparseOffloadCacheMixin:
         if self._sparse_batch is not None:
             self._sparse_batch.wait_published()
         if self._enable_kv_cache_offload and any(
-            not (request.is_first_context_chunk and request.is_last_context_chunk)
+            not request.is_disagg_generation_init_state
             for request in scheduled_batch.context_requests
         ):
-            # Attention metadata's prompt_lens contains the current chunk's
-            # length, so only the scheduled request can identify a first chunk
-            # that does not complete its prompt. Reject before model writes.
-            raise NotImplementedError("Sparse offload does not support chunked prefill")
+            # An offloading worker admits one query token per request per step, so it serves
+            # the decode phase and runs no context batch. Disaggregated gen-init requests are
+            # the exception only because they run no forward: they are resized and their KV
+            # transferred before they join the Batch. Rejected here rather than in the
+            # compressor, which sees this as a bare context count once the model is already
+            # writing.
+            raise NotImplementedError(
+                "Sparse offload does not support prefill; it serves generation only"
+            )
         super().prepare_resources(scheduled_batch)
         if not self._enable_kv_cache_offload:
             return
@@ -948,6 +953,10 @@ class SparseOffloadCacheMixin:
             if (
                 descriptor.scale_buffer_index is not None
                 and layer_idx not in self._paired_write_layers
+                # With no member seated every row is dead, so the comparison could not
+                # retire the layer and the sync that reads it would be pure cost. Warmup
+                # steps run that way, once per layer per step.
+                and self._sparse_batch_members
                 and not torch.cuda.is_current_stream_capturing()
             ):
                 self._check_paired_write_indices(out, descriptor, layer_idx)

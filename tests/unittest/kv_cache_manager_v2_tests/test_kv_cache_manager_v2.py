@@ -2963,6 +2963,9 @@ class TestSparseDataPath(unittest.TestCase):
                 )
                 self.assertEqual(int(err), 0)
                 self.assertEqual(bytes(got), pattern, "the cell does not hold its page's bytes")
+                # Removal returns the lease and discards the GPU cache, so the
+                # write-back record has to match the history being given up.
+                batch.flush_sparse_units([4 * self.TPB])
                 batch.remove_kv_cache(cache)
         finally:
             if cache is not None:
@@ -3182,6 +3185,9 @@ class TestSparseWriteIndices(unittest.TestCase):
                     seen.append(int(out[0][0]))
                 self.assertNotEqual(seen[0], BAD_PAGE_INDEX)
                 self.assertEqual(len(set(seen)), 1, f"the cell moved between calls: {seen}")
+                # Removal returns the lease and discards the GPU cache, so the
+                # write-back record has to match the history being given up.
+                batch.flush_sparse_units([self.TPB - 1])
                 batch.remove_kv_cache(cache)
         finally:
             if cache is not None:
@@ -3219,6 +3225,9 @@ class TestSparseWriteIndices(unittest.TestCase):
                 self.assertEqual(
                     int(out[1][0]), BAD_PAGE_INDEX, "a free row carries no reservation"
                 )
+                # Removal returns the lease and discards the GPU cache, so the
+                # write-back record has to match the history being given up.
+                batch.flush_sparse_units([self.TPB, 0])
                 batch.remove_kv_cache(cache)
         finally:
             if cache is not None:
@@ -3292,6 +3301,9 @@ class TestSparseWriteIndices(unittest.TestCase):
                     BAD_PAGE_INDEX, got, f"both buffers hold the in-flight unit: {got}"
                 )
                 self.assertEqual(len(set(got)), 2, f"buffers must not share a cell: {got}")
+                # Removal returns the lease and discards the GPU cache, so the
+                # write-back record has to match the history being given up.
+                batch.flush_sparse_units([self.TPB - 1])
                 batch.remove_kv_cache(cache)
         finally:
             if cache is not None:
@@ -3375,6 +3387,9 @@ class TestSparseWriteIndices(unittest.TestCase):
                     list(range(runs[0], runs[0] + layers)),
                     f"cell runs are not per buffer: {indices}",
                 )
+                # Removal returns the lease and discards the GPU cache, so the
+                # write-back record has to match the history being given up.
+                batch.flush_sparse_units([self.TPB - 1])
                 batch.remove_kv_cache(cache)
         finally:
             if cache is not None:
@@ -3468,6 +3483,9 @@ class TestSparseWriteIndices(unittest.TestCase):
                 )
                 self.assertEqual(int(err), 0)
                 self.assertEqual(bytes(got), written, "the fetch overwrote the in-flight cell")
+                # Removal returns the lease and discards the GPU cache, so the
+                # write-back record has to match the history being given up.
+                batch.flush_sparse_units([3 * self.TPB - 1])
                 batch.remove_kv_cache(cache)
         finally:
             if cache is not None:
@@ -3601,6 +3619,9 @@ class TestSparseQuantisedDataPath(unittest.TestCase):
                     self.assertEqual(
                         bytes(got), patterns[role], f"{role}'s cell does not hold its page"
                     )
+                # Removal returns the lease and discards the GPU cache, so the
+                # write-back record has to match the history being given up.
+                batch.flush_sparse_units([4 * self.TPB])
                 batch.remove_kv_cache(cache)
         finally:
             if cache is not None:
