@@ -514,8 +514,30 @@ public:
         return getUniformAttribute(offTier, [this](int pool) { return poolMedium(PoolIndex{pool}); });
     }
 
-    //! Bytes this group holds in pools whose pages are `medium`, each rounded up to that
-    //! medium's grain. Pools of any other medium contribute nothing.
+    //! Bytes this group would hold at `slots`, each pool rounded to its own allocator's
+    //! grain. An absent `medium` counts every pool; a named one counts only its own.
+    //! Stated at each call rather than defaulted: the two are different questions.
+    //!
+    //! One slot count for every pool, though pools can report different counts: each
+    //! rounds its own allocation up to its own grain, so the excess is under one grain and
+    //! rounding returns the allocation whichever count is used. That is what lets the
+    //! current-state total below share this.
+    [[nodiscard]] size_t roundedBytesWith(SlotCount slots, std::optional<CacheTier> medium) const
+    {
+        size_t total = 0;
+        for (auto const& pool : mPools)
+        {
+            if (medium.has_value() && pool->medium() != *medium)
+            {
+                continue;
+            }
+            total += roundUp(slotCountToSizeT(slots) * pool->slotSize(), pool->sizeGranularity());
+        }
+        return total;
+    }
+
+    //! Bytes this group holds now in pools whose pages are `medium`. Pools of any other
+    //! medium contribute nothing.
     //!
     //! Bytes of different media are not comparable -- they are paid for from different
     //! budgets and rounded to different grains -- so every caller measuring them names the
@@ -523,13 +545,12 @@ public:
     //! roundedNumBytes(HOST_MEM) on a GPU-tier group is what it holds in host pages besides.
     [[nodiscard]] size_t roundedNumBytes(CacheTier medium) const
     {
-        size_t const grain = poolSizeGranularity(medium);
         size_t total = 0;
-        for (PoolIndex pool{0}; pool < mPools.size(); ++pool)
+        for (auto const& pool : mPools)
         {
-            if (poolMedium(pool) == medium)
+            if (pool->medium() == medium)
             {
-                total += roundUp(mPools.at(pool)->numBytes(), grain);
+                total += roundUp(pool->numBytes(), pool->sizeGranularity());
             }
         }
         return total;
@@ -697,6 +718,10 @@ public:
     //! medium's grain. Every group of a level is of the level's tier, so the media
     //! reachable here are this tier's own and, on a device level, the host pages its
     //! host-backed pools hold.
+    //!
+    //! At cacheTier() this is what the level's quota pays for. Host-backed pools of a
+    //! device level fall outside it, which is the point: a rebalance given an inflated
+    //! figure would hand the level more slots than the device can hold.
     [[nodiscard]] size_t roundedNumBytes(CacheTier medium) const
     {
         size_t total = 0;
@@ -721,9 +746,6 @@ public:
     }
 
     //! The grain the second medium's pools round to, or 0 when this level has none.
-    //!
-    //! Distinct from poolSizeGranularity(), which is the quantum this level's own quota is
-    //! expressed in. The two media round differently, which is why a budget carries its own.
     [[nodiscard]] size_t secondaryMediumGranularity() const
     {
         auto const medium = secondaryMedium();
@@ -733,38 +755,21 @@ public:
         }
         for (auto const& pg : mPoolGroups)
         {
-            if (pg->secondaryMedium() == medium)
+            if (size_t const grain = pg->poolSizeGranularity(*medium); grain != 0)
             {
-                return pg->poolSizeGranularity(*medium);
+                return grain;
             }
         }
         return 0;
     }
 
-    //! Bytes this level holds in pools of a second medium, which its quota does not pay
-    //! for. Zero unless some group has one, so a host level answers zero rather than its
-    //! whole size.
-    [[nodiscard]] size_t secondaryMediumBytes() const
-    {
-        size_t total = 0;
-        for (auto const& pg : mPoolGroups)
-        {
-            if (auto const medium = pg->secondaryMedium())
-            {
-                total += pg->roundedNumBytes(*medium);
-            }
-        }
-        return total;
-    }
-
-    //! Bytes this level's quota is paying for: the pools on its own medium. Host-backed
-    //! pools of a device level are excluded -- the quota measures one medium, and a
-    //! rebalance that defaulted to an inflated figure would hand the level more slots
-    //! than the device can hold.
-    [[nodiscard]] size_t totalQuota() const
-    {
-        return roundedNumBytes(cacheTier());
-    }
+    //! The quantum this level's quota is expressed in, for the arithmetic that divides a
+    //! budget across pool groups.
+    //!
+    //! Configured, not read off a pool: a pool's own grain is this adjusted for its slot
+    //! size (see hostCommitUnit), so the two differ and a quota quantized to a pool's
+    //! grain would round to a figure the level never asked for.
+    [[nodiscard]] virtual size_t poolSizeGranularity() const noexcept = 0;
 
     // Returns numSlots() per pool group.
     TypedVec<PoolGroupIndex, SlotCount> slotCountList() const
@@ -776,34 +781,33 @@ public:
         return ret;
     }
 
-    //! The pools of a second medium -- the ones this level's quota does not pay for --
-    //! as indices into slotSizeLists()[pg].
+    //! The pools whose pages are `medium`, as indices into slotSizeLists()[pg]. An absent
+    //! `medium` names no pools, which is what a level that has none should contribute.
     //!
-    //! Empty everywhere but the hot level, the only one whose pools can differ from its
-    //! tier: a cold group is a single pool holding whatever the codec packs into it,
-    //! whatever the buffers were declared, and so is a GPU tier that happens to be a cold
-    //! level. A hot level with no host-backed pool answers empty too.
+    //! Takes an optional so it composes with secondaryMedium(). Pass that rather than a
+    //! literal when you mean "the pools this level's quota does not pay for": on a host
+    //! level every pool is HOST_MEM, yet none of them is a second medium.
     //!
-    //! The complement is what this level's quota pays for, which the allocator derives
-    //! rather than taking: that way no pool can be charged twice or missed.
-    [[nodiscard]] TypedVec<PoolGroupIndex, std::vector<PoolIndex>> poolsOfSecondaryMedium() const
+    //! The complement is what the quota pays for, which the allocator derives rather than
+    //! taking: that way no pool can be charged twice or missed.
+    [[nodiscard]] TypedVec<PoolGroupIndex, std::vector<PoolIndex>> poolsOfMedium(std::optional<CacheTier> medium) const
     {
         TypedVec<PoolGroupIndex, std::vector<PoolIndex>> ret;
         ret.reserve(mPoolGroups.size());
         for (auto const& pg : mPoolGroups)
         {
-            std::vector<PoolIndex> secondary;
-            if (auto const medium = pg->secondaryMedium())
+            std::vector<PoolIndex> matching;
+            if (medium.has_value())
             {
                 for (PoolIndex pool{0}; pool < pg->slotSize().size(); ++pool)
                 {
                     if (pg->poolMedium(pool) == *medium)
                     {
-                        secondary.push_back(pool);
+                        matching.push_back(pool);
                     }
                 }
             }
-            ret.push_back(std::move(secondary));
+            ret.push_back(std::move(matching));
         }
         return ret;
     }
@@ -829,26 +833,20 @@ public:
     //! This is the measure the pool ratio speaks in, and the one the allocator divides
     //! against. Measuring a host-backed pool in device grains instead -- they differ by up
     //! to 8192x -- would put the two sides of a rebalance's comparison in different units.
-    [[nodiscard]] TypedVec<PoolGroupIndex, size_t> allBytes(TypedVec<PoolGroupIndex, SlotCount> const& slotCounts) const
+    [[nodiscard]] TypedVec<PoolGroupIndex, size_t> allMediaBytes(
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCounts) const
     {
         TypedVec<PoolGroupIndex, size_t> ret(mPoolGroups.size(), 0);
         for (PoolGroupIndex pgIdx{0}; pgIdx < mPoolGroups.size(); ++pgIdx)
         {
-            auto const& pg = mPoolGroups[pgIdx];
-            size_t total = 0;
-            for (PoolIndex pool{0}; pool < pg->slotSize().size(); ++pool)
-            {
-                total += roundUp(slotCountToSizeT(slotCounts[pgIdx]) * pg->slotSize().at(pool),
-                    pg->poolSizeGranularity(pg->poolMedium(pool)));
-            }
-            ret[pgIdx] = total;
+            ret[pgIdx] = mPoolGroups[pgIdx]->roundedBytesWith(slotCounts[pgIdx], std::nullopt);
         }
         return ret;
     }
 
     //! Current ratio list: proportion of bytes per pool group.
     //!
-    //! Counts every pool, host-backed ones included -- unlike totalQuota(), which pays for
+    //! Counts every pool, host-backed ones included -- unlike the quota, which pays for
     //! the dense ones alone. The asymmetry is deliberate: this ratio is projected onto cold
     //! levels, where one pool holds dense and sparse buffers together, and it is what a
     //! rebalance compares its target against. Both sides of that comparison have to measure
@@ -861,7 +859,7 @@ public:
         {
             counts[pgIdx] = mPoolGroups[pgIdx]->numSlots();
         }
-        auto const bytes = allBytes(counts);
+        auto const bytes = allMediaBytes(counts);
         TypedVec<PoolGroupIndex, float> ret(mPoolGroups.size(), 0.f);
         float total = 0.f;
         for (PoolGroupIndex pgIdx{0}; pgIdx < mPoolGroups.size(); ++pgIdx)
@@ -874,14 +872,6 @@ public:
         for (auto& r : ret)
             r /= total;
         return ret;
-    }
-
-    //! The quantum this level's quota is expressed in, for the arithmetic that divides a
-    //! budget across pool groups. Not the grain any particular pool rounds to -- ask the
-    //! group's poolSizeGranularity(CacheTier) for that, which can differ within a group.
-    virtual size_t poolSizeGranularity() const noexcept
-    {
-        return kDiskPoolSizeGranularity;
     }
 
     //! Largest quota this level may be resized to, when it has one.
@@ -1008,6 +998,12 @@ public:
     CacheTier cacheTier() const noexcept override
     {
         return CacheTier::DISK;
+    }
+
+    //! Disk has no allocation unit to match, so this is a rounding quantum alone.
+    size_t poolSizeGranularity() const noexcept override
+    {
+        return kDiskPoolSizeGranularity;
     }
 
     std::string const& directory() const noexcept

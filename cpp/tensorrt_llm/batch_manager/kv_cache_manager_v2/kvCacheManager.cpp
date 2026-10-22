@@ -906,7 +906,8 @@ bool KvCacheManager::resize(CacheLevel level, size_t quota, bool bestEfforts)
 size_t KvCacheManager::getQuota(CacheLevel level) const
 {
     auto const apiLock = lockShared();
-    return mStorage->mLevels.at(level).storage->totalQuota();
+    auto const& storage = *mStorage->mLevels.at(level).storage;
+    return storage.roundedNumBytes(storage.cacheTier());
 }
 
 // ---- Statistics ----------------------------------------------------------

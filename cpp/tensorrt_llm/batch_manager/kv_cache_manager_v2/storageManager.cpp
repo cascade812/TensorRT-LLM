@@ -359,7 +359,8 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     // path afterwards asks the pool groups themselves, which carry the same sparsity.
     auto gpuSlotCounts
         = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mHotMinSlots, gpuGranularity,
-            _hostSparsePoolBudget(sparsePools, hotPoolSizeGranularity(CacheTier::HOST_MEM, gpuGranularity)));
+            _secondaryBudget(
+                sparsePools, hotPoolSizeGranularity(CacheTier::HOST_MEM, gpuGranularity), config.hostSparsePoolQuota));
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
         gpuSlotCounts, mGpuPhysMemAllocator.get(), tierBackingOptions(config.cacheTiers[kHotLevel], gpuGranularity));
 
@@ -1809,9 +1810,8 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
 {
     auto& lvlStorage = *mLevels.at(level).storage;
     auto oldNumSlots = lvlStorage.slotCountList();
-    size_t quota = newQuota.has_value()
-        ? roundUp(newQuota.value(), static_cast<size_t>(lvlStorage.poolSizeGranularity()))
-        : lvlStorage.totalQuota();
+    size_t quota = newQuota.has_value() ? roundUp(newQuota.value(), lvlStorage.poolSizeGranularity())
+                                        : lvlStorage.roundedNumBytes(lvlStorage.cacheTier());
     // Chargeable, not total: a rebalance that charged host bytes to the device budget would
     // under-size the level and evict live pages to reach it.
     size_t minQuota = minQuotaForLevel(level);
@@ -2173,25 +2173,25 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(Cac
 //! pool of every group by up to one device grain.
 std::optional<SecondaryPoolBudget> StorageManager::_secondaryBudget(CacheLevelStorage const& level) const
 {
-    // A level with no second medium names no pools, which _hostSparsePoolBudget reports as
-    // the absent budget.
-    return _hostSparsePoolBudget(level.poolsOfSecondaryMedium(), level.secondaryMediumGranularity());
+    // A level with no second medium names no pools, which is the absent budget.
+    return _secondaryBudget(
+        level.poolsOfMedium(level.secondaryMedium()), level.secondaryMediumGranularity(), mHostSparsePoolQuota);
 }
 
-std::optional<SecondaryPoolBudget> StorageManager::_hostSparsePoolBudget(
-    TypedVec<PoolGroupIndex, std::vector<PoolIndex>> sparsePools, size_t granularity) const
+std::optional<SecondaryPoolBudget> StorageManager::_secondaryBudget(
+    TypedVec<PoolGroupIndex, std::vector<PoolIndex>> secondaryPools, size_t granularity, std::optional<size_t> quota)
 {
-    // Returned whenever the level has a sparse pool, bounded or not: the allocator needs to
+    // Returned whenever the level has such a pool, bounded or not: the allocator needs to
     // know which pools this level's quota does not pay for before it needs to know whether
     // anything limits them. Only `quota` carries the latter.
-    if (std::ranges::none_of(sparsePools, [](auto const& pools) { return !pools.empty(); }))
+    if (std::ranges::none_of(secondaryPools, [](auto const& pools) { return !pools.empty(); }))
     {
         return std::nullopt;
     }
     SecondaryPoolBudget budget;
-    budget.quota = mHostSparsePoolQuota;
+    budget.quota = quota;
     budget.granularity = granularity;
-    budget.pools = std::move(sparsePools);
+    budget.pools = std::move(secondaryPools);
     return budget;
 }
 
@@ -2270,12 +2270,12 @@ TypedVec<PoolGroupIndex, float> StorageManager::constrainPoolGroupRatio(
     auto& gpuStorage = *mLevels[kHotLevel].storage;
     // The same budgets the allocator will actually use, or the ratio this derives would
     // describe a layout the next rebalance cannot produce.
-    auto slotCountList = slotCountsForLevel(kHotLevel, gpuStorage.totalQuota(), ratio);
+    auto slotCountList = slotCountsForLevel(kHotLevel, gpuStorage.roundedNumBytes(gpuStorage.cacheTier()), ratio);
     // All-bytes, each medium in its own grain -- the same measure ratioList() reports, so
     // the target this derives and the layout a rebalance then achieves are comparable. They
     // have to be: _needAdjustment treats this as a prediction of the allocator's own output
     // and re-fires until the two agree.
-    return normalizeToRatio(gpuStorage.allBytes(slotCountList));
+    return normalizeToRatio(gpuStorage.allMediaBytes(slotCountList));
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -642,28 +642,36 @@ GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const
         cuCheck(cuCtxGetDevice(&dev));
         cuCheck(cuDeviceTotalMem(&totalGpuMem, dev));
     }
-    // @TODO: We should replace maxSlotSize with sum. This should also be updated in Python. Will do it later.
-    // @TODO: maxSlotSize spans sparse pools too, though they reserve no device VA. When a
-    // sparse pool is the largest, every dense pool's vmSize is scaled down by that ratio,
-    // which costs growth headroom (the floor below keeps the initial allocation correct),
-    // so expandPoolGroup can hit the VA limit earlier than intended. Size the ratio from
-    // the device-backed pools alone.
     TLLM_CHECK_WITH_INFO(!slotSizeList.empty(), "GpuPoolGroup: slotSizeList must not be empty");
-    size_t maxSlotSize = *std::max_element(slotSizeList.begin(), slotSizeList.end());
+    // Every pool reserves address space for the most slots this group could ever hold: the
+    // count all of device memory would buy. A slot is one row spanning every pool, and only
+    // the device-backed pools draw on that memory, so they alone set the count -- which is
+    // why StorageManager requires one here. No quota can exceed device memory, so this
+    // reservation is a bound the allocator cannot reach rather than one it might.
+    size_t deviceSlotBytes = 0;
+    for (PoolIndex p{0}; p < slotSizeList.size(); ++p)
+    {
+        if (!sparsity[p])
+        {
+            deviceSlotBytes += slotSizeList.at(p);
+        }
+    }
+    TLLM_CHECK_WITH_INFO(deviceSlotBytes > 0,
+        "GpuPoolGroup: a wholly sparse group has no device bytes per slot to size its reservation from");
+    size_t const maxSlots = totalGpuMem / deviceSlotBytes;
     for (PoolIndex p{0}; p < slotSizeList.size(); ++p)
     {
         size_t const sz = slotSizeList.at(p);
-        // VA proportional to GPU memory, scaled by slot size ratio (mirrors Python).
-        // Compute ratio as double first to avoid size_t overflow.
-        double sizeRatio = static_cast<double>(sz) / static_cast<double>(maxSlotSize);
-        size_t vmSize = roundDown(static_cast<size_t>(static_cast<double>(totalGpuMem) * sizeRatio), physMemSize);
-        vmSize = std::max(vmSize, roundUp(slotCountToSizeT(numSlots) * sz, physMemSize));
+        // Each in the grain of its own medium: a host-backed pool commits in host units.
+        size_t const grain = sparsity[p] ? HostMem::kAlignment : physMemSize;
+        size_t vmSize = std::max(roundUp(maxSlots * sz, grain), roundUp(slotCountToSizeT(numSlots) * sz, grain));
         if (sparsity[p])
         {
             // A sparse pool's pages: host memory, device-mapped, so the sparse cache fills
-            // from them without a host round trip. No device VA is reserved for them, and
-            // the same proportional reservation bounds its growth -- host address space is
-            // cheap, and the host sparse pool quota is the real bound.
+            // from them without a host round trip. The reservation is host address space,
+            // not device, but it is as hard a bound: HostMem keeps a fixed base and rejects
+            // a resize past it. Sizing it from maxSlots is what keeps it unreachable, since
+            // the row count those slots imply is the most the device quota can buy.
             //
             // Device-mapped does not mean these pages need extra synchronization. The fill
             // completes before allocate() returns the slot, so by the time any descriptor

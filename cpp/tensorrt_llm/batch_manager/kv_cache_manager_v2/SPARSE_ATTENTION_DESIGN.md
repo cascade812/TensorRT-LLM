@@ -1181,8 +1181,8 @@ cannot overlap, and no pool can be left for neither to pay.
 These are deliberately different currencies, and the asymmetry looks like a bug until the
 third party is in view.
 
-- **The quota** (`totalQuota()`, `denseNumBytes`) counts only dense pools. Host-backed bytes
-  consume none of the device memory it measures.
+- **The quota** (`roundedNumBytes(cacheTier())`) counts only the pools on the level's own
+  medium. Host-backed bytes consume none of the device memory it measures.
 - **The ratio** (`ratioList()`, and the profiler's) weighs *every* pool, host-backed
   included. It has to: it is projected onto cold levels, where a single pool holds dense and
   sparse buffers together, and it is compared against the achieved layout, which is measured
@@ -1216,7 +1216,7 @@ level inherits.
 The allocator is a search over one scalar, and all-bytes is what that scalar buys.
 
 Write `A(pg, n)` for what `n` slots of group `pg` cost in all-bytes — every pool rounded up
-to the grain of the medium backing it, which is exactly `CacheLevelStorage::allBytes()`. For
+to the grain of the medium backing it, which is exactly `CacheLevelStorage::allMediaBytes()`. For
 a *level* of all-bytes spending `L`, each group's demand is
 
     demand(pg, L) = max( minSlots[pg], maxSlotsForAllBytes(L · r[pg]) )

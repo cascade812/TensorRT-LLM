@@ -764,6 +764,21 @@ class TestSparseBufferConfig(unittest.TestCase):
             layers=[layer],
         )
 
+    def test_rejects_a_layer_whose_buffers_are_all_sparse(self):
+        """A slot is one row across a group's pools, priced in the device bytes it costs.
+
+        Sparse pools are host memory and cost none, so a group holding only those has no
+        slot count to derive. Raised when storage is built rather than by config
+        validation: a pool group forms across layers, so no single layer can be judged.
+        """
+        layer = AttentionLayerConfig(
+            0,
+            [BufferConfig("key", 4096, is_sparse=True)],
+            sparse_cache=SparseCacheConfig(num_selected_blocks=2, max_cached_units=4),
+        )
+        with self.assertRaisesRegex((ValueError, RuntimeError), "wholly sparse"):
+            KVCacheManager(self._make_config(layer))
+
     def test_a_layer_may_mix_sparse_and_dense_buffers(self):
         """Sparsity picks a buffer's pool and nothing above it.
 

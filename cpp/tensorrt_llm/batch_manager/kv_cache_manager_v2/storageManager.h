@@ -381,7 +381,7 @@ private:
         CacheLevel srcLevel, CacheLevel dstLevel, TypedVec<LifeCycleId, float> const& srcLifeCycleRatio) const;
     //! Bytes a hot-level slot count costs, each pool rounded by hotPoolSizeGranularity() to
     //! the grain of the medium backing it.
-    //! This is the same measure as CacheLevelStorage::allBytes(), which the resulting ratio is
+    //! This is the same measure as CacheLevelStorage::allMediaBytes(), which the resulting ratio is
     //! compared against; the storage does not exist yet here, so `sparsePools` names the sparse
     //! pools of each group instead of PoolGroupBase::poolMedium(), and the grain is predicted
     //! rather than read off the pool.
@@ -429,13 +429,16 @@ private:
     //! structural one slot per pool group.
     [[nodiscard]] TypedVec<PoolGroupIndex, SlotCount> _minSlotsFor(CacheLevel level) const;
 
-    //! The host memory budget for `sparsePools`, as the allocator takes it, or nullopt when
-    //! `hostSparsePoolQuota` leaves them unbounded.
+    //! The second medium's budget over `secondaryPools`, as the allocator takes it, or nullopt
+    //! when no pool is named. A level holding such pools always passes one, bounded or not;
+    //! `quota` alone says whether anything limits them.
     //!
-    //! For the config stage, which has no pools to ask. `granularity` is what they will
-    //! round to once built -- see hotPoolSizeGranularity().
-    [[nodiscard]] std::optional<SecondaryPoolBudget> _hostSparsePoolBudget(
-        TypedVec<PoolGroupIndex, std::vector<PoolIndex>> sparsePools, size_t granularity) const;
+    //! Static so the config stage can call it before any pool exists to ask: `granularity`
+    //! is what they will round to once built (hotPoolSizeGranularity), and `quota` is the
+    //! configured bound.
+    [[nodiscard]] static std::optional<SecondaryPoolBudget> _secondaryBudget(
+        TypedVec<PoolGroupIndex, std::vector<PoolIndex>> secondaryPools, size_t granularity,
+        std::optional<size_t> quota);
 
     //! The second medium's budget for a level that already exists, reading both the pools
     //! and their grain off it rather than restating either.

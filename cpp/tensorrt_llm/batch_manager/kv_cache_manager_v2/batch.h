@@ -19,7 +19,6 @@
 
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
-#include "kv_cache_manager_v2/sparseCache.h"
 #include "kv_cache_manager_v2/sparseCacheKernels.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
