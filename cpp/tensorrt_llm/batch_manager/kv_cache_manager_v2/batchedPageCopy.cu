@@ -998,7 +998,6 @@ void copyFlushRangesToDevice(CUdeviceptr dst, int32_t const* src, size_t count, 
     }
     TLLM_CHECK_WITH_INFO(dst != 0 && src != nullptr, "Flush-range copy requires valid source and destination");
 
-#if CUDA_VERSION >= 12080
     size_t numBytes = count * sizeof(int32_t);
     CUdeviceptr srcAddress = reinterpret_cast<CUdeviceptr>(src);
     CUmemcpyAttributes attributes{};
@@ -1012,17 +1011,7 @@ void copyFlushRangesToDevice(CUdeviceptr dst, int32_t const* src, size_t count, 
     // CU_MEMCPY_SRC_ACCESS_ORDER_DURING_API_CALL semantics above (driver bug nvbugs 6718200).
     attributes.flags = 0;
     size_t firstCopy = 0;
-#if CUDA_VERSION < 13000
-    size_t failIdx = std::numeric_limits<size_t>::max();
-    TLLM_CU_CHECK(cuMemcpyBatchAsync(&dst, &srcAddress, &numBytes, 1, &attributes, &firstCopy, 1, &failIdx, stream));
-#else
     TLLM_CU_CHECK(cuMemcpyBatchAsync(&dst, &srcAddress, &numBytes, 1, &attributes, &firstCopy, 1, stream));
-#endif
-#else
-    // Without the batch API the source has to outlive the enqueue, so the copy is
-    // synchronous on the host side rather than silently reading freed memory.
-    TLLM_CU_CHECK(cuMemcpyHtoD(dst, src, count * sizeof(int32_t)));
-#endif
 }
 
 void copyPageIndicesToDevice(CUdeviceptr dst, PageIndexPair const* src, size_t numPageIndices, CUstream stream)

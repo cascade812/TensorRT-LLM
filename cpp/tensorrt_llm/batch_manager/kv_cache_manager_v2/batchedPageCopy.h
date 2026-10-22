@@ -191,12 +191,6 @@ void copyPageIndicesToDevice(CUdeviceptr dst, PageIndexPair const* src, size_t n
 //! the previous step, the call could not complete until the stream reached it.
 void copyFlushRangesToDevice(CUdeviceptr dst, int32_t const* src, size_t count, CUstream stream);
 
-#if CUDA_VERSION < 12080
-//! Kernel fallback used when cuMemcpyBatchAsync is unavailable. Exposed for focused testing.
-void copyPageIndicesToDeviceWithKernel(
-    CUdeviceptr dst, PageIndexPair const* src, size_t numPageIndices, CUstream stream);
-#endif
-
 } // namespace detail
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
