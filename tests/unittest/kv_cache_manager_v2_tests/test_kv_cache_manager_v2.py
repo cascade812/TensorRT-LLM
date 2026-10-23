@@ -2692,8 +2692,6 @@ class TestIndexMode(unittest.TestCase):
             plain = manager.get_layer_group_id(self.PLAIN_LAYER)
             self.assertNotEqual(windowed, plain)
 
-            # Collapsed: scratch reuse is on, so the answer is "it depends".
-            self.assertIsNone(manager.supports_index_mode(PageIndexMode.SHARED))
             # Per life cycle: only the sliding one is in doubt.
             self.assertIsNone(manager.supports_index_mode(PageIndexMode.SHARED, windowed))
             self.assertTrue(manager.supports_index_mode(PageIndexMode.SHARED, plain))

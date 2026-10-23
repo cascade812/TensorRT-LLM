@@ -156,38 +156,28 @@ void hostPrefaultChunk(MemAddress ptr, size_t size, HostMadviseFn madviseFn, Hos
 // HostMem implementation
 // ---------------------------------------------------------------------------
 
-size_t HostMem::chunkCount() const noexcept
+//! Steps the backing to its target, publishing the watermark after each step.
+void HostMem::fillToTarget()
 {
-    return mChunkSize == 0 ? 0 : divUp(mSize, mChunkSize);
-}
-
-//! Commits [beginOffset, mSize) in chunk-sized steps, publishing the watermark
-//! after each one.
-//!
-//! `beginOffset` is a byte offset rather than a chunk index because a grow
-//! resumes at the old size, which need not fall on a chunk boundary. The step
-//! that straddles the boundary is committed as a short range, so no byte is
-//! ever committed twice.
-void HostMem::commitRange(size_t beginOffset)
-{
-    size_t offset = beginOffset;
-    while (offset < mSize)
+    while (mBacking.committedSize() != mBacking.targetSize())
     {
-        size_t const end = std::min(roundUp(offset + 1, mChunkSize), mSize);
-        mBacking.commit(offset, end - offset);
-        offset = end;
-        // A chunk counts as usable only once it is committed to its end, so a
-        // partially committed trailing chunk does not advance the watermark.
-        mFilledChunks.store(
-            static_cast<uint32_t>(offset == mSize ? chunkCount() : offset / mChunkSize), std::memory_order_release);
-        mFilledChunks.notify_all();
+        // Clamped because a shrink's steps report a registered end that is still
+        // above the target; the watermark must never run ahead of it.
+        mUsable.store(std::min(mBacking.resizeStep(), mBacking.targetSize()), std::memory_order_release);
+        mUsable.notify_all();
     }
+    // The target rather than the registered end, which trails it by whatever
+    // does not fill a whole register unit. No consumer can use a remainder
+    // smaller than that, and publishing the shorter value would hang a wait for
+    // the whole range.
+    mUsable.store(mBacking.targetSize(), std::memory_order_release);
+    mUsable.notify_all();
 }
 
-void HostMem::startFill(size_t beginOffset)
+void HostMem::startFill()
 {
     mFillWorker = std::thread(
-        [this, beginOffset]
+        [this]
         {
             // A new thread starts on device 0 whatever the creator selected, and
             // registration needs a context on the right one. Selecting it here
@@ -203,15 +193,15 @@ void HostMem::startFill(size_t beginOffset)
                 cudaStreamCaptureMode captureMode = cudaStreamCaptureModeRelaxed;
                 TLLM_CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&captureMode));
                 runtime::TopologyDetector::getInstance().bindThreadByCurrentGpu();
-                commitRange(beginOffset);
+                fillToTarget();
             }
             catch (...)
             {
                 // Stored before the sentinel: a waiter that observes the
                 // sentinel through an acquire load is guaranteed to see it.
                 mFillFailure = std::current_exception();
-                mFilledChunks.store(kFillFailed, std::memory_order_release);
-                mFilledChunks.notify_all();
+                mUsable.store(kFillFailed, std::memory_order_release);
+                mUsable.notify_all();
             }
         });
 }
@@ -226,18 +216,17 @@ void HostMem::joinFill() noexcept
 
 void HostMem::waitUsable(size_t endOffset) const
 {
-    if (endOffset == 0 || mChunkSize == 0)
+    if (endOffset == 0)
     {
         return;
     }
     TLLM_CHECK_DEBUG(endOffset <= mSize);
-    auto const needed = static_cast<uint32_t>(divUp(endOffset, mChunkSize));
 
-    uint32_t current = mFilledChunks.load(std::memory_order_acquire);
-    while (current < needed)
+    size_t current = mUsable.load(std::memory_order_acquire);
+    while (current < endOffset)
     {
-        mFilledChunks.wait(current, std::memory_order_acquire);
-        current = mFilledChunks.load(std::memory_order_acquire);
+        mUsable.wait(current, std::memory_order_acquire);
+        current = mUsable.load(std::memory_order_acquire);
     }
     if (current == kFillFailed)
     {
@@ -246,7 +235,8 @@ void HostMem::waitUsable(size_t endOffset) const
 }
 
 HostMem::HostMem(size_t vmSize, size_t initialSize, HostMemBackingOptions const& options, bool waitForFill)
-    : mBacking(options)
+    // Rounded up so that the largest accepted resize is itself a valid, aligned size.
+    : mBacking(vmSize == 0 ? 0 : roundUp(vmSize, sizeGranularity()), options)
     , mWaitForFill(waitForFill)
 {
     TLLM_CUDA_CHECK(cudaGetDevice(&mDevice));
@@ -259,16 +249,14 @@ HostMem::HostMem(size_t vmSize, size_t initialSize, HostMemBackingOptions const&
     size_t const granularity = mBacking.commitGranularity();
     TLLM_CHECK_WITH_INFO(initialSize % granularity == 0,
         "HostMem size %zu is not a multiple of the commit granularity %zu", initialSize, granularity);
-    mChunkSize = roundUp(kFillChunkSize, granularity);
 
     try
     {
-        // The reservation is rounded up so that the largest accepted resize is
-        // itself a valid, aligned size.
-        mVmSize = roundUp(vmSize, granularity);
+        mVmSize = mBacking.reservedSize();
         mSize = initialSize;
-        mAddr = mBacking.reserve(mVmSize);
-        startFill(0);
+        mAddr = mBacking.address();
+        mBacking.setTargetSize(mSize);
+        startFill();
         if (mWaitForFill)
         {
             waitUsable(mSize);
@@ -303,9 +291,8 @@ void HostMem::destroy()
     mAddr = 0;
     mSize = 0;
     mVmSize = 0;
-    mChunkSize = 0;
     mFillFailure = nullptr;
-    mFilledChunks.store(0, std::memory_order_release);
+    mUsable.store(0, std::memory_order_release);
 }
 
 void HostMem::resize(size_t newSize)
@@ -315,7 +302,7 @@ void HostMem::resize(size_t newSize)
     // The fill must be finished before the mapping changes underneath it, and a
     // failed fill has to surface here rather than be resized over.
     joinFill();
-    if (mFilledChunks.load(std::memory_order_acquire) == kFillFailed)
+    if (mUsable.load(std::memory_order_acquire) == kFillFailed)
     {
         std::rethrow_exception(mFillFailure);
     }
@@ -330,29 +317,27 @@ void HostMem::resize(size_t newSize)
     TLLM_CHECK_WITH_INFO(newSize <= mVmSize,
         "HostMem resize to %zu exceeds the reserved maximum of %zu; raise the tier's maxQuota", newSize, mVmSize);
 
+    mBacking.setTargetSize(newSize);
     if (newSize < mSize)
     {
         // Shrink within the existing reservation: only the tail is released and
-        // the base address is unchanged. The release is exact, because newSize
-        // is a multiple of the unit the backing allocates in.
-        mBacking.decommit(newSize, mSize - newSize);
+        // the base address is unchanged. Done on this thread, because the caller
+        // has already had to stop every consumer for the range to be releasable
+        // at all, so there is nothing for a worker to overlap with.
         mSize = newSize;
-        mFilledChunks.store(static_cast<uint32_t>(chunkCount()), std::memory_order_release);
-        mFilledChunks.notify_all();
+        // Lowered before anything is released, not after, so no waiter is ever
+        // holding a watermark that covers memory already gone.
+        mUsable.store(newSize, std::memory_order_release);
+        fillToTarget();
         return;
     }
 
     // Grow: the address space is already reserved, so this only commits the new
     // tail. Everything below keeps its contents and its address.
-    size_t const oldSize = mSize;
     mSize = newSize;
-    // The watermark counts whole chunks, and the old size rounded up to one.
-    // Growing makes that rounding wrong -- it would claim the new tail is
-    // already usable -- so it is rebased to the chunks genuinely complete.
-    mFilledChunks.store(static_cast<uint32_t>(oldSize / mChunkSize), std::memory_order_release);
     try
     {
-        startFill(oldSize);
+        startFill();
     }
     catch (...)
     {
@@ -360,8 +345,8 @@ void HostMem::resize(size_t newSize)
         // wait past the old size would block on a watermark that no worker is
         // left to advance.
         mFillFailure = std::current_exception();
-        mFilledChunks.store(kFillFailed, std::memory_order_release);
-        mFilledChunks.notify_all();
+        mUsable.store(kFillFailed, std::memory_order_release);
+        mUsable.notify_all();
         throw;
     }
     if (mWaitForFill)

@@ -280,17 +280,14 @@ public:
         return mConfig.enableSwaScratchReuse();
     }
 
-    // Whether managed KV caches support the given page index mode.
-    // Returns true/false for a definitive answer, nullopt for per-instance check.
-    std::optional<bool> supportsIndexMode(PageIndexMode mode) const;
-
-    //! The same question for one life cycle, which is the granularity a Batch decides at.
+    //! Whether managed KV caches support the given page index mode for one life cycle,
+    //! which is the granularity a Batch decides at. True or false is definitive; nullopt
+    //! means it depends on the individual KvCache, which must then be asked.
     //!
     //! Only scratch-slot substitution can make one layer's converted indices differ from
     //! another's in the same life cycle, so SHARED is definitive for a life cycle that can
     //! never hold scratch -- anything computeScratchRange() returns empty for, which is
-    //! every life cycle without a sliding window. The collapsing overload above answers
-    //! nullopt wherever scratch reuse is on, even for those.
+    //! every life cycle without a sliding window.
     //!
     //! Configuration only: the answer never depends on what a request is currently doing,
     //! which is what lets a Batch fix its mode at construction.

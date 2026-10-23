@@ -336,7 +336,7 @@ KVCacheManagerConfig makeSplitColdGroupingConfig()
     KVCacheManagerConfig config;
     config.tokensPerBlock = 4;
     config.cacheTiers.emplace_back(GpuCacheTierConfig{4 << 20});
-    // The host tier is distributed in units of HostMem::kAlignment, so a quota
+    // The host tier is distributed in units of HostMem::sizeGranularity(), so a quota
     // of only a few multiples of it cannot express a pool ratio: every group
     // rounds to the same single unit. Sized here to leave enough units for the
     // ratios these tests assert on.
@@ -358,7 +358,7 @@ KVCacheManagerConfig makeSplitColdGroupingConfig()
 
 //! A config whose cold tier holds exactly one page.
 //!
-//! The host tier is allocated in whole multiples of HostMem::kAlignment, so a
+//! The host tier is allocated in whole multiples of HostMem::sizeGranularity(), so a
 //! pool contains a single slot only when one page fills that unit. Tests that
 //! need two pages to contend for one cold slot size the page accordingly rather
 //! than shrinking the quota, which cannot go below one unit.
@@ -367,12 +367,12 @@ KVCacheManagerConfig makeSingleColdSlotConfig()
     KVCacheManagerConfig config = makeSplitColdGroupingConfig();
     for (auto& layer : config.layers)
     {
-        std::get<AttentionLayerConfig>(layer).buffers[0].size = HostMem::kAlignment;
+        std::get<AttentionLayerConfig>(layer).buffers[0].size = HostMem::sizeGranularity();
     }
     // The hot tier holds pages of the same size, so it is sized in the same
     // unit to leave room for the slots these tests allocate up front.
-    config.cacheTiers[0] = GpuCacheTierConfig{8 * HostMem::kAlignment};
-    config.cacheTiers[1] = HostCacheTierConfig{HostMem::kAlignment};
+    config.cacheTiers[0] = GpuCacheTierConfig{8 * HostMem::sizeGranularity()};
+    config.cacheTiers[1] = HostCacheTierConfig{HostMem::sizeGranularity()};
     return config;
 }
 
@@ -1088,7 +1088,7 @@ TEST(KvCacheManagerV2ColdPageTest, MaxQuotaBelowTheStructuralMinimumIsRejected)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
     // Two cold pool groups, from the two distinct sliding windows.
-    constexpr size_t kOneUnit = HostMem::kAlignment;
+    size_t const kOneUnit = HostMem::sizeGranularity();
 
     auto makeConfig = [](std::optional<size_t> maxQuota)
     {
@@ -1139,7 +1139,7 @@ TEST(KvCacheManagerV2ColdPageTest, RecursiveFallenPageMergeResortsByPriority)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
     auto config = makeSingleColdSlotConfig();
-    config.cacheTiers.emplace_back(HostCacheTierConfig{HostMem::kAlignment});
+    config.cacheTiers.emplace_back(HostCacheTierConfig{HostMem::sizeGranularity()});
     auto manager = std::make_shared<KvCacheManager>(std::move(config));
     auto& storage = manager->storage();
     CacheLevel const firstColdLevel{1};

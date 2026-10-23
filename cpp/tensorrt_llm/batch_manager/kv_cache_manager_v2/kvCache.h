@@ -556,12 +556,8 @@ public:
     // requires the already-committed tokens to be digest-free (verified by a scan).
     void setTextOnly(bool textOnly);
 
-    // Whether the given page index mode is supported (SHARED requires no scratch slots).
-    bool supportsIndexMode(PageIndexMode mode) const;
-
-    // The same question for one life cycle, which is where the scratch slots actually live.
-    // The overload above collapses them, so one life cycle's scratch makes it answer false
-    // for every other.
+    // Whether the given page index mode is supported for one life cycle, which is where
+    // the scratch slots actually live: SHARED requires that this life cycle hold none.
     bool supportsIndexMode(PageIndexMode mode, LifeCycleId lcId) const;
 
     // ---- Internal callbacks (called by SharedPageLock) ----------------------

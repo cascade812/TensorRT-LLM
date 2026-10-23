@@ -44,21 +44,20 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 class HostMem
 {
 public:
-    //! Required alignment of every size passed to HostMem. Only the single-size
-    //! constructor rounds up on the caller's behalf; elsewhere a size that is
-    //! not a multiple of this is a bug and is rejected.
+    //! What every size passed to HostMem must be a multiple of. Only the single-size
+    //! constructor rounds up on the caller's behalf; elsewhere a size that is not a
+    //! multiple of this is a bug and is rejected.
     //!
-    //! The base is only page-aligned: registration takes any address, and the
-    //! mprotect and madvise calls round to pages themselves.
-    static constexpr size_t kAlignment = kHostMemAlignment;
-
-    //! Bytes committed per watermark advance. Large enough that the commit cost
-    //! dominates the notify, small enough that a waiter near the start of the
-    //! range is released early.
+    //! A granularity of sizes and of offsets within the reservation, not an alignment of
+    //! addresses: the base comes from mmap and is only page-aligned. Registration takes
+    //! any address, and the mprotect and madvise calls round to pages themselves.
     //!
-    //! Unrelated to the unit memory is allocated and released in: this only sets
-    //! how often the fill publishes progress. See HostMemBacking.
-    static constexpr size_t kFillChunkSize = 512ULL << 20; // 512 MB
+    //! Runtime rather than constant: it follows the page size, which the platform
+    //! decides. hostMemSizeGranularity() is the one place that settles it.
+    [[nodiscard]] static size_t sizeGranularity() noexcept
+    {
+        return hostMemSizeGranularity();
+    }
 
     //! Reserves `vmSize` of address space and commits `initialSize` of it.
     //!
@@ -66,10 +65,6 @@ public:
     //! moves the committed boundary within the reservation, and a resize past
     //! `vmSize` is rejected rather than served by relocating. Reserving costs
     //! address space, not memory.
-    //!
-    //! `options.commitUnit` is the granularity memory is allocated and released
-    //! in, and therefore the alignment every size must satisfy. It is
-    //! independent of kFillChunkSize, which only paces progress reporting.
     //!
     //! The fill always runs on a worker thread. `waitForFill` selects whether
     //! the caller is exposed to that: when true, the constructor and resize()
@@ -92,10 +87,10 @@ public:
     //! resizes. Takes no waitForFill: a caller that cannot resize has no reason
     //! to observe a partially filled range.
     //!
-    //! `size` may be any byte count: it is rounded up to kAlignment, and size()
+    //! `size` may be any byte count: it is rounded up to sizeGranularity(), and size()
     //! reports the rounded value.
     explicit HostMem(size_t size)
-        : HostMem(roundUp(size, kAlignment), roundUp(size, kAlignment), HostMemBackingOptions{},
+        : HostMem(roundUp(size, sizeGranularity()), roundUp(size, sizeGranularity()), HostMemBackingOptions{},
             /*waitForFill=*/true)
     {
     }
@@ -140,28 +135,23 @@ public:
 
 private:
     //! Sentinel stored in the watermark when the worker failed. Distinct from
-    //! every real chunk count, so a waiter cannot mistake it for progress.
-    static constexpr uint32_t kFillFailed = UINT32_MAX;
+    //! every reachable byte count, so a waiter cannot mistake it for progress.
+    static constexpr size_t kFillFailed = SIZE_MAX;
 
-    void commitRange(size_t beginOffset);
-    void startFill(size_t beginOffset);
+    void fillToTarget();
+    void startFill();
     void joinFill() noexcept;
-    [[nodiscard]] size_t chunkCount() const noexcept;
 
     HostMemBacking mBacking;
     MemAddress mAddr = 0;
     size_t mSize = 0;
     size_t mVmSize = 0;
-
-    //! Bytes committed between watermark advances. A multiple of the backing's
-    //! commit granularity, so a fill step never lands inside an allocation.
-    size_t mChunkSize = 0;
     bool mWaitForFill = true;
 
-    //! Read on every allocation, written once per committed chunk. Kept on its
-    //! own cache line so publishing progress does not invalidate the line that
-    //! readers are spinning on.
-    alignas(64) mutable std::atomic<uint32_t> mFilledChunks{0};
+    //! Bytes a consumer may touch, from the base. Read on every allocation,
+    //! written once per fill step. Kept on its own cache line so publishing
+    //! progress does not invalidate the line that readers are spinning on.
+    alignas(64) mutable std::atomic<size_t> mUsable{0};
 
     //! Written before the failure sentinel is stored, and only read after that
     //! sentinel has been observed, so no lock is needed.

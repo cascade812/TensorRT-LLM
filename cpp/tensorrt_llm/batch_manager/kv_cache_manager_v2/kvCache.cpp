@@ -3404,16 +3404,6 @@ bool KvCache::isSwaScratchReuseEnabled() const noexcept
     return mEnableSwaScratchReuse;
 }
 
-bool KvCache::supportsIndexMode(PageIndexMode mode) const
-{
-    switch (mode)
-    {
-    case PageIndexMode::PER_LAYER: return true;
-    case PageIndexMode::SHARED: return !hasScratchSlots();
-    }
-    return false;
-}
-
 bool KvCache::supportsIndexMode(PageIndexMode mode, LifeCycleId lcId) const
 {
     switch (mode)

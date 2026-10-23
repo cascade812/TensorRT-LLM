@@ -357,12 +357,10 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     mHostSparsePoolQuota = config.hostSparsePoolQuota;
     // Derived from the descriptors here because the level's storage does not exist yet; every
     // path afterwards asks the pool groups themselves, which carry the same sparsity.
-    auto gpuSlotCounts
-        = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mHotMinSlots, gpuGranularity,
-            _secondaryBudget(
-                sparsePools, hotPoolSizeGranularity(CacheTier::HOST_MEM, gpuGranularity), config.hostSparsePoolQuota));
+    auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mHotMinSlots,
+        gpuGranularity, _secondaryBudget(sparsePools, hostMemSizeGranularity(), config.hostSparsePoolQuota));
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
-        gpuSlotCounts, mGpuPhysMemAllocator.get(), tierBackingOptions(config.cacheTiers[kHotLevel], gpuGranularity));
+        gpuSlotCounts, mGpuPhysMemAllocator.get(), HostMemBackingOptions{});
 
     auto const gpuDescs = poolGroupDescs();
     TLLM_CHECK_WITH_INFO(
@@ -1810,8 +1808,9 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
 {
     auto& lvlStorage = *mLevels.at(level).storage;
     auto oldNumSlots = lvlStorage.slotCountList();
-    size_t quota = newQuota.has_value() ? roundUp(newQuota.value(), lvlStorage.poolSizeGranularity())
-                                        : lvlStorage.roundedNumBytes(lvlStorage.cacheTier());
+    size_t quota = newQuota.has_value()
+        ? roundUp(newQuota.value(), lvlStorage.poolSizeGranularity(lvlStorage.cacheTier()))
+        : lvlStorage.roundedNumBytes(lvlStorage.cacheTier());
     // Chargeable, not total: a rebalance that charged host bytes to the device budget would
     // under-size the level and evict live pages to reach it.
     size_t minQuota = minQuotaForLevel(level);
@@ -2168,14 +2167,18 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(Cac
 
 //! The sparse host budget as the allocator takes it, or nullopt when unbounded.
 //!
-//! Host-backed pools round to HostMem::kAlignment, not to the device granularity, so the
+//! Host-backed pools round to HostMem::sizeGranularity(), not to the device granularity, so the
 //! budget is counted in that grain: charging them in device grains would over-count every
 //! pool of every group by up to one device grain.
 std::optional<SecondaryPoolBudget> StorageManager::_secondaryBudget(CacheLevelStorage const& level) const
 {
-    // A level with no second medium names no pools, which is the absent budget.
-    return _secondaryBudget(
-        level.poolsOfMedium(level.secondaryMedium()), level.secondaryMediumGranularity(), mHostSparsePoolQuota);
+    auto const medium = level.secondaryMedium();
+    if (!medium.has_value())
+    {
+        // Nothing here sits outside what this level's quota pays for.
+        return std::nullopt;
+    }
+    return _secondaryBudget(level.poolsOfMedium(*medium), level.poolSizeGranularity(*medium), mHostSparsePoolQuota);
 }
 
 std::optional<SecondaryPoolBudget> StorageManager::_secondaryBudget(
@@ -2209,7 +2212,6 @@ size_t StorageManager::tierCommitUnit(CacheTierConfig const& tierConfig, size_t 
 HostMemBackingOptions StorageManager::tierBackingOptions(CacheTierConfig const& tierConfig, size_t gpuPhysMemSize)
 {
     HostMemBackingOptions options;
-    options.commitUnit = tierCommitUnit(tierConfig, gpuPhysMemSize);
     if (auto const* host = std::get_if<HostCacheTierConfig>(&tierConfig))
     {
         options.allowRemoteNumaFallback = host->allowRemoteNumaFallback;
@@ -2230,16 +2232,16 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::_minSlotsFor(CacheLevel leve
 size_t StorageManager::minQuotaForLevel(CacheLevel level) const
 {
     auto const& storage = *mLevels.at(level).storage;
-    return minQuotaForLevel(
-        storage.slotSizeLists(), storage.poolSizeGranularity(), _minSlotsFor(level), _secondaryBudget(storage));
+    return minQuotaForLevel(storage.slotSizeLists(), storage.poolSizeGranularity(storage.cacheTier()),
+        _minSlotsFor(level), _secondaryBudget(storage));
 }
 
 TypedVec<PoolGroupIndex, SlotCount> StorageManager::slotCountsForLevel(
     CacheLevel level, size_t quota, TypedVec<PoolGroupIndex, float> const& ratio) const
 {
     auto const& storage = *mLevels.at(level).storage;
-    return CacheLevelStorage::ratioToSlotCountList(quota, storage.slotSizeLists(), ratio, storage.poolSizeGranularity(),
-        _minSlotsFor(level), _secondaryBudget(storage));
+    return CacheLevelStorage::ratioToSlotCountList(quota, storage.slotSizeLists(), ratio,
+        storage.poolSizeGranularity(storage.cacheTier()), _minSlotsFor(level), _secondaryBudget(storage));
 }
 
 size_t StorageManager::minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,

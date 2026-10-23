@@ -596,13 +596,13 @@ std::optional<HostMemPlacement> KvCacheIntrospection::probeHostMemPlacement(size
 
     HostMemBackingOptions options;
     options.allowRemoteNumaFallback = allowRemoteNumaFallback;
-    auto backing = std::make_unique<HostMemBacking>(options);
+    size_t const span = roundUp(size, hostMemSizeGranularity());
+    auto backing = std::make_unique<HostMemBacking>(span, options);
 
     HostMemPlacement placement{};
     placement.gpuNumaNode = runtime::TopologyDetector::getInstance().getCurrentGpuNumaId();
 
-    size_t const span = roundUp(size, backing->commitGranularity());
-    MemAddress const base = backing->reserve(span);
+    MemAddress const base = backing->address();
 
     int mode = -1;
     if (::get_mempolicy(&mode, nullptr, 0, reinterpret_cast<void*>(base), MPOL_F_ADDR) == 0)
@@ -627,7 +627,7 @@ std::optional<HostMemPlacement> KvCacheIntrospection::probeHostMemPlacement(size
                 // so the device has to be reselected before binding by GPU.
                 TLLM_CUDA_CHECK(cudaSetDevice(device));
                 runtime::TopologyDetector::getInstance().bindThreadByCurrentGpu();
-                backing->commit(0, span);
+                backing->resizeTo(span);
                 std::memset(reinterpret_cast<void*>(base), 0, span);
             }
             catch (...)

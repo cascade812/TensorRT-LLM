@@ -208,13 +208,12 @@ inline constexpr size_t kDiskPoolSizeGranularity = size_t{2} << 20;
 //! The grain a hot-level pool of `medium` rounds its bytes to, where
 //! `deviceGranularity` is the VMM allocation granularity device pools grow in.
 //!
-//! For the config stage, which sizes pools before any exists to be asked. Once
-//! storage is built, ask the group: PoolGroupBase::poolSizeGranularity(CacheTier).
-//! The two must agree, and do because GpuPoolGroup gives its host-backed pools a
-//! default-constructed HostMemBackingOptions, whose commit unit is kAlignment.
+//! For the config stage, which sizes pools before any exists to be asked. Once storage is
+//! built, ask the group: PoolGroupBase::poolSizeGranularity(CacheTier). The two agree
+//! because a host-backed pool commits in hostMemSizeGranularity() whatever level it is on.
 inline size_t hotPoolSizeGranularity(CacheTier medium, size_t deviceGranularity) noexcept
 {
-    return medium == CacheTier::HOST_MEM ? HostMem::kAlignment : deviceGranularity;
+    return medium == CacheTier::HOST_MEM ? hostMemSizeGranularity() : deviceGranularity;
 }
 
 //! Unit a tier of the given size allocates and releases physical memory in,
@@ -310,9 +309,6 @@ public:
     {
         return CacheTier::GPU_MEM;
     }
-
-    // Extend by exactly one physical memory chunk; returns new numSlots.
-    SlotCount extendByOnePhysMem();
 
     static size_t computeNumPhysMem(size_t slotSize, SlotCount numSlots, size_t physMemSize) noexcept;
     static SlotCount computeNumSlots(size_t slotSize, size_t numPhysMem, size_t physMemSize) noexcept;
@@ -479,7 +475,8 @@ public:
 
     //! The grain a pool of `medium` rounds its byte total to. Media of one group differ --
     //! a host-backed pool of a GPU group commits in host units, not in the device's VMM
-    //! granularity -- but pools sharing a medium do not, because they share an allocator.
+    //! granularity -- but pools sharing a medium do not: the grain follows the medium's
+    //! allocator, not the pool's slot size, which registration bounds absorb instead.
     //!
     //! Per medium rather than per pool so that this and hotPoolSizeGranularity(), which
     //! predicts the same number before any pool exists, are the same shape and can be held
@@ -545,15 +542,9 @@ public:
     //! roundedNumBytes(HOST_MEM) on a GPU-tier group is what it holds in host pages besides.
     [[nodiscard]] size_t roundedNumBytes(CacheTier medium) const
     {
-        size_t total = 0;
-        for (auto const& pool : mPools)
-        {
-            if (pool->medium() == medium)
-            {
-                total += roundUp(pool->numBytes(), pool->sizeGranularity());
-            }
-        }
-        return total;
+        // The group's count stands in for every pool's own: resizePools() hands them all the
+        // same one, and each pool's allocation is that count rounded to its own grain.
+        return roundedBytesWith(numSlots(), medium);
     }
 
 protected:
@@ -583,8 +574,12 @@ public:
     //! The group still reports GPU_MEM. Migration never reads the hot side's tier -- the
     //! codec path keeps only the cold side's -- and host memory is device-accessible, so a
     //! mixed group needs no second tier.
+    //! `hostOptions` backs the sparse pools. One object for the whole level, so every
+    //! host-backed pool of every group commits in one unit -- which is what lets
+    //! poolSizeGranularity(medium) speak of a grain per medium at all.
     GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
-        PooledPhysMemAllocator& physMemAllocator, TypedVec<PoolIndex, bool> sparsity = {});
+        PooledPhysMemAllocator& physMemAllocator, TypedVec<PoolIndex, bool> sparsity = {},
+        HostMemBackingOptions const& hostOptions = {});
 
     [[nodiscard]] CacheTier cacheTier() const noexcept override
     {
@@ -649,7 +644,7 @@ struct SecondaryPoolBudget
     //! whether anything does.
     std::optional<size_t> quota;
     //! The second medium's allocation grain, which is a property of its allocator rather
-    //! than of the level. Host-backed pools round to HostMem::kAlignment, not to the device
+    //! than of the level. Host-backed pools round to HostMem::sizeGranularity(), not to the device
     //! granularity, so charging them in device grains would over-count every one of them.
     size_t granularity = 0;
     //! The pools `quota` pays for, per pool group.
@@ -745,31 +740,23 @@ public:
         return std::nullopt;
     }
 
-    //! The grain the second medium's pools round to, or 0 when this level has none.
-    [[nodiscard]] size_t secondaryMediumGranularity() const
+    //! The grain pools of `medium` round to at this level, or 0 when it has none. Groups
+    //! holding that medium are held to agree, as the pools within one are.
+    //!
+    //! Read off a pool, for every medium alike. A host pool commits in the unit its level
+    //! was configured with and a device pool in its allocator's, so asking the pool gives
+    //! the quantum the quota is expressed in as well as the second medium's grain --
+    //! poolSizeGranularity(cacheTier()) is the former.
+    [[nodiscard]] size_t poolSizeGranularity(CacheTier medium) const
     {
-        auto const medium = secondaryMedium();
-        if (!medium.has_value())
+        auto grainOf = [medium](auto const& pg) { return pg->poolSizeGranularity(medium); };
+        auto withMedium = mPoolGroups | std::views::filter([&](auto const& pg) { return grainOf(pg) != 0; });
+        if (std::ranges::empty(withMedium))
         {
             return 0;
         }
-        for (auto const& pg : mPoolGroups)
-        {
-            if (size_t const grain = pg->poolSizeGranularity(*medium); grain != 0)
-            {
-                return grain;
-            }
-        }
-        return 0;
+        return getUniformAttribute(withMedium, grainOf);
     }
-
-    //! The quantum this level's quota is expressed in, for the arithmetic that divides a
-    //! budget across pool groups.
-    //!
-    //! Configured, not read off a pool: a pool's own grain is this adjusted for its slot
-    //! size (see hostCommitUnit), so the two differ and a quota quantized to a pool's
-    //! grain would round to a figure the level never asked for.
-    [[nodiscard]] virtual size_t poolSizeGranularity() const noexcept = 0;
 
     // Returns numSlots() per pool group.
     TypedVec<PoolGroupIndex, SlotCount> slotCountList() const
@@ -781,30 +768,26 @@ public:
         return ret;
     }
 
-    //! The pools whose pages are `medium`, as indices into slotSizeLists()[pg]. An absent
-    //! `medium` names no pools, which is what a level that has none should contribute.
+    //! The pools whose pages are `medium`, as indices into slotSizeLists()[pg].
     //!
-    //! Takes an optional so it composes with secondaryMedium(). Pass that rather than a
-    //! literal when you mean "the pools this level's quota does not pay for": on a host
-    //! level every pool is HOST_MEM, yet none of them is a second medium.
+    //! For "the pools this level's quota does not pay for", pass secondaryMedium() rather
+    //! than a literal: on a host level every pool is HOST_MEM, yet none of them is a
+    //! second medium.
     //!
     //! The complement is what the quota pays for, which the allocator derives rather than
     //! taking: that way no pool can be charged twice or missed.
-    [[nodiscard]] TypedVec<PoolGroupIndex, std::vector<PoolIndex>> poolsOfMedium(std::optional<CacheTier> medium) const
+    [[nodiscard]] TypedVec<PoolGroupIndex, std::vector<PoolIndex>> poolsOfMedium(CacheTier medium) const
     {
         TypedVec<PoolGroupIndex, std::vector<PoolIndex>> ret;
         ret.reserve(mPoolGroups.size());
         for (auto const& pg : mPoolGroups)
         {
             std::vector<PoolIndex> matching;
-            if (medium.has_value())
+            for (PoolIndex pool{0}; pool < pg->slotSize().size(); ++pool)
             {
-                for (PoolIndex pool{0}; pool < pg->slotSize().size(); ++pool)
+                if (pg->poolMedium(pool) == medium)
                 {
-                    if (pg->poolMedium(pool) == *medium)
-                    {
-                        matching.push_back(pool);
-                    }
+                    matching.push_back(pool);
                 }
             }
             ret.push_back(std::move(matching));
@@ -940,16 +923,12 @@ public:
     //! rather than directly, so they live on the hot level as ordinary pages that merely
     //! happen to be host-resident.
     GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator);
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator,
+        HostMemBackingOptions const& hostOptions = {});
 
     CacheTier cacheTier() const noexcept override
     {
         return CacheTier::GPU_MEM;
-    }
-
-    size_t poolSizeGranularity() const noexcept override
-    {
-        return mPhysMemAllocator.physMemSize();
     }
 
 private:
@@ -970,14 +949,9 @@ public:
         return CacheTier::HOST_MEM;
     }
 
-    size_t poolSizeGranularity() const noexcept override
-    {
-        return mOptions.commitUnit;
-    }
-
     //! Always set: an unset configured maxQuota resolves to the host memory the
     //! OS reports, and the pools reserve against that resolved value. Rounded
-    //! up to poolSizeGranularity(), which is the quantum quotas are expressed
+    //! up to poolSizeGranularity(cacheTier()), which is the quantum quotas are expressed
     //! in, so the configured bound is reachable.
     [[nodiscard]] std::optional<size_t> maxQuota() const noexcept override
     {
@@ -1001,11 +975,6 @@ public:
     }
 
     //! Disk has no allocation unit to match, so this is a rounding quantum alone.
-    size_t poolSizeGranularity() const noexcept override
-    {
-        return kDiskPoolSizeGranularity;
-    }
-
     std::string const& directory() const noexcept
     {
         return mDirectory;

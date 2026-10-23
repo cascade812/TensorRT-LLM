@@ -721,16 +721,6 @@ PageIndexConverter KvCacheManager::getPageIndexConverter(LayerId layerId, DataRo
     return PageIndexConverter{scale, attr.expansion, offset, scratchPages};
 }
 
-std::optional<bool> KvCacheManager::supportsIndexMode(PageIndexMode mode) const
-{
-    switch (mode)
-    {
-    case PageIndexMode::PER_LAYER: return true;
-    case PageIndexMode::SHARED: return mConfig.enableSwaScratchReuse() ? std::optional<bool>(std::nullopt) : true;
-    }
-    return std::nullopt;
-}
-
 std::optional<bool> KvCacheManager::supportsIndexMode(PageIndexMode mode, LifeCycleId lcId) const
 {
     switch (mode)

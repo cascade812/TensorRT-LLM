@@ -21,29 +21,32 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <map>
 #include <memory>
+#include <stack>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
-//! Smallest unit the backing allocates in, and the alignment every size it is
-//! given must satisfy.
-inline constexpr size_t kHostMemAlignment = 2ULL << 20;
+//! What every size a caller asks of the host tier must be a multiple of.
+//!
+//! A granularity, not an address alignment: the reservation's base comes from mmap and is
+//! only page-aligned, so this constrains sizes and offsets within it rather than addresses.
+//!
+//! One value for the process, settled from the page size on first use. Nothing configures
+//! it: madvise and mprotect take any page-aligned range, so a larger tier has no reason to
+//! want a larger one, and the chunks the fill actually works in are its own business.
+[[nodiscard]] size_t hostMemSizeGranularity() noexcept;
 
 struct HostMemBackingOptions
 {
-    //! Unit memory is registered and released in. Also the alignment every
-    //! commit and decommit bound must satisfy, and therefore how finely a resize
-    //! can give memory back.
+    //! What every registration bound is a multiple of, so no registration ever
+    //! splits a range of this size. The registered prefix therefore trails the
+    //! committed one by up to this much.
     //!
-    //! Each unit is a separate registration, so it must divide whatever ranges
-    //! are copied in one call: the driver rejects a copy that straddles two
-    //! registrations. It need not be a multiple of the page size -- registration
-    //! accepts any alignment, and the madvise and mprotect calls round to pages
-    //! themselves, outwards when they must cover the range and inwards when they
-    //! must not reach past it.
-    size_t commitUnit = kHostMemAlignment;
+    //! A caller sets it to the largest range it hands to one cudaMemcpy, which
+    //! the driver rejects if it straddles two registrations. 1 imposes no
+    //! constraint, which is what a caller that never copies wants.
+    size_t registerUnit = 1;
 
     //! Whether a page may come from a NUMA node other than the one the GPU
     //! attaches to, when the local node cannot satisfy it.
@@ -57,13 +60,13 @@ struct HostMemBackingOptions
     bool allowRemoteNumaFallback = true;
 };
 
-//! Physical backing for the host tier: reserve an address range once, then
-//! commit it a unit at a time.
+//! Physical backing for the host tier: an address range reserved on
+//! construction, whose committed prefix then moves towards a target a chunk at
+//! a time.
 //!
-//! The base address returned by reserve() is fixed for the lifetime of the
-//! object. Growing and shrinking touch only the delta, so a resize costs
-//! O(delta) rather than O(total) and never invalidates a pointer the allocator
-//! above has handed out.
+//! The base address is fixed for the lifetime of the object. Growing and
+//! shrinking touch only the delta, so a resize costs O(delta) rather than
+//! O(total) and never invalidates a pointer the allocator above has handed out.
 //!
 //! Pages are populated through the kernel's fault path (MADV_POPULATE_WRITE)
 //! and then handed to the driver with cuMemHostRegister. Allocating and zeroing
@@ -72,14 +75,31 @@ struct HostMemBackingOptions
 //! an 8-GPU node collapsed per-process fill throughput by roughly 5x and blocked
 //! unrelated CUDA calls on the same process for seconds at a time.
 //!
-//! Registration happens in units rather than over the whole range so that a
-//! shrink can unregister exactly what it releases; a registration can only be
-//! dropped whole. Each unit stays far below the 2 GiB-per-call pinning limit on
-//! Linux 6.11.
+//! Registration happens in chunks rather than over the whole range so that a
+//! shrink can unregister close to exactly what it releases; a registration can
+//! only be dropped whole. Each chunk stays far below the 2 GiB-per-call pinning
+//! limit on Linux 6.11.
+//!
+//! The target is set once and reached over many steps, rather than each step
+//! naming its own range, because a step that knows more are coming can stop on
+//! a chunk boundary and leave the remainder to its successor. Registering what
+//! a step happened to populate instead would fragment the range into one
+//! registration per step, each one a chunk plus whatever the previous step's
+//! rounding left over.
 class HostMemBacking
 {
 public:
-    explicit HostMemBacking(HostMemBackingOptions const& options);
+    //! Reserves `vmSize` bytes of address space, page-aligned as mmap returns it
+    //! and no coarser, and takes no memory for it. No page is resident and none
+    //! is reachable: the whole range is PROT_NONE until a step opens it, so a
+    //! read that runs ahead of the fill faults instead of returning zeros.
+    //!
+    //! `vmSize` must be a multiple of hostMemSizeGranularity(). Zero reserves
+    //! nothing, for an owner that has no range to back.
+    //!
+    //! Needs a current CUDA context, which is captured here: registration needs
+    //! one and the fill worker only sets the device, which does not give it one.
+    explicit HostMemBacking(size_t vmSize, HostMemBackingOptions const& options = {});
     ~HostMemBacking();
 
     HostMemBacking(HostMemBacking const&) = delete;
@@ -87,52 +107,133 @@ public:
     HostMemBacking(HostMemBacking&&) = delete;
     HostMemBacking& operator=(HostMemBacking&&) = delete;
 
-    //! Reserves `size` bytes of address space, page-aligned as mmap returns it
-    //! and no coarser. No page is resident and none is reachable: the whole
-    //! range is PROT_NONE until commit() opens it, so a read that runs ahead of
-    //! the fill faults instead of returning zeros.
-    //!
-    //! Must be called exactly once, before any commit.
-    [[nodiscard]] MemAddress reserve(size_t size);
+    //! Base of the reservation, fixed for the lifetime of the object. Zero once
+    //! destroy() has run, and for a backing reserving nothing.
+    [[nodiscard]] MemAddress address() const noexcept
+    {
+        return mAddr;
+    }
 
-    //! Makes [offset, offset + size) resident and reachable by both the CPU and
-    //! the GPU. Both bounds must be multiples of commitGranularity().
-    //!
-    //! Throws HostOOMError when the system cannot back the range; that is the
-    //! expected failure and callers are required to handle it.
-    void commit(size_t offset, size_t size);
+    //! Bytes of address space held, i.e. the largest target this accepts.
+    [[nodiscard]] size_t reservedSize() const noexcept
+    {
+        return mSize;
+    }
 
-    //! Releases the physical backing of [offset, offset + size), which stays
-    //! reserved and may be committed again. Both bounds must be multiples of
-    //! commitGranularity().
-    void decommit(size_t offset, size_t size) noexcept;
+    //! Declares how much of the reservation should end up committed. Must be a
+    //! multiple of commitGranularity() and no larger than the reservation.
+    //!
+    //! Takes no memory by itself; resizeStep() does the work. The previous
+    //! target must have been reached: a caller that wants a different one is
+    //! responsible for finishing or abandoning the fill in flight, which is
+    //! what it has to do anyway to stop a worker touching the range.
+    void setTargetSize(size_t size);
+
+    //! Moves committedSize() one chunk towards the target and returns
+    //! registeredSize().
+    //!
+    //! A single step, so a caller filling a large tier can publish progress
+    //! between them. It is a no-op once committedSize() == targetSize(), which
+    //! is how a loop over it terminates.
+    //!
+    //! Throws HostOOMError when the system cannot back the chunk; that is the
+    //! expected failure and callers are required to handle it. The step then
+    //! takes nothing: committedSize() is left where it was found.
+    size_t resizeStep();
+
+    //! Sets the target and steps until it is reached, for a caller with nothing
+    //! to do in between.
+    void resizeTo(size_t size);
 
     //! Releases everything, including the reservation. Idempotent.
     void destroy() noexcept;
 
-    //! The unit memory is populated, registered and released in.
+    //! The granularity of every size this object is asked for.
     [[nodiscard]] size_t commitGranularity() const noexcept
     {
         return mUnit;
     }
 
+    [[nodiscard]] size_t targetSize() const noexcept
+    {
+        return mTarget;
+    }
+
+    //! Bytes resident and reachable, from the base. Moves one chunk per step.
+    [[nodiscard]] size_t committedSize() const noexcept
+    {
+        return mCommitted;
+    }
+
+    //! Bytes the GPU may be copied to or from, from the base. Never exceeds
+    //! committedSize(), and trails it by less than one register unit once the
+    //! target is reached.
+    [[nodiscard]] size_t registeredSize() const noexcept
+    {
+        return mRegisteredEnd;
+    }
+
 private:
-    void unregisterRange(size_t offset, size_t size) noexcept;
+    //! Populate up to `end`, which must be at or above mCommitted.
+    void commitUpTo(size_t end);
+
+    //! Release from `end`, which must be at or below mCommitted.
+    void decommitFrom(size_t end) noexcept;
+
+    //! Extend registration towards the last whole register unit at or below `end`.
+    //! Unless `allowPartialChunk`, stops at the last whole chunk boundary so the
+    //! remainder joins the next chunk rather than becoming a registration of its
+    //! own.
+    void registerUpTo(size_t end, bool allowPartialChunk);
+
+    //! Drop registration above the last whole register unit at or below `end`.
+    void unregisterFrom(size_t end) noexcept;
+
+    //! Remember `start` if it is not where arithmetic would look for it.
+    void recordRegistrationStart(size_t start);
+
+    //! Where the registration ending at mRegisteredEnd began. Requires one to exist.
+    [[nodiscard]] size_t innermostRegistrationStart() const noexcept;
+
+    //! Unregister that one and pull mRegisteredEnd back to its start, which is
+    //! returned.
+    size_t dropInnermostRegistration() noexcept;
+
+    //! cuMemHostUnregister takes only a base address; the size is the driver's.
+    void unregisterAt(size_t offset) noexcept;
 
     size_t mUnit = 0;
+    size_t mRegUnit = 1;
+    //! Bytes per registration: the most whole register units that fit in the target
+    //! chunk size, or one register unit when that is the larger.
+    size_t mRegChunk = 0;
     bool mAllowRemoteNumaFallback = true;
     MemAddress mAddr = 0;
+
+    //! Bytes of address space held.
     size_t mSize = 0;
 
-    //! Bytes actually mapped: mSize rounded up to a page, since a unit is a
-    //! whole number of slots and need not end on one.
+    size_t mTarget = 0;
+    size_t mCommitted = 0;
+
+    //! Bytes actually mapped: mSize rounded up to a page.
     size_t mMapped = 0;
 
-    //! Offsets of the units currently registered. A unit is registered exactly
-    //! when it is committed, so this is also what destroy() must undo.
-    std::map<size_t, size_t> mRegistered;
+    //! Innermost last. Registrations are contiguous and grow and shrink only at
+    //! the end, so a stack is the whole structure.
+    //!
+    //! Only the unaligned ones, because the rest are arithmetic: a step registers
+    //! whole chunks from a boundary, so the start of the registration covering a
+    //! byte is normally the chunk boundary below it. One case breaks that -- a
+    //! fill resumed at a higher target begins where the previous target's partial
+    //! tail ended -- and those are what this holds, one per resumed fill rather
+    //! than one per chunk of the tier.
+    std::stack<size_t> mUnalignedRegStarts;
 
-    //! Captured in reserve(), which runs on the thread that owns the context.
+    //! End of the registered prefix, always a whole number of register units.
+    size_t mRegisteredEnd = 0;
+
+    //! Captured on construction, which runs on the thread that owns the context.
     //! cuMemHostRegister needs a current context and the fill worker only sets
     //! the device, which leaves it without one.
     void* mContext = nullptr;
