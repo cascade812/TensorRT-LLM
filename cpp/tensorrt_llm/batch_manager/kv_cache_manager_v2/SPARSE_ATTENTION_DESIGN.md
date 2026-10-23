@@ -985,6 +985,58 @@ That is an implementation limit, not a property of the design. Lifting it:
 Until then a mismatch is rejected at construction. It was previously taken as a `max` across
 the life cycle, which quietly served one layer's shape to another.
 
+## Planned: the output list honours `IndexTableSpec`
+
+A spec says which buffers a consumer needs addressable together, from one base. For a
+sparse life cycle the scatter is the half that has to honour it, because the scatter's
+output is the half a consumer sees: the converted indices over the **host** pages are the
+copy's input, naming where a miss is read from, and no attention kernel ever holds them.
+What a kernel is handed is `out`, in the arena's index space.
+
+Today that is backwards. The copy resolves `sparseIndexRun(layer, role)` per buffer and
+takes both the table and the base from it; the dense converter is table-oriented
+throughout; and the scatter alone walks pool runs and lays `out` out by the caller's buffer
+vector, one slice each. So a spec a caller declares reaches only the internal addressing,
+and the list they read ignores it.
+
+**Lay `out` out per table**, entries within a table in the spec's buffer order -- the shape
+`_buildIndexTables` already produces. The index a buffer takes is the resolve's slot put
+through an affine map:
+
+```
+out = (leaseIndex * cellsPerLease + slotInPool * cellsPerBuffer + slot / unitsPerPage)
+      * unitsPerPage + slot % unitsPerPage
+```
+
+`slot` is the resolve's, identical across a layer's buffers; `cellsPerBuffer` is one value
+for the whole shape. So the two terms that vary are the sparse spellings of what the dense
+converter already names:
+
+- **`slotInPool * cellsPerBuffer` is `concatOffsets`.** It stays in the index, which is
+  what lets one base serve every buffer of a spec.
+- **`cellsPerLease` is `scale`.** It is `buffersInPool * cellsPerBuffer`.
+
+Note the two halves of the fetch answer "where does the per-buffer offset live" differently
+today: the copy folds `bufferSlotInPool * cellsPerBuffer * bufferBytes` into `deviceBase`,
+while the scatter leaves the same term in the index. Each is consistent with the base its
+own consumer holds, and laying `out` out per table is what makes the scatter's choice the
+declared one rather than an accident of the pool walk.
+
+**A SHARED mode then follows.** Tables whose `scale` and offsets both coincide hold
+bit-identical lists and can be merged, which is the test `_buildIndexTables` already
+applies:
+
+```
+table.lifeCycle == lifeCycle && table.scale == scale && table.concatOffsets == offsets
+```
+
+A key-and-value pool beside a scale pool qualifies: equal buffer counts give equal
+`cellsPerLease`, and the lockstep counters give equal offsets. Four slices become two and
+the scatter runs once rather than once per pool. Pools of unequal width do not qualify:
+their indices differ by `(cellsPerLease_a - cellsPerLease_b) * leaseIndex * unitsPerPage`,
+which varies with the request's lease and so is not an offset at all. See
+`INDEX_CONVERSION_DESIGN.md`.
+
 ## Sparse buffers across more than one pool
 
 A life cycle's sparse buffers need not agree on size. The **quantised shape** — block scales
