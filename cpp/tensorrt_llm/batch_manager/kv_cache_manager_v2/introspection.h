@@ -31,6 +31,10 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
+//! Defined in batch.h, which this header does not pull in: Batch itself arrives as a
+//! forward declaration from kvCache.h, and one hook returns this by value.
+struct GpuCoalescedPageTable;
+
 //! Where a host-tier allocation's pages ended up, and under which policy.
 struct HostMemPlacement
 {
@@ -80,6 +84,14 @@ public:
     //! One converted index table, row-major [entries][max_batch][blocks_per_seq].
     //! Reads the device copy, so it shows what the last publish() converted. Synchronises.
     static std::vector<int32_t> batchIndexTable(Batch const& batch, int tableId);
+
+    //! White-box hook: one layer group's coalesced page table on the device.
+    //!
+    //! The view, not a copy: unlike the hooks around it this neither synchronises nor
+    //! reads back. Its callers check the DLPack device-array contract and that the device
+    //! pointer is stable across resizes, both of which a host copy would erase. The host
+    //! table, which is what a consumer actually reads, is Batch::coalescedPageTable().
+    static GpuCoalescedPageTable batchGpuCoalescedPageTable(Batch const& batch, int layerGroupId);
 
     // White-box hook: entriesPerLayer of each row's published sparse cache view, zero where
     // no view is staged. Non-zero exactly where a member holds a reservation. Synchronises.

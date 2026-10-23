@@ -173,6 +173,13 @@ public:
         return mRegisteredEnd;
     }
 
+    //! What registration bounds are multiples of, as the options asked, or 1 when
+    //! they imposed no constraint.
+    [[nodiscard]] size_t registerUnit() const noexcept
+    {
+        return mRegUnit;
+    }
+
 private:
     //! Populate up to `end`, which must be at or above mCommitted.
     void commitUpTo(size_t end);

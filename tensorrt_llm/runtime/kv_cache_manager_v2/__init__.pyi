@@ -1164,8 +1164,15 @@ class Batch:
 
     @property
     def cuda_stream(self) -> CudaStream:
-        """The stream this batch and every member run on, fixed at construction."""
+        """The stream this batch and every member run on.
 
+        Assigning moves the batch and every member onto the new stream, which first waits
+        on what the old one has queued, so no explicit synchronization is needed. A member
+        cannot be moved on its own: its own setter refuses while it is in a batch.
+        """
+
+    @cuda_stream.setter
+    def cuda_stream(self, cuda_stream: CudaStream) -> None: ...
     @property
     def max_batch_size(self) -> int: ...
     @property
@@ -1282,7 +1289,7 @@ class Batch:
         buffers: Sequence[BufferId],
         selected: DeviceArray,  # int32[batch, topk]
         out: DeviceArray,  # int32[batch, len(buffers), topk]
-        stream: CudaStream,
+        stream: CudaStream | None = None,
     ) -> None:
         """Resolve a batch's selections against each buffer's per-request history cache.
 
@@ -1291,6 +1298,13 @@ class Batch:
         enqueues onto ``stream`` and returns. Order it against the selection kernel by
         sharing a stream, or across streams with an event. Every shape is static across
         steps, so the call is capturable in a CUDA graph.
+
+        ``stream`` defaults to the batch's own, which is the only correct choice while
+        layers are fetched in order, since a layer's selection comes from the one before
+        it. Name a stream only to run ahead of that -- a model that fetches several layers
+        early can do so on its own -- and then order it against the batch's stream
+        yourself: the resolve's scratch and counters are batch state the step clears on
+        that stream.
 
         ``buffers`` must be exactly one layer's sparse buffers, in the order
         :meth:`get_mem_pool_base_address` numbers them. One layer, not one layer group:
@@ -1448,17 +1462,6 @@ class Batch:
 
         An entry names a coalesced slot, which may hold several buffers; a converted index
         names one buffer inside one. See :meth:`converted_index_table`.
-        """
-
-    def gpu_coalesced_page_table(self, layer_group_id: LayerGroupId) -> DeviceArray:
-        """``int32[max_batch, max_blocks_per_seq]`` coalesced page indices, on the device.
-
-        Internal. The device copy exists for the index conversion to read; a consumer's own
-        kernels read the converted tables instead, and a consumer wanting the indices
-        themselves reads :meth:`coalesced_page_table`. Exposed for tests and introspection.
-
-        A DLPack array over memory the ``Batch`` owns; it keeps the ``Batch`` alive for as
-        long as the array exists. An unoccupied row reads as ``BAD_PAGE_INDEX`` throughout.
         """
 
     def history_lengths(self) -> DeviceArray:

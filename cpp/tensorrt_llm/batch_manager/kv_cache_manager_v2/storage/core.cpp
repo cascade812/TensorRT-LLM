@@ -697,7 +697,11 @@ HostPoolGroup::HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> con
     for (size_t sz : slotSizeList)
     {
         double const sizeRatio = static_cast<double>(sz) / static_cast<double>(maxSlotSize);
-        auto const poolVmSize = static_cast<size_t>(static_cast<double>(groupVmSize) * sizeRatio);
+        // Rounded here because the share is scaled by a ratio and so lands anywhere, while
+        // HostMem takes only whole granules. Up rather than down, and the shares may then
+        // sum past groupVmSize: this is address space, which costs nothing until committed.
+        auto const poolVmSize
+            = roundUp(static_cast<size_t>(static_cast<double>(groupVmSize) * sizeRatio), hostMemSizeGranularity());
         mPools.push_back(std::make_unique<HostSlotPool>(sz, numSlots, poolVmSize, options));
     }
 }

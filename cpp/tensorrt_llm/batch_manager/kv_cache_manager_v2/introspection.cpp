@@ -161,6 +161,11 @@ std::vector<int32_t> KvCacheIntrospection::batchIndexTable(Batch const& batch, i
     return out;
 }
 
+GpuCoalescedPageTable KvCacheIntrospection::batchGpuCoalescedPageTable(Batch const& batch, int layerGroupId)
+{
+    return batch.gpuCoalescedPageTable(LayerGroupId{layerGroupId});
+}
+
 std::vector<int32_t> KvCacheIntrospection::batchSparseViewEntries(Batch const& batch, int layerGroupId)
 {
     auto const rows = static_cast<size_t>(batch.maxBatchSize());

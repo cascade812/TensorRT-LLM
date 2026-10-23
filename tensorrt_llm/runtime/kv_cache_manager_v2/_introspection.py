@@ -295,6 +295,17 @@ def batch_index_table(batch: Any, table_id: int) -> list[int]:
     return list(_cpp().batch_index_table(batch, table_id))
 
 
+def batch_gpu_coalesced_page_table(batch: Any, layer_group_id: int) -> Any:
+    """One layer group's coalesced page table on the device, as a DLPack array.
+
+    ``int32[max_batch, max_blocks_per_seq]``. A view rather than a copy, so unlike the
+    other hooks here it neither synchronises nor returns a plain list: callers check the
+    device-array contract and that the pointer is stable across resizes. The indices a
+    consumer actually reads come from ``Batch.coalesced_page_table()``, on the host.
+    """
+    return _cpp().batch_gpu_coalesced_page_table(batch, layer_group_id)
+
+
 def batch_sparse_view_entries(batch: Any, layer_group_id: int) -> list[int]:
     """Entries per buffer of each row's published sparse cache view.
 

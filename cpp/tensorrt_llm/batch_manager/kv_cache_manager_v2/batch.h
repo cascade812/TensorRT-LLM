@@ -68,7 +68,7 @@ struct ConvertedIndexTable
     int32_t blocksPerRow = 0;
 };
 
-//! One layer group's page table as the host writes it, in the Batch's pinned staging.
+//! One lifecycle's page table as the host writes it, in the Batch's pinned staging.
 //! Packed like the device one, and for the same reason: the Batch allocates it.
 //!
 //! A consumer that needs these indices for its own purposes reads this rather than lending
@@ -89,7 +89,7 @@ struct CoalescedPageTable
 //! Identifies one converted index table of a Batch.
 using IndexTableId = StrongIndex<int, struct IndexTableIdTag>;
 
-//! Device scratch one layer group's step works through: what a fetch resolves into before
+//! Device scratch one lifecycle's step works through: what a fetch resolves into before
 //! the copy and the index scatter read it back, and what a write-back lists before its own
 //! copy reads it.
 //!
@@ -184,9 +184,11 @@ public:
     //! @param indexTables what consumers need addressable together. Requests whose
     //! converted indices coincide are merged onto one table, which is how a quantised
     //! layer's data and block scales come to share one.
-    //! @param stream the stream every member runs on. A Batch owns it rather than taking
-    //! one per call: a member's own work and the Batch's transfers have to be ordered
-    //! against each other, and two streams would leave that ordering to the caller.
+    //! @param stream the stream every member runs on, taken here rather than one per call:
+    //! a member's own work and the Batch's transfers have to be ordered against each other,
+    //! and two streams would leave that ordering to the caller. setCudaStream() moves the
+    //! Batch and its members together, which is the only way it changes. The caller keeps
+    //! it -- a Batch neither creates nor destroys it, and it must outlive the Batch.
     //!
     //! @param maxTotalInputTokens tokens one step may ingest across every row, as the
     //! runtime's own batching bound gives it. It sizes the write-back's work list: a row
@@ -205,11 +207,25 @@ public:
         std::optional<PageIndexMode> mode = std::nullopt, std::vector<IndexTableSpec> indexTables = {},
         std::optional<int> maxTotalInputTokens = std::nullopt);
 
-    //! The stream the Batch and every member run on, fixed at construction.
+    //! The stream the Batch and every member run on.
     [[nodiscard]] CUstream cudaStream() const noexcept
     {
         return mCudaStream;
     }
+
+    //! Moves the Batch and every member onto `stream`.
+    //!
+    //! The new stream is made to wait on what the old one already has queued, so the
+    //! caller need not synchronize: the device arrays and the staging buffer are the same
+    //! objects either side of the move, and work that names them stays ordered.
+    //!
+    //! Members move too. A KvCache in a Batch runs on the Batch's stream -- its own setter
+    //! refuses while it is a member -- so leaving them behind would split the very ordering
+    //! a Batch exists to keep.
+    //!
+    //! Like the constructor, this takes no ownership: the caller's stream must outlive the
+    //! Batch, or be replaced here before it is destroyed.
+    void setCudaStream(CUstream stream);
 
     //! Page index mode of one life cycle, as chosen at construction.
     [[nodiscard]] PageIndexMode indexMode(LayerGroupId layerGroupId) const;
@@ -411,8 +427,13 @@ public:
     //! Compact, in the selection's own order, rather than a table indexed by unit ordinal,
     //! because that is the shape sparse attention kernels take. See
     //! SPARSE_ATTENTION_DESIGN.md's "Fetch".
+    //! `stream` defaults to the Batch's own, which is the only correct choice while the
+    //! layers are fetched in order: a layer's selection comes from the one before it. Name
+    //! a stream only to run ahead of that -- a model that fetches several layers early can
+    //! do so on its own -- and then order it against the Batch's stream yourself, because
+    //! the resolve's scratch and counters are Batch state the step clears on that stream.
     void fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
-        int32_t* out, CUstream stream);
+        int32_t* out, std::optional<CUstream> stream = std::nullopt);
 
     //! Give the in-flight unit of each request a cell, and report where to write it.
     //!
@@ -435,15 +456,13 @@ public:
     //! `out` is [maxBatchSize][buffers.size()], written in full, in the same expanded index
     //! space fetchSparsePages produces and relative to the same per-pool arena region:
     //! kBadPageIndex where the row holds no reservation or has nothing in flight.
-    void prepareSparseWriteIndices(std::vector<BufferId> const& buffers, int32_t* out, CUstream stream);
+    //! `stream` defaults to the Batch's own, on the same terms as fetchSparsePages.
+    void prepareSparseWriteIndices(
+        std::vector<BufferId> const& buffers, int32_t* out, std::optional<CUstream> stream = std::nullopt);
 
     //! The history each row has been written back to. A row that has never needed a flush
     //! reads its own history, so a caller may always compare against it.
     [[nodiscard]] int flushedHistory(int row) const;
-
-    //! Where one life cycle's staged [from] units start; its [to] units follow maxBatchSize
-    //! later. Written by flushSparseUnits(), read by the scan it launches.
-    [[nodiscard]] int32_t const* flushRangeRow(LifeCycleId lifeCycle) const;
 
     //! Block until the last publish() has finished reading the staging rows.
     //!
@@ -452,33 +471,15 @@ public:
     //! member directly is the one that has to.
     void waitPublished();
 
-    [[nodiscard]] GpuCoalescedPageTable gpuCoalescedPageTable(LayerGroupId layerGroupId) const;
-
     //! One layer group's page table on the host, as a publish will upload it. Read-only:
     //! the entries are the members' to write, through their page locks.
     [[nodiscard]] CoalescedPageTable coalescedPageTable(LayerGroupId layerGroupId) const;
-
-    //! Per-row sparse cache state for one layer group, as the fetch kernel sees it.
-    //!
-    //! A device array of SparseCacheView, indexed by row. A free row, or a member whose
-    //! cache is not reserved, reads as a default-constructed view -- null pointers and zero
-    //! counts -- which the kernel skips.
-    //!
-    //! The views hold pointers into each request's own allocation, so what is mirrored is
-    //! the handle rather than the memory: the reservation stays with the request. They move
-    //! whenever a member resumes or suspends, which is why they are restaged on every
-    //! publish alongside the watermarks.
-    [[nodiscard]] CUdeviceptr sparseCacheViews(LayerGroupId layerGroupId) const;
 
     //! Per-row history length and capacity, published by the same transfer as the page
     //! tables. They have to travel together: the lengths bound which entries of a row are
     //! valid, so a kernel pairing one step's table with another step's lengths would read
     //! past the end of a row that has since been reused.
     [[nodiscard]] WatermarkView watermarks() const;
-
-    //! Scratch for one layer group's fetch. Null pointers when the group carries no sparse
-    //! cache, which is what makes "nothing to fetch here" cheap to detect.
-    [[nodiscard]] SparseStepScratch const& sparseStepScratch(LayerGroupId layerGroupId) const;
 
     //! Row of a member, or -1.
     [[nodiscard]] int rowOf(KvCache const& kvCache) const;
@@ -541,9 +542,53 @@ public:
     [[nodiscard]] std::shared_ptr<KvCache> const& operator[](int row) const;
 
 private:
+    //! Reaches the step state below, which has no caller outside this class and the
+    //! introspection hooks that report it. KvCache mirrors the same arrangement.
+    friend class KvCacheIntrospection;
+
     //! Write back every row's crossed units for one life cycle, from the ranges the Batch
     //! staged. One scan over (layer, row), then one copy per pool covering the whole batch.
     void writeBackSparseUnits(LifeCycleId lifeCycle, CUstream stream);
+
+    //! One layer group's page table on the device, which the index conversion reads. A
+    //! consumer reads the converted table instead; coalescedPageTable() is the host copy
+    //! and the one with the indices a caller wants.
+    [[nodiscard]] GpuCoalescedPageTable gpuCoalescedPageTable(LayerGroupId layerGroupId) const;
+
+    //! Per-row sparse cache state for one layer group, as the fetch kernel sees it.
+    //!
+    //! A device array of SparseCacheView, indexed by row. A free row, or a member whose
+    //! cache is not reserved, reads as a default-constructed view -- null pointers and zero
+    //! counts -- which the kernel skips.
+    //!
+    //! The views hold pointers into each request's own allocation, so what is mirrored is
+    //! the handle rather than the memory: the reservation stays with the request. They move
+    //! whenever a member resumes or suspends, which is why they are restaged on every
+    //! publish alongside the watermarks.
+    [[nodiscard]] CUdeviceptr sparseCacheViews(LayerGroupId layerGroupId) const;
+
+    //! Scratch for one layer group's fetch. Null pointers when the group carries no sparse
+    //! cache, which is what makes "nothing to fetch here" cheap to detect.
+    [[nodiscard]] SparseStepScratch const& sparseStepScratch(LayerGroupId layerGroupId) const;
+
+    //! The unit ordinals bounding what each row's history watermark crossed in the last
+    //! flushSparseUnits(), for one life cycle: row `r` crossed [from[r], to[r]).
+    //!
+    //! Two parallel arrays of maxBatchSize rather than an array of pairs: the scan reads
+    //! one row per thread and takes the bounds as separate pointers, so each stays
+    //! coalesced. A struct per row would stride both reads by two.
+    //!
+    //! Ordinals are in this life cycle's units -- tokensPerBlock / unitsPerPage -- so one
+    //! token count quantises differently per life cycle. That is why these are per life
+    //! cycle where flushedHistory(), which is in tokens, is not.
+    //!
+    //! Device memory, written by flushSparseUnits() and read by the scan it launches.
+    //! Stale unless that flush found work: a step where no row crossed a boundary skips
+    //! the upload, which is safe only because nothing reads these then.
+    [[nodiscard]] int32_t const* flushFromUnits(LifeCycleId lifeCycle) const;
+
+    //! @see flushFromUnits
+    [[nodiscard]] int32_t const* flushToUnits(LifeCycleId lifeCycle) const;
 
     friend class KvCache;
 

@@ -2406,6 +2406,22 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("table_id"),
         "One converted index table, row-major [entries][max_batch][blocks_per_seq]. Reads the "
         "device copy, so it shows what the last publish() converted. Synchronises.");
+    mIntrospection.def(
+        "batch_gpu_coalesced_page_table",
+        [](nb::object batchObj, int layerGroupId)
+        {
+            auto const& batch = nb::cast<kv::Batch const&>(batchObj);
+            auto const view = kv::KvCacheIntrospection::batchGpuCoalescedPageTable(batch, layerGroupId);
+            // The Batch owns the memory; batchObj keeps it alive for the array's lifetime.
+            return makeDeviceArray2D(view.data, view.numRows, view.blocksPerRow, batchObj);
+        },
+        nb::arg("batch"), nb::arg("layer_group_id"),
+        "int32[max_batch, max_blocks_per_seq] coalesced page indices for one layer group, as a "
+        "DLPack array on the device.\n\n"
+        "A view, not a copy, and so unlike its neighbours it neither synchronises nor returns a "
+        "plain list. The device copy exists for the index conversion to read, and the kernels a "
+        "consumer writes read the converted table instead: Batch.coalesced_page_table() is where "
+        "the indices themselves are read.");
     mIntrospection.def("batch_sparse_view_entries", &kv::KvCacheIntrospection::batchSparseViewEntries, nb::arg("batch"),
         nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
@@ -2864,8 +2880,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 {
                     throw std::invalid_argument("prepare_sparse_write_indices: out's last extent must be len(buffers)");
                 }
-                auto const handle
-                    = stream.is_none() ? CUstream{} : reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream));
+                auto const handle = stream.is_none()
+                    ? std::optional<CUstream>{}
+                    : std::optional<CUstream>{reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream))};
                 auto* outPtr = out.data();
                 nb::gil_scoped_release rel;
                 self.prepareSparseWriteIndices(buffers, outPtr, handle);
@@ -2913,8 +2930,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         "fetch_sparse_pages: out's last extent must be the selection width; the result is compact, "
                         "one index per selection slot, not a table indexed by ordinal");
                 }
-                auto const handle
-                    = stream.is_none() ? CUstream{} : reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream));
+                auto const handle = stream.is_none()
+                    ? std::optional<CUstream>{}
+                    : std::optional<CUstream>{reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream))};
                 auto* selectedPtr = selected.data();
                 auto* outPtr = out.data();
                 auto const width = static_cast<int>(selected.shape(1));
@@ -2938,7 +2956,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "pages, which are host memory for a sparse life cycle, while the cells a kernel "
             "reads live in the arena.\n\n"
             "Device-driven and stream-ordered: enqueues and returns, and every shape is static, "
-            "so a CUDA graph can capture it.")
+            "so a CUDA graph can capture it.\n\n"
+            "stream defaults to the batch's own, which is the only correct choice while layers are "
+            "fetched in order, since a layer's selection comes from the one before it. Name a stream "
+            "only to run ahead of that, and then order it against the batch's stream yourself: the "
+            "resolve's scratch and counters are batch state the step clears on that stream.")
         .def("flushed_history", &kv::Batch::flushedHistory, nb::arg("row"),
             "The history a row has been written back to. A row that has never needed a flush reads its own "
             "history, so a caller may always compare against it.")
@@ -2982,21 +3004,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "memory, and would be lost in any case: a resize() rewrites only what it changes. "
             "An entry names a coalesced slot; the converted tables name one buffer inside "
             "one.")
-        .def(
-            "gpu_coalesced_page_table",
-            [](nb::object self, int layerGroupId)
-            {
-                auto const& batch = nb::cast<kv::Batch const&>(self);
-                auto const view = batch.gpuCoalescedPageTable(kv::LayerGroupId{layerGroupId});
-                // The Batch owns the memory; self keeps it alive for the array's lifetime.
-                return makeDeviceArray2D(view.data, view.numRows, view.blocksPerRow, self);
-            },
-            nb::arg("layer_group_id"),
-            "int32[max_batch, max_blocks_per_seq] coalesced page indices for one layer group, "
-            "as a DLPack array on the device.\n\n"
-            "Internal: the device copy exists for the index conversion to read, and the kernels "
-            "a consumer writes read the converted table instead. Exposed for tests and "
-            "introspection; read coalesced_page_table() for the indices themselves.")
         .def(
             "history_lengths",
             [](nb::object self)
@@ -3055,9 +3062,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "takes the lowest free one, so a hole is legal and transient. An engine that maps rows "
             "onto its own request slots usually does require it, and asking here beats keeping a "
             "mirror of the membership to check against.")
-        .def_prop_ro(
+        .def_prop_rw(
             "cuda_stream", [](kv::Batch const& self) { return reinterpret_cast<intptr_t>(self.cudaStream()); },
-            "The stream the Batch and every member run on, fixed at construction.")
+            [](kv::Batch& self, intptr_t stream) { self.setCudaStream(reinterpret_cast<CUstream>(stream)); },
+            "The stream the Batch and every member run on. Assigning moves the Batch and every "
+            "member onto the new stream, which first waits on what the old one has queued.")
         .def_prop_ro("max_batch_size", &kv::Batch::maxBatchSize)
         .def_prop_ro("max_blocks_per_seq", &kv::Batch::maxBlocksPerSeq);
 

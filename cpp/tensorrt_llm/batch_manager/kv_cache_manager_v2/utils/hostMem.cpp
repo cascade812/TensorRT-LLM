@@ -170,6 +170,13 @@ void HostMem::fillToTarget()
     // does not fill a whole register unit. No consumer can use a remainder
     // smaller than that, and publishing the shorter value would hang a wait for
     // the whole range.
+    //
+    // Checked rather than assumed: a larger gap would publish a whole register
+    // unit the GPU cannot reach, and nothing would notice until a copy over it
+    // failed, far from here.
+    TLLM_CHECK_WITH_INFO(mBacking.targetSize() - mBacking.registeredSize() < mBacking.registerUnit(),
+        "HostMem: %zu of %zu bytes unregistered at the target, which is a whole register unit of %zu or more",
+        mBacking.targetSize() - mBacking.registeredSize(), mBacking.targetSize(), mBacking.registerUnit());
     mUsable.store(mBacking.targetSize(), std::memory_order_release);
     mUsable.notify_all();
 }
@@ -235,8 +242,7 @@ void HostMem::waitUsable(size_t endOffset) const
 }
 
 HostMem::HostMem(size_t vmSize, size_t initialSize, HostMemBackingOptions const& options, bool waitForFill)
-    // Rounded up so that the largest accepted resize is itself a valid, aligned size.
-    : mBacking(vmSize == 0 ? 0 : roundUp(vmSize, sizeGranularity()), options)
+    : mBacking(vmSize, options)
     , mWaitForFill(waitForFill)
 {
     TLLM_CUDA_CHECK(cudaGetDevice(&mDevice));
@@ -287,12 +293,27 @@ HostMem::~HostMem()
 void HostMem::destroy()
 {
     joinFill();
+    // Nobody may be waiting on a range that is being torn down, so reaching here with a
+    // waiter outstanding is a caller error -- but the failure sentinel makes it one that
+    // reports itself. Zero would leave that waiter blocked forever, since a watermark
+    // that never rises again wakes nobody.
+    //
+    // Set before the sentinel and kept afterwards: waitUsable() reads it only once it has
+    // observed the sentinel through an acquire load, and rethrowing a null is undefined. A
+    // fill that already failed keeps its own exception, which says more than this one.
+    if (mFillFailure == nullptr)
+    {
+        mFillFailure = std::make_exception_ptr(LogicError("HostMem was destroyed while a wait on it was outstanding"));
+    }
+    // Published before the mapping goes, for the reason the shrink in resize() lowers the
+    // watermark first: between unmapping and this store, a watermark left standing names
+    // memory that is already gone, and a reader taking it at its word faults.
+    mUsable.store(kFillFailed, std::memory_order_release);
+    mUsable.notify_all();
     mBacking.destroy();
     mAddr = 0;
     mSize = 0;
     mVmSize = 0;
-    mFillFailure = nullptr;
-    mUsable.store(0, std::memory_order_release);
 }
 
 void HostMem::resize(size_t newSize)

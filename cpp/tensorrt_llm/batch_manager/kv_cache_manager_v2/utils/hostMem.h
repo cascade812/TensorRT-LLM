@@ -59,7 +59,10 @@ public:
         return hostMemSizeGranularity();
     }
 
-    //! Reserves `vmSize` of address space and commits `initialSize` of it.
+    //! Reserves `vmSize` of address space and commits `initialSize` of it. Both must be
+    //! multiples of sizeGranularity(); neither is rounded on the caller's behalf, since
+    //! a reservation quietly made larger is one the caller does not know it can resize
+    //! into, and resize() rejects the same way.
     //!
     //! The base address is fixed for the lifetime of the object: resize() only
     //! moves the committed boundary within the reservation, and a resize past

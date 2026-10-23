@@ -3888,7 +3888,7 @@ class TestBatch(unittest.TestCase):
         try:
             batch = Batch(manager, NULL_STREAM, max_batch_size=2, max_blocks_per_seq=4)
             lg_id = manager.get_layer_group_id(0)
-            table = torch.from_dlpack(batch.gpu_coalesced_page_table(lg_id))
+            table = torch.from_dlpack(_introspection.batch_gpu_coalesced_page_table(batch, lg_id))
             history = torch.from_dlpack(batch.history_lengths())
             capacity = torch.from_dlpack(batch.capacities())
 
@@ -4122,7 +4122,7 @@ class TestBatch(unittest.TestCase):
                 handle = cast(CudaStream, stream.handle)
                 batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=4)
                 lg = manager.get_layer_group_id(0)
-                table = torch.from_dlpack(batch.gpu_coalesced_page_table(lg))
+                table = torch.from_dlpack(_introspection.batch_gpu_coalesced_page_table(batch, lg))
                 address = table.data_ptr()
                 for history in (17, 31):
                     cache = manager.create_kv_cache()

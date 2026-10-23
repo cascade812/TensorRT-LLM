@@ -338,6 +338,28 @@ SparseStepScratch const& Batch::sparseStepScratch(LifeCycleId lcId) const
     return mScratch[lcId];
 }
 
+void Batch::setCudaStream(CUstream stream)
+{
+    if (stream == mCudaStream)
+    {
+        return;
+    }
+    // The Batch's own queued work -- the staging copy, the index conversion, the counter
+    // resets -- is ordered on the old stream alone, and a Batch with no members still has
+    // it. Each member's move below syncs that member, which is a different question.
+    CachedCudaEvent handover(reinterpret_cast<CudaStream>(mCudaStream));
+    handover.waitInStream(reinterpret_cast<CudaStream>(stream));
+    mCudaStream = stream;
+    for (auto const& kvCache : mRows)
+    {
+        if (kvCache != nullptr)
+        {
+            // The private form: the public one refuses to move a member at all.
+            kvCache->_setCudaStream(stream);
+        }
+    }
+}
+
 Batch::~Batch()
 {
     // Both buffers are about to go, and transfers on the upload stream still name them.
@@ -483,10 +505,15 @@ void Batch::_allocateFlushRanges()
     mFlushRangeStaging.assign(elements, 0);
 }
 
-int32_t const* Batch::flushRangeRow(LifeCycleId lifeCycle) const
+int32_t const* Batch::flushFromUnits(LifeCycleId lifeCycle) const
 {
     auto* base = reinterpret_cast<int32_t*>(mFlushRanges.get());
     return base + 2 * static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(lifeCycle.value());
+}
+
+int32_t const* Batch::flushToUnits(LifeCycleId lifeCycle) const
+{
+    return flushFromUnits(lifeCycle) + mMaxBatchSize;
 }
 
 int Batch::flushedHistory(int row) const
@@ -1449,8 +1476,10 @@ int Batch::rowOf(KvCache const& kvCache) const
     return kvCache.mBatch == this ? kvCache.mBatchRow : -1;
 }
 
-void Batch::prepareSparseWriteIndices(std::vector<BufferId> const& buffers, int32_t* out, CUstream stream)
+void Batch::prepareSparseWriteIndices(
+    std::vector<BufferId> const& buffers, int32_t* out, std::optional<CUstream> streamOpt)
 {
+    CUstream const stream = streamOpt.value_or(mCudaStream);
     if (out == nullptr)
     {
         throw std::invalid_argument("prepareSparseWriteIndices: out must be a device pointer");
@@ -1539,8 +1568,8 @@ void Batch::writeBackSparseUnits(LifeCycleId lifeCycle, CUstream stream)
     listArgs.views = views;
     listArgs.numRows = numRows;
     listArgs.numLayers = scratch.numLayers;
-    listArgs.fromUnits = flushRangeRow(lifeCycle);
-    listArgs.toUnits = listArgs.fromUnits + numRows;
+    listArgs.fromUnits = flushFromUnits(lifeCycle);
+    listArgs.toUnits = flushToUnits(lifeCycle);
     listArgs.work = scratch.flushWork;
     listArgs.outCount = scratch.flushCount;
     launchSparseFlushList(listArgs, stream);
@@ -1563,9 +1592,10 @@ void Batch::writeBackSparseUnits(LifeCycleId lifeCycle, CUstream stream)
     launchSparseUnitCopy(copy, stream);
 }
 
-void Batch::fetchSparsePages(
-    std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth, int32_t* out, CUstream stream)
+void Batch::fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
+    int32_t* out, std::optional<CUstream> streamOpt)
 {
+    CUstream const stream = streamOpt.value_or(mCudaStream);
     if (selected == nullptr || out == nullptr)
     {
         throw std::invalid_argument("fetchSparsePages: selected and out must be device pointers");

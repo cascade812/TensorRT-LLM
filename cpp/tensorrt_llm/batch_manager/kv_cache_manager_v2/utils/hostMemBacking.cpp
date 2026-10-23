@@ -196,7 +196,10 @@ HostMemBacking::HostMemBacking(size_t vmSize, HostMemBackingOptions const& optio
     {
         return;
     }
-    TLLM_CHECK_DEBUG(vmSize % mUnit == 0);
+    // The caller rounds. Doing it here would hand back a reservation larger than the one
+    // asked for, which the caller would then not know it could resize into.
+    TLLM_CHECK_WITH_INFO(
+        vmSize % mUnit == 0, "HostMemBacking reservation %zu is not a multiple of the granularity %zu", vmSize, mUnit);
 
     // Captured here rather than in a step: this runs on the thread that owns the
     // context, while the fill worker only sets the device.
