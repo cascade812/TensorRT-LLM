@@ -39,7 +39,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
-from tensorrt_llm._utils import maybe_pin_memory
+from tensorrt_llm._utils import maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -260,11 +260,17 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         per layer, and each build slices, casts to int32, and pins. Pinning is
         what lets the planners stage them with non-blocking copies instead of
         copying out of pageable memory, so it is worth paying for once a step.
+
+        Each is a private snapshot. The base metadata refills its pinned kv_lens
+        in place every step, and a non-blocking copy reads its source when it
+        executes, which under the overlap scheduler can follow the next step's
+        prepare(); a fresh pinned tensor stays alive until its copies complete.
         """
 
         def as_pinned_int32(lens: torch.Tensor) -> torch.Tensor:
             rows = lens[: self.num_seqs]
-            return maybe_pin_memory(rows.to(torch.int32) if rows.dtype != torch.int32 else rows)
+            staged = torch.empty(rows.shape, dtype=torch.int32, pin_memory=prefer_pinned())
+            return staged.copy_(rows)
 
         seq_lens = self.seq_lens
         kv_lens = getattr(self, "kv_lens", None)
