@@ -76,7 +76,9 @@ def _manager(
         ),
     )
     return DSACacheManagerV2(
-        kv_cache_config=KvCacheConfig(enable_block_reuse=False, max_tokens=4096, host_cache_size=0),
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False, max_tokens=16384, host_cache_size=0
+        ),
         kv_cache_type=CacheTypeCpp.SELFKONLY,
         num_layers=num_layers,
         num_kv_heads=1,
@@ -338,6 +340,9 @@ def test_fetched_rows_hold_written_history_across_evictions(seed, num_layers, nu
             descriptor = descriptors[layer]
             data = descriptor.data_buffer_index
             writes = manager.prepare_sparse_write_indices(state, layer)
+            # At the buffer's slice, not its position: buffers whose arena indices
+            # coincide share one, and the slices no buffer maps to are never written.
+            data = state.out_slots[layer][data]
             for row, rid, history in zip(batch_rows, request_ids, histories):
                 write_row = writes[row, data].item()
                 assert write_row >= 0, (rid, history, layer)
@@ -350,9 +355,10 @@ def test_fetched_rows_hold_written_history_across_evictions(seed, num_layers, nu
             assert (writes[free_rows, data] == -1).all()
             fetched = manager.fetch_sparse_indices(state, layer, topk, request_indices, kv_lengths)
             if nvfp4:
-                scales = descriptor.scale_buffer_index
-                assert torch.equal(writes[:, data], writes[:, scales])
-                assert torch.equal(fetched[:, data], fetched[:, scales])
+                # The scale mirrors the data pool, so it resolves to the same index and
+                # reads the data's slice rather than one of its own. One slice written
+                # once is what replaces the two equal rows this used to compare.
+                assert state.out_slots[layer][descriptor.scale_buffer_index] == data
             merge_sparse_arena_indices(
                 topk,
                 request_indices,
