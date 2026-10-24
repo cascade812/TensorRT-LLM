@@ -310,6 +310,9 @@ class DSATrtllmAttention(TrtllmAttention):
                 state, self.layer_idx, topk_indices, request_indices, kv_lengths
             )
         data_index = descriptor.data_buffer_index
+        # Both paths resolve buffers whose arena indices coincide once, into one slice, so
+        # the data buffer is read at its slot rather than at its own position.
+        data_slot = state.out_slots[self.layer_idx][data_index]
         indices = merge_sparse_arena_indices(
             topk_indices,
             request_indices,
@@ -317,8 +320,8 @@ class DSATrtllmAttention(TrtllmAttention):
             state.active_request_count,
             kv_lengths,
             state.history_lengths,
-            fetched[:, data_index, :],
-            state.write_indices[len(descriptor.buffer_ids)][:, data_index],
+            fetched[:, data_slot, :],
+            state.write_indices[len(descriptor.buffer_ids)][:, data_slot],
             metadata.sparse_offload_attn_indices[:num_tokens],
             unit_tokens=descriptor.unit_tokens,
         )
@@ -407,9 +410,11 @@ class DSATrtllmAttention(TrtllmAttention):
         state = metadata.sparse_offload_state
         manager = metadata.kv_cache_manager
         write_indices = manager.prepare_sparse_write_indices(state, layer_idx)
-        data_index = state.layers[layer_idx].data_buffer_index
+        descriptor = state.layers[layer_idx]
+        # At the slot: the write resolves coinciding buffers once, as the fetch does.
+        data_slot = state.out_slots[layer_idx][descriptor.data_buffer_index]
         write_rows = gather_sparse_batch_rows(
-            write_indices[:, data_index],
+            write_indices[:, data_slot],
             state.batch_rows,
             out=metadata.sparse_latent_block_offsets[0, :, 0, 0],
         )

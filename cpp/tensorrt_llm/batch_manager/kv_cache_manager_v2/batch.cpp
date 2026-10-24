@@ -1525,6 +1525,12 @@ void Batch::prepareSparseWriteIndices(
 
     // The in-flight list stands in for a selection: the resolve writes kNoSparseSlot past the
     // span, so a row with nothing in flight needs no separate signal.
+    //
+    // Shared the same way the fetch shares, and for the same reason: buffers whose arena
+    // indices coincide are resolved once. The two paths have to agree, or a caller would
+    // need one rule for reading the fetch's output and another for this one.
+    auto const slots = sparseOutSlots(buffers);
+    std::vector<bool> written(static_cast<size_t>(span.numBuffers), false);
     for (auto const& copy : mManager->_sparseCopyTemplates(lcId))
     {
         auto const runBase = std::max(copy.bufferBase, span.bufferBase);
@@ -1532,6 +1538,15 @@ void Batch::prepareSparseWriteIndices(
         if (runBase >= runEnd)
         {
             continue;
+        }
+        int const firstSlot = slots[static_cast<size_t>(runBase - span.bufferBase)];
+        if (written[static_cast<size_t>(firstSlot)])
+        {
+            continue;
+        }
+        for (int32_t buffer = runBase; buffer < runEnd; ++buffer)
+        {
+            written[static_cast<size_t>(slots[static_cast<size_t>(buffer - span.bufferBase)])] = true;
         }
         SparseOutIndexArgs indices;
         indices.views = views;
@@ -1544,8 +1559,10 @@ void Batch::prepareSparseWriteIndices(
         indices.selectionWidth = 1;
         indices.outSlotStride = scratch.maxInFlightUnits;
         indices.out = out;
+        // The row stride is the caller's: `out` keeps one entry per buffer, and an entry
+        // no buffer maps to is never written.
         indices.outBuffers = span.numBuffers;
-        indices.outBase = runBase - span.bufferBase;
+        indices.outBase = firstSlot;
         indices.bufferBase = runBase;
         indices.numBuffers = runEnd - runBase;
         indices.cellsPerBuffer = copy.cellsPerBuffer;
@@ -1590,6 +1607,59 @@ void Batch::writeBackSparseUnits(LifeCycleId lifeCycle, CUstream stream)
     copy.bufferLayer = mManager->_sparseArena(lifeCycle).bufferLayer();
     copy.gridCtas = mManager->_sparseCopyGridCtas(scratch.flushWork.capacity);
     launchSparseUnitCopy(copy, stream);
+}
+
+std::vector<int> Batch::sparseOutSlots(std::vector<BufferId> const& buffers) const
+{
+    auto const span = mManager->_sparseLayerSpan(buffers, "sparseOutSlots");
+    auto const runs = mManager->_sparseCopyTemplates(span.lifeCycle);
+    auto const& shape = mManager->_sparseArena(span.lifeCycle).shape();
+
+    // What decides whether two buffers sharing a dense table also share an arena index.
+    // cellsPerBuffer is one value for the whole shape, so a lease spans the same cells in
+    // two pools exactly when they hold the same number of buffers.
+    auto geometry = [&](int32_t buffer)
+    {
+        for (auto const& run : runs)
+        {
+            if (buffer >= run.bufferBase && buffer < run.bufferBase + run.numBuffers)
+            {
+                return std::tuple<int, int, int>{static_cast<int>(run.cellsPerLease),
+                    static_cast<int>(run.cellsPerBuffer), shape.bufferSlotInPool[static_cast<size_t>(buffer)]};
+            }
+        }
+        throw LogicError("sparseOutSlots: a sparse buffer belongs to no pool run");
+    };
+
+    std::vector<std::pair<int, int>> tableEntries;
+    std::vector<std::tuple<int, int, int>> geometries;
+    std::vector<int> slots;
+    slots.reserve(buffers.size());
+    for (size_t i = 0; i < buffers.size(); ++i)
+    {
+        auto const [tableId, entry] = indexTableSlot(buffers[i].layerId, buffers[i].role);
+        auto const key = std::make_pair(tableId.value(), entry);
+        auto const geo = geometry(span.bufferBase + static_cast<int32_t>(i));
+        auto const found = std::find(tableEntries.begin(), tableEntries.end(), key);
+        if (found == tableEntries.end())
+        {
+            tableEntries.push_back(key);
+            geometries.push_back(geo);
+            slots.push_back(static_cast<int>(tableEntries.size()) - 1);
+            continue;
+        }
+        auto const at = static_cast<size_t>(std::distance(tableEntries.begin(), found));
+        // The dense tables merge on the hot pool's scale and concat offsets; the arena has
+        // its own geometry and has to agree separately. It normally does, but the two are
+        // not the same quantity -- a pool carrying only some of the group's layers has the
+        // same scale and a different cellsPerLease -- and taking the dense answer there
+        // would alias two different cells onto one slice.
+        TLLM_CHECK_WITH_INFO(geometries[at] == geo,
+            "sparseOutSlots: buffers share an index table entry but not their arena geometry, so one "
+            "slice cannot serve both");
+        slots.push_back(static_cast<int>(at));
+    }
+    return slots;
 }
 
 void Batch::fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
@@ -1674,6 +1744,11 @@ void Batch::fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const
     // dependency as soon as it is addressed, so this follows it on the stream without
     // waiting for it to finish.
     auto const plan = mManager->_sparseBufferPlan(lcId);
+    // Buffers whose indices coincide share a slice, so a run that only repeats slices an
+    // earlier one already wrote is not launched at all. A layer's data and scale pools
+    // mirror, which is exactly that case.
+    auto const slots = sparseOutSlots(buffers);
+    std::vector<bool> written(static_cast<size_t>(numBuffers), false);
     for (auto const& pool : mManager->_sparseCopyTemplates(lcId))
     {
         auto const runBase = std::max(pool.bufferBase, bufferBase);
@@ -1682,6 +1757,17 @@ void Batch::fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const
         {
             continue;
         }
+        // A run's buffers are consecutive entries of one table, so their slices are
+        // consecutive too and the first one says where the run writes.
+        int const firstSlot = slots[static_cast<size_t>(runBase - bufferBase)];
+        if (written[static_cast<size_t>(firstSlot)])
+        {
+            continue;
+        }
+        for (int32_t buffer = runBase; buffer < runEnd; ++buffer)
+        {
+            written[static_cast<size_t>(slots[static_cast<size_t>(buffer - bufferBase)])] = true;
+        }
         SparseOutIndexArgs indices;
         indices.views = views;
         indices.numRows = numRows;
@@ -1689,8 +1775,10 @@ void Batch::fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const
         indices.outSlot = scratch.outSlot;
         indices.selectionWidth = selectionWidth;
         indices.out = out;
+        // The row stride is the caller's, not the slice count: `out` keeps one entry per
+        // buffer, and a slice no buffer maps to is simply never written.
         indices.outBuffers = numBuffers;
-        indices.outBase = runBase - bufferBase;
+        indices.outBase = firstSlot;
         indices.bufferBase = runBase;
         indices.numBuffers = runEnd - runBase;
         indices.cellsPerBuffer = pool.cellsPerBuffer;

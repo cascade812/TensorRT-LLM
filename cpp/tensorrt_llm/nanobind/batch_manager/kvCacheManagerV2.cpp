@@ -3062,6 +3062,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "takes the lowest free one, so a hole is legal and transient. An engine that maps rows "
             "onto its own request slots usually does require it, and asking here beats keeping a "
             "mirror of the membership to check against.")
+        .def(
+            "sparse_out_slots",
+            [](kv::Batch const& self, std::vector<kv::BufferId> const& buffers)
+            { return self.sparseOutSlots(buffers); },
+            nb::arg("buffers"),
+            "Where each buffer reads its indices in fetch_sparse_pages' output.\n\n"
+            "Buffers whose converted indices coincide share a slice: a layer's data and scale pools "
+            "mirror, so one slice serves both and the caller applies the base of whichever pool it "
+            "reads. A scale shared by key and value is its own index table and keeps a slice of its "
+            "own. One entry per buffer, in the order given; out's middle extent is one more than the "
+            "largest.")
         .def_prop_rw(
             "cuda_stream", [](kv::Batch const& self) { return reinterpret_cast<intptr_t>(self.cudaStream()); },
             [](kv::Batch& self, intptr_t stream) { self.setCudaStream(reinterpret_cast<CUstream>(stream)); },

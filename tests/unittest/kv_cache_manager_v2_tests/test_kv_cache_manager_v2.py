@@ -2048,8 +2048,16 @@ class TestSparseFetch(unittest.TestCase):
     def setUp(self) -> None:
         init_cuda_once()
 
+    # Bytes per sparse buffer. A pool holds buffers of one size, so giving two roles a
+    # different size is how a test puts them in a pool of their own.
+    SPARSE_BYTES = 4096
+
     @classmethod
-    def _manager(cls, roles: tuple[str, ...] = ("key", "value")) -> KVCacheManager:
+    def _manager(
+        cls,
+        roles: tuple[str, ...] = ("key", "value"),
+        sizes: dict[str, int] | None = None,
+    ) -> KVCacheManager:
         return KVCacheManager(
             KVCacheManagerConfig(
                 tokens_per_block=cls.TOKENS_PER_BLOCK,
@@ -2065,7 +2073,7 @@ class TestSparseFetch(unittest.TestCase):
                         [
                             BufferConfig(
                                 role,
-                                4096,
+                                (sizes or {}).get(role, cls.SPARSE_BYTES),
                                 is_sparse=True,
                             )
                             for role in roles
@@ -2095,10 +2103,16 @@ class TestSparseFetch(unittest.TestCase):
         return torch
 
     @contextlib.contextmanager
-    def _fixture(self, roles: tuple[str, ...] = ("key", "value"), rows: int = 2, blocks: int = 4):
+    def _fixture(
+        self,
+        roles: tuple[str, ...] = ("key", "value"),
+        rows: int = 2,
+        blocks: int = 4,
+        sizes: dict[str, int] | None = None,
+    ):
         """A resumed member in row 0 of a two-row batch, with history to select from."""
         torch = self._torch()
-        manager = self._manager(roles)
+        manager = self._manager(roles, sizes)
         cache = None
         batch = None
         try:
@@ -2139,7 +2153,12 @@ class TestSparseFetch(unittest.TestCase):
         )
 
     def test_every_selection_slot_is_written(self):
-        """A stale index must never survive, so padded slots take the sentinel too."""
+        """A stale index must never survive, so padded slots take the sentinel too.
+
+        Of the slots a buffer maps to. Buffers whose indices coincide share one, and the
+        entries of ``out`` no buffer maps to are not written at all -- see
+        ``sparse_out_slots``. These two buffers do not coincide, so every entry is live.
+        """
         roles = ("key", "value")
         with self._fixture(roles) as (torch, manager, batch, _cache, handle):
             selected = torch.tensor([[0, -1], [-1, -1]], dtype=torch.int32, device="cuda")
@@ -2151,6 +2170,110 @@ class TestSparseFetch(unittest.TestCase):
             self.assertTrue(bool((out[0, :, 0] != BAD_PAGE_INDEX).all()))
             # Slot 1 was padded, so it reads as absent rather than as the fill we started from.
             self.assertTrue(bool((out[0, :, 1] == BAD_PAGE_INDEX).all()))
+
+    def test_mirrored_pools_resolve_a_selection_to_one_index(self):
+        """Mirrored pools give a selection one index, so one slice of ``out`` serves both.
+
+        K and V share a pool; their block scales share another. The two pools hold the same
+        number of buffers, so a lease spans the same cells in each and a selection resolves
+        to the same index in both. ``sparse_out_slots`` reports that as a shared slot, and
+        the fetch then resolves it once.
+
+        The equality itself is no longer observable here: the merge is what removes the
+        second copy, so there is nothing left to compare it against. It is enforced instead
+        where the slots are built, which refuses to share a slot unless the two buffers'
+        arena geometry -- cellsPerLease, cellsPerBuffer and slotInPool -- agrees.
+
+        Checked on the *second* member, whose lease is not zero. An index is
+        ``leaseIndex * cellsPerLease + slotInPool * cellsPerBuffer + ...``, and
+        ``cellsPerLease`` is the only term that differs between pools of unequal width, so
+        at lease zero a wrongly shared slot would look identical to a right one.
+        """
+        roles = ("key", "value", "key_scale", "value_scale")
+        sizes = {"key_scale": 512, "value_scale": 512}
+        with self._fixture(roles, sizes=sizes) as (torch, manager, batch, _cache, handle):
+            second = manager.create_kv_cache()
+            try:
+                self.assertTrue(second.resume(handle))
+                tokens = 2 * self.TOKENS_PER_BLOCK
+                self.assertTrue(second.resize(tokens, tokens))
+                batch.add_kv_cache(second)
+                self.assertEqual(batch.row_of(second), 1, "the second member takes row 1")
+                self.assertEqual(batch.resize([tokens, tokens], [tokens, tokens]), [True, True])
+
+                buffers = self._buffers(roles)
+                self.assertEqual(batch.sparse_out_slots(buffers), [0, 1, 0, 1])
+
+                selected = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32, device="cuda")
+                out = self._out(torch, 2, len(roles))
+                batch.fetch_sparse_pages(buffers, selected, out, handle)
+                torch.cuda.synchronize()
+
+                for row in (0, 1):
+                    key, value = out[row, 0, :], out[row, 1, :]
+                    self.assertTrue(
+                        bool((key != BAD_PAGE_INDEX).all()), f"row {row} should resolve"
+                    )
+                    # The two buffers of a pool sit at consecutive slots, so they differ by
+                    # a constant. Stated as a difference because the stride is the arena's
+                    # business, not this test's.
+                    deltas = (value - key).tolist()
+                    self.assertEqual(len(set(deltas)), 1, f"row {row}: one stride, {deltas}")
+                    self.assertNotEqual(deltas[0], 0, f"row {row}: key and value share a cell")
+
+                # Different leases, or the geometry term the sharing turns on is multiplied
+                # away and this proves nothing.
+                self.assertNotEqual(out[0, 0, :].tolist(), out[1, 0, :].tolist())
+            finally:
+                if batch.row_of(second) >= 0:
+                    batch.remove_kv_cache(second)
+                second.close()
+
+    def test_mirrored_pools_share_one_output_slice(self):
+        """Buffers whose indices coincide are resolved once, into one slice of ``out``.
+
+        The scatter runs per pool, and a pool whose slices an earlier one already wrote is
+        not launched: the work and the writes are what the sharing saves. ``out`` keeps one
+        entry per buffer, so the entries no buffer maps to are left as they were, which is
+        what this checks -- a merged layout that still wrote them would save nothing.
+        """
+        roles = ("key", "value", "key_scale", "value_scale")
+        sizes = {"key_scale": 512, "value_scale": 512}
+        with self._fixture(roles, sizes=sizes) as (torch, manager, batch, _cache, handle):
+            buffers = self._buffers(roles)
+            # Mirrored pools: key with its scale, value with its scale.
+            self.assertEqual(batch.sparse_out_slots(buffers), [0, 1, 0, 1])
+
+            selected = torch.tensor([[0, 1], [-1, -1]], dtype=torch.int32, device="cuda")
+            out = self._out(torch, 2, len(roles))
+            batch.fetch_sparse_pages(buffers, selected, out, handle)
+            torch.cuda.synchronize()
+
+            # The slots buffers map to carry real indices.
+            self.assertTrue(bool((out[0, 0, :] != BAD_PAGE_INDEX).all()))
+            self.assertTrue(bool((out[0, 1, :] != BAD_PAGE_INDEX).all()))
+            # The rest were never written, so they still hold the fill the test started
+            # from -- not the sentinel, which would mean the scatter had run over them.
+            self.assertTrue(bool((out[:, 2:, :] == 12345).all()), "a shared slice was rewritten")
+
+    def test_a_scale_shared_by_two_buffers_keeps_its_own_slice(self):
+        """Coinciding is the test, not pooling: an unmirrored pool gets a slice of its own.
+
+        One scale serving both key and value is a pool of one buffer, so its entries do not
+        line up with the key-and-value pool's and nothing may be shared with it.
+        """
+        roles = ("key", "value", "kv_scale")
+        sizes = {"kv_scale": 512}
+        with self._fixture(roles, sizes=sizes) as (torch, manager, batch, _cache, handle):
+            buffers = self._buffers(roles)
+            self.assertEqual(batch.sparse_out_slots(buffers), [0, 1, 2])
+
+            selected = torch.tensor([[0, 1], [-1, -1]], dtype=torch.int32, device="cuda")
+            out = self._out(torch, 2, len(roles))
+            batch.fetch_sparse_pages(buffers, selected, out, handle)
+            torch.cuda.synchronize()
+            # Nothing is shared, so every entry is a slot some buffer maps to.
+            self.assertTrue(bool((out[0, :, :] != BAD_PAGE_INDEX).all()))
 
     def test_the_hit_rate_counts_selected_units_and_nothing_else(self):
         """Hits and misses are selection entries naming real history, and only those.
@@ -3755,8 +3878,12 @@ class TestSparseQuantisedDataPath(unittest.TestCase):
                 )
                 torch.cuda.synchronize()
 
-                for row, (role, size, _) in enumerate(roles):
-                    index = int(out[0][row][0])
+                slots = batch.sparse_out_slots([BufferId(0, "key"), BufferId(0, "key_scale")])
+                for position, (role, size, _) in enumerate(roles):
+                    # At the buffer's slice, not its position: mirrored pools resolve to
+                    # one index and share a slice, leaving the other holding the fill.
+                    index = int(out[0][slots[position]][0])
+                    self.assertNotEqual(index, 12345, f"{role}'s slice was never written")
                     self.assertNotEqual(index, BAD_PAGE_INDEX, role)
                     arena = int(manager.get_sparse_cache_base_address(LayerId(0), role))
                     got = bytearray(size)

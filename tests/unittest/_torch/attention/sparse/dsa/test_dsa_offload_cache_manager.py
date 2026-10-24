@@ -378,9 +378,6 @@ def test_fetched_rows_hold_written_history_across_evictions(seed, num_layers, nu
                         f"request {rid}, history {histories[position]}, layer {layer}: units "
                         f"{units[wrong].tolist()} read {got[wrong].tolist()}"
                     )
-        if nvfp4:
-            # The write rows were compared once per layer, and matched.
-            assert manager._paired_write_layers == frozenset(range(num_layers))
         manager.update_forward_resources(scheduled, wait_for_input_copy=lambda: None)
         for rid, history in zip(request_ids, histories):
             assert manager.kv_cache_map[rid].history_length == history + 1

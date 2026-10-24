@@ -320,11 +320,14 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                         sparse_state, layer_idx, topk_indices, req_id, compressed_lengths
                     )
                     data_index = descriptor.data_buffer_index
+                    # Read at the slot: buffers whose arena indices coincide share one
+                    # slice, and the slices no buffer maps to are never written.
+                    data_slot = sparse_state.out_slots[layer_idx][data_index]
                     sparse_index_kwargs = dict(
-                        compressed_fetched_indices=fetched[:, data_index, :],
+                        compressed_fetched_indices=fetched[:, data_slot, :],
                         compressed_write_indices=sparse_state.write_indices[
                             len(descriptor.buffer_ids)
-                        ][:, data_index],
+                        ][:, data_slot],
                         compressed_history_lengths=sparse_state.history_lengths,
                         compressed_lengths=compressed_lengths,
                         compressed_batch_rows=sparse_state.batch_rows,

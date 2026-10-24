@@ -427,6 +427,21 @@ public:
     //! Compact, in the selection's own order, rather than a table indexed by unit ordinal,
     //! because that is the shape sparse attention kernels take. See
     //! SPARSE_ATTENTION_DESIGN.md's "Fetch".
+    //! Where each of `buffers` reads its indices in fetchSparsePages()' output.
+    //!
+    //! Buffers whose converted indices coincide share a slice. A layer's data and scale
+    //! pools mirror -- equal buffer counts, so a lease spans the same cells in both -- and
+    //! a selection then resolves to one index serving each, the caller applying the base
+    //! of the pool it is reading. Buffers that do not coincide keep slices of their own: a
+    //! single scale shared by key and value is its own index table, so it gets one.
+    //!
+    //! One entry per buffer, in the order given. `out` keeps one entry per buffer, so a
+    //! slice no buffer maps to is never written and holds whatever was there: read a
+    //! buffer's indices at its own slot and nowhere else. Deduplication follows the index
+    //! tables rather than the pools, so it is the grouping `_buildIndexTables` already
+    //! settled for the dense side rather than a second opinion about it.
+    [[nodiscard]] std::vector<int> sparseOutSlots(std::vector<BufferId> const& buffers) const;
+
     //! `stream` defaults to the Batch's own, which is the only correct choice while the
     //! layers are fetched in order: a layer's selection comes from the one before it. Name
     //! a stream only to run ahead of that -- a model that fetches several layers early can

@@ -1247,10 +1247,12 @@ class Batch:
                 the reservation taken at :meth:`_KVCache.resume`.
             buffers: exactly one layer's sparse buffers, in the cache's order -- the same
                 rule and the same order as :meth:`fetch_sparse_pages`.
-            out: int32 ``[batch.max_batch_size, len(buffers)]``, written in full.
-                ``out[b][i]`` is the index of the in-flight unit's cell for ``buffers[i]``,
-                and ``BAD_PAGE_INDEX`` where the row holds no reservation or has nothing in
-                flight. One entry per request, not per query token: :meth:`_KVCache.resize`
+            out: int32 ``[batch.max_batch_size, len(buffers)]``. ``out[b][s]`` is the index
+                of the in-flight unit's cell, and ``BAD_PAGE_INDEX`` where the row holds no
+                reservation or has nothing in flight. ``s`` is the buffer's output slice
+                from :meth:`sparse_out_slots`, the same assignment a fetch uses: buffers
+                that share a slice are written once, and unused slices are left untouched.
+                One entry per request, not per query token: :meth:`_KVCache.resize`
                 bounds ``capacity - history_length`` to a single token, so at most one unit
                 is ever in flight.
 
@@ -1346,11 +1348,16 @@ class Batch:
         :meth:`prepare_sparse_write_indices` before the model's KV writes to obtain its
         per-buffer physical write indices independently of the selection.
 
-        ``out`` is written in full and is **compact**: entry ``[b][i][k]`` is the cache
-        index holding ``selected[b][k]`` for ``buffers[i]``, and ``BAD_PAGE_INDEX`` where
-        that slot carries no selection. Padding stays where the
-        selection put it rather than being packed out, so slot ``k`` of ``out`` and slot
-        ``k`` of ``selected`` describe the same unit.
+        ``out`` is **compact**: entry ``[b][s][k]`` is the cache index holding
+        ``selected[b][k]``, and ``BAD_PAGE_INDEX`` where that slot carries no selection.
+        Padding stays where the selection put it rather than being packed out, so slot
+        ``k`` of ``out`` and slot ``k`` of ``selected`` describe the same unit.
+
+        ``s`` is the buffer's *output slice*, from :meth:`sparse_out_slots` -- not its
+        position in ``buffers``. Buffers whose arena indices coincide resolve to one
+        slice, so a slice may serve several buffers and the slices no buffer maps to are
+        left untouched. Read a buffer's row at its slice; ``out``'s second extent stays
+        ``len(buffers)`` so the shape is independent of how the buffers happen to merge.
 
         Compact, in the selection's own order, rather than a table indexed by unit
         ordinal, because that is the shape sparse attention kernels take: a token-sparse
@@ -1391,6 +1398,31 @@ class Batch:
 
         Serving prefill from a host-resident history is an open design question; see
         SPARSE_ATTENTION_DESIGN.md.
+        """
+
+    def sparse_out_slots(self, buffers: Sequence[BufferId]) -> list[int]:
+        """Which slice of ``out`` each buffer's indices land in.
+
+        ``buffers`` is one layer's sparse buffers, as :meth:`fetch_sparse_pages` takes
+        them, and the result is parallel to it: entry ``i`` is the second-dimension index
+        to read ``buffers[i]`` at in the ``out`` of :meth:`fetch_sparse_pages`, and in the
+        ``out`` of :meth:`prepare_sparse_write_indices`. Both use the same assignment.
+
+        Buffers that resolve a selection to the same arena index share a slice, so the
+        copy runs once and the kernel reads one row for both. Mirrored pools do this --
+        equal width gives equal indices, as for a K and a V of the same shape, or a key
+        and a value scale -- and the slots then repeat, e.g. ``[0, 1, 0, 1]``. Buffers of
+        unequal width keep slices of their own, so a scale shared by K and V together
+        yields ``[0, 1, 2]``.
+
+        Slices are numbered by first use, so the distinct slices are ``0`` upwards and
+        ``max(slots) + 1`` of the ``len(buffers)`` rows carry data. The rest are left
+        untouched rather than packed out, keeping ``out``'s shape independent of the
+        merge.
+
+        The grouping follows the index table spec the batch was built with, so two
+        buffers merge only where the caller asked for one table over both. It is fixed
+        for the batch's lifetime: ask once and keep the answer.
         """
 
     def flushed_history(self, row: int) -> int:

@@ -360,85 +360,75 @@ stop paying for. The dense reverse form is also what the LRU order and free list
 ### Probe index
 
 Answering "is this ordinal resident, and where" against a dense reverse map would be O(N)
-per selection. The fetch kernel therefore builds a **hash over the resident set**, keyed by
-ordinal and valued by slot, in shared memory at the top of each launch, and discards it at
-the end. Two properties follow from it being ephemeral: there are no deletions, so no
-tombstones and none of the maintenance that made a persistent device hash map unattractive;
-and nothing has to stay consistent across steps or graph replays.
+per selection. The fetch kernel therefore builds a hash in shared memory at the top of each
+launch and discards it at the end. Two properties follow from it being ephemeral: there are
+no deletions, so no tombstones and none of the maintenance that made a persistent device
+hash map unattractive; and nothing has to stay consistent across steps or graph replays.
 
-Hashing the *resident* set rather than the *selected* set is deliberate. Hashing the
-selected set and walking residents also costs O(N + k), but the miss list is not known until
-that walk finishes. Hashing residents means one probe per selected unit decides hit or miss
-immediately, so PCIe copies can be issued before any LRU bookkeeping runs — and the probe
-returns the slot for a hit, so no second pass is needed to resolve it.
-
-Open addressing with linear probing, capacity `C = next_pow2(2N)` so the load factor stays
-at or below one half, which also guarantees an unsuccessful probe terminates on an empty
-entry.
+**The hash is over the required ordinals** -- the in-flight units followed by the selection
+-- and the resident set is then streamed past it. So the table is sized by `k` rather than
+by the cache's capacity `N`:
 
 ```cpp
-constexpr int32_t kEmpty = -1;
-int32_t*  keys;     // [C] unit ordinal
-uint16_t* vals;     // [C] slot index, N <= 65535
-uint32_t* hitMask;  // [(N+31)/32] resident was selected this step
-
-__device__ inline uint32_t slotOf(int32_t key, uint32_t mask) {
-    return (static_cast<uint32_t>(key) * 0x9E3779B1u) & mask;   // Fibonacci
-}
-```
-
-Keys and values are separate arrays rather than packed 64-bit entries: a `__syncthreads()`
-separates build from probe, so no thread reads an entry mid-insert and the value needs no
-atomicity, keeping the CAS 32-bit. Multiplicative hashing rather than identity, because
-ordinals are small and dense, and dense runs make an unsuccessful probe walk the whole run.
-
-Build, one thread per resident slot — this pass reads the reverse map, which the kernel
-must read anyway for LRU and free-slot bookkeeping, so it adds no global traffic. Ordinals
-are unique within a `(request, layer)`, so threads contend only on table-position
-collisions:
-
-```cpp
-for (int s = threadIdx.x; s < N; s += blockDim.x) {
-    int32_t ord = reverseMap[s];
-    if (ord == kBadOrdinal) continue;              // free slot
-    uint32_t h = slotOf(ord, C - 1);
-    while (atomicCAS(&keys[h], kEmpty, ord) != kEmpty)
-        h = (h + 1) & (C - 1);
-    vals[h] = static_cast<uint16_t>(s);
+// Index the required ordinals, then match the resident set against that index.
+for (int32_t i = threadIdx.x; i < required; i += kThreads) {
+    int32_t ord = i < inFlight ? historyUnits + i : selected[i - inFlight];
+    if (ord < 0) continue;
+    uint32_t pos = slotOf(ord, mask);
+    int32_t key = atomicCAS(&keys[pos], kEmptyKey, ord);
+    while (key != kEmptyKey && key != ord) { pos = (pos + 1U) & mask; key = atomicCAS(...); }
 }
 __syncthreads();
-```
 
-Probe, one thread per selected unit. `hitMask` then drives eviction: residents with a clear
-bit are evictable, in LRU order.
-
-```cpp
-for (int i = threadIdx.x; i < k; i += blockDim.x) {
-    int32_t ord = selected[i];
-    if (ord < 0) continue;                         // padding
-    uint32_t h = slotOf(ord, C - 1);
-    int32_t  key;
-    while ((key = keys[h]) != kEmpty && key != ord)
-        h = (h + 1) & (C - 1);
-    if (key == ord) {
-        uint16_t s = vals[h];
-        outSlot[i] = s;
-        atomicOr(&hitMask[s >> 5], 1u << (s & 31));
-    } else {
-        outSlot[i] = kMiss;
-    }
+for (int32_t s = threadIdx.x; s < entries; s += kThreads) {   // the resident set
+    int32_t ord = residentOrdinal[s];
+    cls[s] = kClassUntouched | (ord >= historyUnits ? kPinned : 0);
+    previousLru[s] = lruOrder[s];
+    if (ord == kFreeOrdinal) continue;
+    ... find ord in the table ...
+    if (key == ord) vals[pos] = s;        // the resident entry claims its query
 }
 ```
 
-At 6 bytes per entry plus the mask, shared-memory use is ~0.8 KB at N = 64 (MSA, k = 16)
-and ~6 KB at N = 512 — negligible. At N = 8192 (DSA, k = 2048) it reaches ~96 KB, which
-fits only in Hopper/Blackwell dynamic shared memory and costs occupancy. Occupancy matters
-less here than usual, since the kernel is bound by PCIe copy latency and one CTA per
-`(request, layer)` is an acceptable shape, but at that size prefer one of: storing only the
-slot per entry and comparing against `reverseMap[slot]` (2 bytes per entry, one indirection
-per probe step); tiling the resident set into two passes; or a bitset indexed by ordinal,
-which is affordable exactly at the granularity where N is large only because units are
-small.
+Open addressing with linear probing, capacity `next_pow2(2 * required)` so the load factor
+stays at or below one half, which also guarantees an unsuccessful probe terminates on an
+empty entry. Keys and values are separate arrays rather than packed 64-bit entries: a
+`__syncthreads()` separates build from match, so no thread reads an entry mid-insert and the
+value needs no atomicity, keeping the CAS 32-bit. Multiplicative hashing rather than
+identity, because ordinals are small and dense, and dense runs make an unsuccessful probe
+walk the whole run.
+
+The resident sweep is also where per-entry recency and pin state are cached, so the pass
+the match needs is the pass the eviction ranking needs; see "Capacity and eviction".
+
+**This reverses an earlier decision, deliberately.** The index was first built over the
+*resident* set, keyed by ordinal and valued by slot, sized `next_pow2(2N)`. That was argued
+for on the grounds that hashing the selection would leave the miss list unknown until the
+resident walk finished. The argument does not hold: the resident-keyed build had to walk
+every slot and cross a `__syncthreads()` before its first probe, so the misses were never
+known any earlier. What the choice really bought was one fewer pass -- the probe returned a
+hit's slot directly, where the selection-keyed form needs a third pass of size `k` to read
+the slots back out of the table.
+
+What the reversal costs, and why it is still worth it:
+
+- **Shared memory falls from O(N) to O(k).** At the DSA geometry the table drops from 8192
+  buckets to 2048. This is the whole point: `N` now costs linear per-entry scratch rather
+  than a `next_pow2`-rounded table, so the quantity bounding how large a cache one launch
+  can serve is the selection width, not the capacity.
+- **A third pass of size `k`** resolves hits from the table. Shared-memory only, and small
+  against the resident sweep.
+- **The index build no longer precedes the dependency wait.** The resident-keyed build read
+  only the layer's own residency table, so it could run while the producing kernel was still
+  draining; hashing the selection cannot, because the selection is what the producer
+  produces. Only shared-memory initialisation now sits above the wait.
+
+Measured on DSA at the geometry above, the resolve kernel fell from 1.468 to 0.833 ms per
+decode step summed across 21 sparse layers.
+
+A reservation-only call -- `prepare_sparse_write_indices`, which has no selection -- skips
+the table entirely and runs a separate kernel that scans the recency order for its single
+in-flight ordinal. See "Writing the in-flight unit".
 
 ## Extraction interface
 
@@ -579,11 +569,23 @@ have the single batched launch can express it in configuration, by declaring the
 layers' buffers as one `AttentionLayerConfig` with distinct roles — one metadata row, one
 call, the same cells.
 
+The per-layer call is what a tied run actually uses. GLM-5.2's four layers share an
+indexer, and they are four `AttentionLayerConfig`s sharing a selection, not one config layer
+holding all their buffers: only the full-indexer layer declares an `INDEX_KEY` buffer, so
+the other three are wholly sparse, and it is the **life cycle** that needs a dense buffer,
+not each layer. The overlap a tied run wants is reached by issuing a later layer's call
+early on another stream, with an event the consuming attention joins -- entirely above
+KVCM2, which sees one ordinary call per layer.
+
+So a call covers one layer's buffers and the copy needs no way to name a subset of them.
+A caller wanting a layer's copies split further would be asking for the inverse of the
+configuration choice above, having already declared those buffers as one layer.
+
 Each call then:
 
 1. read the selection: unit ordinals, uniform width, `-1` padded;
-2. build the probe index over the resident set;
-3. probe once per selected unit — hit with its slot, or miss;
+2. build the probe index over the required ordinals — in-flight units, then the selection;
+3. stream the resident set past it: a match is a hit with its slot, the rest are misses;
 4. allocate a slot per miss from the free list, evicting LRU when empty;
 5. extract and copy each miss from the device-mapped host page;
 6. promote hits above new misses in recency order;
@@ -920,6 +922,8 @@ Declared or planned in `tensorrt_llm/runtime/kv_cache_manager_v2/__init__.pyi`:
 - `KVCacheManager.is_sparse(layer_id, data_role) -> bool`.
 - `Batch` — membership, row order, device arrays, `resize()`, dirty-row publication.
 - `KVCacheManager.fetch_sparse_pages(batch, buffers, selected, out, stream)`.
+- `Batch.sparse_out_slots(buffers) -> list[int]` — the slice of `out` each buffer's
+  indices land in, for both the fetch and the write.
 
 Publishing the page table is `Batch`'s job. It must not reuse the dense path's block
 offsets: those are scaled and fold `BAD_PAGE_INDEX` to slot zero, whereas a sparse table
@@ -985,57 +989,49 @@ That is an implementation limit, not a property of the design. Lifting it:
 Until then a mismatch is rejected at construction. It was previously taken as a `max` across
 the life cycle, which quietly served one layer's shape to another.
 
-## Planned: the output list honours `IndexTableSpec`
+## The output list merges across mirrored pools
 
-A spec says which buffers a consumer needs addressable together, from one base. For a
-sparse life cycle the scatter is the half that has to honour it, because the scatter's
-output is the half a consumer sees: the converted indices over the **host** pages are the
-copy's input, naming where a miss is read from, and no attention kernel ever holds them.
-What a kernel is handed is `out`, in the arena's index space.
+The arena mirrors the hot pool group, and a lease takes the same cell index in every pool
+of it. So **mirrored pools** -- equal `buffersInPool`, hence equal `cellsPerLease`, with
+`cellsPerBuffer` one value for the whole shape -- resolve a selection to the same index.
+`out` carries one slice per distinct index table entry rather than one per buffer, with
+the caller applying each pool's own base.
 
-Today that is backwards. The copy resolves `sparseIndexRun(layer, role)` per buffer and
-takes both the table and the base from it; the dense converter is table-oriented
-throughout; and the scatter alone walks pool runs and lays `out` out by the caller's buffer
-vector, one slice each. So a spec a caller declares reaches only the internal addressing,
-and the list they read ignores it.
+For a life cycle whose pool group holds a dense indexer and two sparse pools -- `{K,V}`
+and `{kscale,vscale}` -- `sparseIndexTableSpecs()` emits one spec per `(pool, layerRow)`
+and `Batch::_buildIndexTables` folds the two into **one** table, because their `scale` and
+`concatOffsets` agree. The layer's four buffers therefore take the slices `[0, 1, 0, 1]`:
+`K` with its scale, `V` with its scale. A scale shared by `K` and `V` together is a pool
+of one buffer, whose `cellsPerLease` differs, so it keeps a slice of its own: `[0, 1, 2]`.
 
-**Lay `out` out per table**, entries within a table in the spec's buffer order -- the shape
-`_buildIndexTables` already produces. The index a buffer takes is the resolve's slot put
-through an affine map:
+`Batch::sparseOutSlots` is the query, and both `fetchSparsePages` and
+`prepareSparseWriteIndices` follow it. The two have to agree, or a caller would need one
+rule for reading a fetch and another for a write. A run whose slices an earlier one
+already wrote is not launched at all -- the saved work and the saved writes are the point
+-- and the entries of `out` no buffer maps to are left untouched rather than packed out,
+so `out`'s shape stays `len(buffers)` however the buffers happen to merge.
 
-```
-out = (leaseIndex * cellsPerLease + slotInPool * cellsPerBuffer + slot / unitsPerPage)
-      * unitsPerPage + slot % unitsPerPage
-```
+The grouping follows the caller's `IndexTableSpec`, so two buffers merge only where one
+table was asked for over both. The merge is not read off the dense tables alone, though:
+those merge on the hot pool's `scale` and `concatOffsets`, which is not the same quantity
+as the arena's geometry -- a pool carrying only some of the group's layers has the same
+scale and a different `cellsPerLease`. `sparseOutSlots` checks the arena geometry agrees
+before sharing a slice, and raises rather than aliasing two different cells onto one.
 
-`slot` is the resolve's, identical across a layer's buffers; `cellsPerBuffer` is one value
-for the whole shape. So the two terms that vary are the sparse spellings of what the dense
-converter already names:
+Rests on a property only a second lease can observe:
+`TestSparseFetch::test_mirrored_pools_resolve_a_selection_to_one_index` uses one, because
+at lease zero the `leaseIndex * cellsPerLease` term vanishes and pools of unequal width
+are indistinguishable.
 
-- **`slotInPool * cellsPerBuffer` is `concatOffsets`.** It stays in the index, which is
-  what lets one base serve every buffer of a spec.
-- **`cellsPerLease` is `scale`.** It is `buffersInPool * cellsPerBuffer`.
+The rest of the arrangement is what makes one base per slice enough:
 
-Note the two halves of the fetch answer "where does the per-buffer offset live" differently
-today: the copy folds `bufferSlotInPool * cellsPerBuffer * bufferBytes` into `deviceBase`,
-while the scatter leaves the same term in the index. Each is consistent with the base its
-own consumer holds, and laying `out` out per table is what makes the scatter's choice the
-declared one rather than an accident of the pool walk.
-
-**A SHARED mode then follows.** Tables whose `scale` and offsets both coincide hold
-bit-identical lists and can be merged, which is the test `_buildIndexTables` already
-applies:
-
-```
-table.lifeCycle == lifeCycle && table.scale == scale && table.concatOffsets == offsets
-```
-
-A key-and-value pool beside a scale pool qualifies: equal buffer counts give equal
-`cellsPerLease`, and the lockstep counters give equal offsets. Four slices become two and
-the scatter runs once rather than once per pool. Pools of unequal width do not qualify:
-their indices differ by `(cellsPerLease_a - cellsPerLease_b) * leaseIndex * unitsPerPage`,
-which varies with the request's lease and so is not an offset at all. See
-`INDEX_CONVERSION_DESIGN.md`.
+- **A base per pool, in both spaces.** `getSparseCacheBaseAddress` returns
+  `arena.base(poolIndex)` -- "per pool, not per buffer" -- so `{K,V}` share one arena base
+  and `{kscale,vscale}` another, exactly as the two pools share one hot-pool base each.
+- **The within-pool offset rides in the index**, as `slotInPool * cellsPerBuffer`. That is
+  the concat-offset arrangement, so one base does serve a pool's buffers.
+- **The output order is the plan's**, because `_sparseLayerSpan` rejects any other:
+  "buffers must be exactly this layer's sparse buffers, in the cache's order".
 
 ## Sparse buffers across more than one pool
 
@@ -1111,12 +1107,13 @@ it, and in each the order of the prologue is the point: a block does everything 
 its predecessor's output *above* `cudaGridDependencySynchronize()`, so that by the time the
 predecessor drains the block is resident, addressed, and as far along as it can be.
 
-How far along differs by kernel, and the resolve gets the most out of it. Its probe index --
-an insert per resident entry, over the whole per-request cache -- reads only the layer's own
-residency table and writes only shared memory, and nothing running before a resolve touches
-that table: a previous layer's resolve owns a different slice of it, and the copy and index
-kernels between them write cells and indices. So the entire index build sits above the wait,
-and what the resolve actually waits for is the *selection*. The copy resolves its pool, its
+How far along differs by kernel. The resolve gets least out of it: its probe index is keyed
+by the required ordinals, and the selection is exactly what the producer produces, so only
+shared-memory initialisation sits above the wait. That was not always so -- an index built
+over the resident set read only the layer's own residency table, which nothing before a
+resolve touches, so the whole build could run while the predecessor drained. Keying the
+table by `k` rather than by the cache's capacity was worth giving that up; see
+"Probe index". The copy resolves its pool, its
 buffer and its work list from descriptors and block coordinates; the flush-list scan
 addresses its row from the staged view. Each then waits for the one thing that is genuinely
 produced upstream.

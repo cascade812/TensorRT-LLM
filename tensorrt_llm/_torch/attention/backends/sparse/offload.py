@@ -19,7 +19,7 @@ offloaded layer with ``_build_sparse_offload_descriptor``.
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Collection, Iterable
 
 import torch
@@ -135,6 +135,11 @@ class SparseOffloadState:
     fetched_indices: dict[int, torch.Tensor]
     write_indices: dict[int, torch.Tensor]
     scatter_start_positions: torch.Tensor
+    #: Which slice of ``fetched_indices`` and ``write_indices`` each of a layer's buffers
+    #: reads. Buffers whose arena indices coincide share one, and the slices no buffer
+    #: maps to are never written, so a buffer must be read at its slot rather than at its
+    #: own position. Filled on first use, the earliest the native Batch exists to ask.
+    out_slots: dict[int, tuple[int, ...]] = field(default_factory=dict)
     nvfp4_scratch: torch.Tensor | None = None
     batch: Batch | None = None
     history_lengths: torch.Tensor | None = None
@@ -300,9 +305,6 @@ class SparseOffloadCacheMixin:
     _sparse_offload_topk: int | None = None
     _sparse_batch: Batch | None = None
     _sparse_batch_prepared: bool = False
-    # Layers with block scales whose native write indices were seen to give data
-    # and scales the same arena rows.
-    _paired_write_layers: frozenset[int] = frozenset()
 
     def _init_sparse_offload(self, *, enabled: bool, topk: int | None) -> None:
         self._enable_kv_cache_offload = enabled
@@ -946,46 +948,17 @@ class SparseOffloadCacheMixin:
         out = state.write_indices[len(descriptor.buffer_ids)]
         state.write_layer = None
         with torch.cuda.device(out.device):
+            if layer_idx not in state.out_slots:
+                state.out_slots[layer_idx] = tuple(
+                    state.batch.sparse_out_slots(list(descriptor.buffer_ids))
+                )
             state.batch.prepare_sparse_write_indices(
                 buffers=descriptor.buffer_ids,
                 out=out,
                 stream=CudaStream(torch.cuda.current_stream().cuda_stream),
             )
-            if (
-                descriptor.scale_buffer_index is not None
-                and layer_idx not in self._paired_write_layers
-                # With no member seated every row is dead, so the comparison could not
-                # retire the layer and the sync that reads it would be pure cost. Warmup
-                # steps run that way, once per layer per step.
-                and self._sparse_batch_members
-                and not torch.cuda.is_current_stream_capturing()
-            ):
-                self._check_paired_write_indices(out, descriptor, layer_idx)
         state.write_layer = layer_idx
         return out
-
-    def _check_paired_write_indices(
-        self, out: torch.Tensor, descriptor: SparseOffloadLayerDescriptor, layer_idx: int
-    ) -> None:
-        """Check that native gives a layer's data and block scales the same write rows.
-
-        Writers and the NVFP4 gather address scales with the data column.
-        Descriptor construction re-derives the arena layout to check that, so it
-        cannot see a native change; the indices themselves can. A layer counts as
-        checked once a live row has been compared. Reading the result waits for
-        the stream, so this runs only until then.
-        """
-        data = out[:, descriptor.data_buffer_index]
-        scale = out[:, descriptor.scale_buffer_index]
-        differs, live = torch.stack(((data != scale).any(), (data >= 0).any())).tolist()
-        if differs:
-            raise RuntimeError(
-                f"Sparse NVFP4 layer {layer_idx}: the KV cache manager wrote data and block "
-                "scales to different arena rows, but writers and attention address scales "
-                "with the data row. Its sparse arena no longer pairs the two buffers."
-            )
-        if live:
-            self._paired_write_layers = self._paired_write_layers | {layer_idx}
 
     @nvtx_range_debug("fetch_sparse_indices")
     def fetch_sparse_indices(
@@ -1035,6 +1008,10 @@ class SparseOffloadCacheMixin:
                 unit_tokens=descriptor.unit_tokens,
             )
             out = state.fetched_indices[len(descriptor.buffer_ids)]
+            if layer_idx not in state.out_slots:
+                state.out_slots[layer_idx] = tuple(
+                    state.batch.sparse_out_slots(list(descriptor.buffer_ids))
+                )
             # Fetch even for an empty selection so every output slot is refreshed
             # on graph replay. Native Batch supplies page tables and watermarks.
             state.batch.fetch_sparse_pages(
