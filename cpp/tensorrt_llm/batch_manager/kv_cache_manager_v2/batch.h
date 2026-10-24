@@ -181,12 +181,18 @@ struct WatermarkView
 class Batch
 {
 public:
+    //! @param indexTables what consumers need addressable together. Requests whose
+    //! converted indices coincide are merged onto one table, which is how a quantised
+    //! layer's data and block scales come to share one. Required, and `{}` is how a caller
+    //! that converts no indices says so: an empty list is a choice about what the consumer
+    //! reads, not an absence the Batch could fill in.
+    //!
     //! @param maxBatchSize    rows, i.e. the most requests that can be stepped together.
     //! @param maxBlocksPerSeq columns, i.e. the longest sequence a row can describe.
     //!
     //! Both bound device arrays whose shape must not change between steps, so neither can
-    //! be grown later. Pass 0 to derive from the manager's `constraints`, which fails when
-    //! none were declared -- a pool-sizing hint is not a batch bound, so it is only a
+    //! be grown later. Left unset they derive from the manager's `constraints`, which fails
+    //! when none were declared -- a pool-sizing hint is not a batch bound, so it is only a
     //! default, never an inference.
     //!
     //! @param mode page index mode, applied to every life cycle. Left unset, each life
@@ -210,9 +216,6 @@ public:
     //!
     //! The mode is fixed here because a converted table's shape is baked into a captured
     //! graph. It cannot follow a member's scratch state, which varies per step.
-    //! @param indexTables what consumers need addressable together. Requests whose
-    //! converted indices coincide are merged onto one table, which is how a quantised
-    //! layer's data and block scales come to share one.
     //! @param stream the stream every member runs on, taken here rather than one per call:
     //! a member's own work and the Batch's transfers have to be ordered against each other,
     //! and two streams would leave that ordering to the caller. setCudaStream() moves the
@@ -232,9 +235,9 @@ public:
     //! `maxBatchSize` -- a decode step advances capacity one token per row, so one row
     //! crosses at most one unit boundary. Pass it once a step can ingest more than that,
     //! which is what chunked prefill under in-flight batching does.
-    explicit Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize = 0, int maxBlocksPerSeq = 0,
-        std::optional<PageIndexMode> mode = std::nullopt, std::vector<IndexTableSpec> indexTables = {},
-        std::optional<int> maxTotalInputTokens = std::nullopt);
+    explicit Batch(KvCacheManager& manager, CUstream stream, std::vector<IndexTableSpec> indexTables,
+        std::optional<int> maxBatchSize = std::nullopt, std::optional<int> maxBlocksPerSeq = std::nullopt,
+        std::optional<PageIndexMode> mode = std::nullopt, std::optional<int> maxTotalInputTokens = std::nullopt);
 
     //! The stream the Batch and every member run on.
     [[nodiscard]] CUstream cudaStream() const noexcept
@@ -300,7 +303,7 @@ public:
     Batch(Batch const&) = delete;
     Batch& operator=(Batch const&) = delete;
 
-    //! Seat a cache in `row`, or in the lowest free row when it is negative.
+    //! Seat a cache in `row`, or in the lowest free row when none is named.
     //!
     //! Seat a request only once it is ready to be stepped. Seating takes the sparse arena
     //! lease, so a request that holds pages without being stepped -- a disaggregated one
@@ -313,7 +316,7 @@ public:
     //! Throws when the row is taken or out of range, the batch is full, the cache already
     //! belongs to a batch, or its beam width exceeds one -- only beam 0 is mirrored, so a
     //! wider request would have every beam read beam 0's pages.
-    int addKvCache(KvCache& kvCache, int row = -1);
+    int addKvCache(KvCache& kvCache, std::optional<int> row = std::nullopt);
 
     //! Free the cache's row, leaving a hole, and hand back the reference the Batch held.
     //! Throws when it is not a member.
@@ -519,8 +522,8 @@ public:
     //! past the end of a row that has since been reused.
     [[nodiscard]] WatermarkView watermarks() const;
 
-    //! Row of a member, or -1.
-    [[nodiscard]] int rowOf(KvCache const& kvCache) const;
+    //! Row of a member; nullopt when this cache is not one.
+    [[nodiscard]] std::optional<int> rowOf(KvCache const& kvCache) const;
 
     //! Members seated, which is the rows occupied. Also the leases held: seating takes one
     //! from every life cycle's arena and leaving returns it.

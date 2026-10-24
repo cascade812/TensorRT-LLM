@@ -117,22 +117,22 @@ struct SparseResolveArgs
     //! [numRows] cache state per row, as Batch::sparseCacheViews() publishes it. A row with
     //! a null residentOrdinal holds no reservation -- free, or a member that has suspended --
     //! and is skipped.
-    SparseCacheView const* views = nullptr;
-    int32_t numRows = 0;
+    SparseCacheView const* views;
+    int32_t numRows;
     //! Which of the life cycle's layers this call resolves: the metadata row every sparse
     //! buffer of that layer shares.
-    int32_t layerInGroup = 0;
+    int32_t layerInGroup;
     //! Shape shared by every row's view. Passed separately because the host needs them to
     //! size shared memory and the grid before any view can be read.
-    int32_t numLayers = 0;
-    int32_t entriesPerLayer = 0;
+    int32_t numLayers;
+    int32_t entriesPerLayer;
 
     //! [numRows][selectionWidth] unit ordinals, negative where the selection is padded.
     //! Ordinals must be unique within a row; duplicates would be resolved as separate
     //! misses and waste an entry each.
-    int32_t const* selected = nullptr;
+    int32_t const* selected;
     //! Selected units per row, uniform across requests so shapes stay static.
-    int32_t selectionWidth = 0;
+    int32_t selectionWidth;
 
     //! [numRows] history length and capacity, in tokens, as Batch::watermarks() publishes
     //! them; `unitTokens` divides both to units. Taking the source and the divisor rather
@@ -146,22 +146,22 @@ struct SparseResolveArgs
     //! [historyUnits, capacityUnits) are in flight: the entry holds the only copy of their
     //! data, so it is pinned against eviction and there is nothing to fetch for it. See
     //! "Unflushed entries carry no state" in SPARSE_ATTENTION_DESIGN.md.
-    int32_t const* historyTokens = nullptr;
-    int32_t const* capacityTokens = nullptr;
+    int32_t const* historyTokens;
+    int32_t const* capacityTokens;
     //! tokens_per_block / unitsPerPage, a per-layer-group constant.
-    int32_t unitTokens = 1;
+    int32_t unitTokens;
 
     //! [numRows][selectionWidth] entry index per selection, kNoSparseSlot where padded or
     //! where the row holds no reservation. One list serves every buffer of the layer.
-    int32_t* outSlot = nullptr;
+    int32_t* outSlot;
 
     //! [numRows][maxInFlightUnits] entry index per in-flight unit, in ordinal order from
     //! historyUnits. Entries past the live count are left untouched. The model writes new
     //! KV through these, so they are resolved before the selection takes any victim.
-    int32_t* inFlightSlot = nullptr;
+    int32_t* inFlightSlot;
     //! Array stride, bounding capacityUnits - historyUnits. Follows from the cache width,
     //! so the shape stays static while the live count varies.
-    int32_t maxInFlightUnits = 0;
+    int32_t maxInFlightUnits;
 
     //! The history units that were not resident, and the entries given to them. One list,
     //! since a call resolves one layer; every buffer of that layer copies from it.
@@ -171,7 +171,7 @@ struct SparseResolveArgs
     SparseWorkList work;
     //! [numRows] entries this row contributed. The copy does not read it -- it walks the
     //! compacted list -- but it is what makes a row's hit rate observable.
-    int32_t* missCount = nullptr;
+    int32_t* missCount;
 
     //! Cumulative fetch statistics, which every row adds its own share of. Null skips it.
     //!
@@ -242,16 +242,16 @@ enum class SparseCopyWidth : int32_t
 //! are ordered (layer, pool), so a run never spans layers.
 struct SparseCopyRun
 {
-    int32_t bufferBase = 0;
-    int32_t numBuffers = 0;
+    int32_t bufferBase;
+    int32_t numBuffers;
     //! Base of this pool's region in the cell arena, before a buffer's slot is added.
-    CUdeviceptr deviceBase = 0;
-    uint32_t bufferBytes = 0;
-    int32_t cellsPerBuffer = 0;
-    int32_t cellsPerLease = 0;
-    uint32_t hostPageStride = 0;
+    CUdeviceptr deviceBase;
+    uint32_t bufferBytes;
+    int32_t cellsPerBuffer;
+    int32_t cellsPerLease;
+    uint32_t hostPageStride;
     SelectionUnitLayout layout;
-    SparseCopyWidth width = SparseCopyWidth::kByte;
+    SparseCopyWidth width;
 };
 
 //! One buffer's share of a copy: everything a block needs that does not vary per work item.
@@ -390,14 +390,14 @@ struct SparseOutIndexArgs
 {
     //! [numRows] per-row cache state; a row with a null residentOrdinal is filled with
     //! kBadPageIndex and nothing else, which is what a free row should look like.
-    SparseCacheView const* views = nullptr;
-    int32_t numRows = 0;
+    SparseCacheView const* views;
+    int32_t numRows;
 
     //! [numRows][selectionWidth] the ordinals selected, and the entries the resolve gave
     //! them. Negative in either array means the slot carried no selection.
-    int32_t const* selected = nullptr;
-    int32_t const* outSlot = nullptr;
-    int32_t selectionWidth = 0;
+    int32_t const* selected;
+    int32_t const* outSlot;
+    int32_t selectionWidth;
 
     //! Row stride of `outSlot`, when it is wider than the part this call reads. Zero means
     //! `selectionWidth`. The write-index path needs it: its slots come from the resolve's
@@ -413,17 +413,17 @@ struct SparseOutIndexArgs
     //!
     //! One call fills `numBuffers` of the row's `outBuffers` entries, starting at `outBase`,
     //! because a call serves one pool while the caller asks for a whole layer.
-    int32_t* out = nullptr;
-    int32_t outBuffers = 0;
-    int32_t outBase = 0;
+    int32_t* out;
+    int32_t outBuffers;
+    int32_t outBase;
 
     //! The buffers this call writes, as for the copy.
-    int32_t bufferBase = 0;
-    int32_t numBuffers = 0;
+    int32_t bufferBase;
+    int32_t numBuffers;
 
-    int32_t cellsPerBuffer = 0;
-    int32_t cellsPerLease = 0;
-    int32_t unitsPerPage = 1;
+    int32_t cellsPerBuffer;
+    int32_t cellsPerLease;
+    int32_t unitsPerPage;
 };
 
 //! Launch the index scatter. One CTA per (row, buffer).

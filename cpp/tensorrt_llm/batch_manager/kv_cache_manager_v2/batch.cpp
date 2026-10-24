@@ -57,8 +57,9 @@ std::pair<int, int> deriveBounds(KVCacheManagerConfig const& config)
 
 } // namespace
 
-Batch::Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize, int maxBlocksPerSeq,
-    std::optional<PageIndexMode> mode, std::vector<IndexTableSpec> indexTables, std::optional<int> maxTotalInputTokens)
+Batch::Batch(KvCacheManager& manager, CUstream stream, std::vector<IndexTableSpec> indexTables,
+    std::optional<int> maxBatchSize, std::optional<int> maxBlocksPerSeq, std::optional<PageIndexMode> mode,
+    std::optional<int> maxTotalInputTokens)
     : mManager(&manager)
     , mCudaStream(stream)
     , mMaxTotalInputTokens(maxTotalInputTokens)
@@ -68,8 +69,8 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize, int max
         throw std::invalid_argument("Batch: maxTotalInputTokens must be positive when given");
     }
     auto const [derivedRows, derivedBlocks] = deriveBounds(manager.config());
-    mMaxBatchSize = maxBatchSize > 0 ? maxBatchSize : derivedRows;
-    mMaxBlocksPerSeq = maxBlocksPerSeq > 0 ? maxBlocksPerSeq : derivedBlocks;
+    mMaxBatchSize = maxBatchSize.value_or(derivedRows);
+    mMaxBlocksPerSeq = maxBlocksPerSeq.value_or(derivedBlocks);
     if (mMaxBatchSize <= 0 || mMaxBlocksPerSeq <= 0)
     {
         throw std::invalid_argument(
@@ -226,7 +227,7 @@ int32_t Batch::_flushCapacity(LifeCycleId lifeCycle) const
     }
     // Without a budget, a step is assumed to advance capacity by the in-flight headroom in
     // every row at once, which is what a decode step does.
-    return mMaxBatchSize * std::max(1, mManager->_sparseCacheMaxInFlightUnits(lifeCycle));
+    return mMaxBatchSize * mManager->_sparseCacheMaxInFlightUnits(lifeCycle);
 }
 
 void Batch::_allocateStepScratch()
@@ -716,20 +717,30 @@ void Batch::_allocateIndexTables()
         mIndexTables.begin(), mIndexTables.end(), [&](IndexTable const& table) { return !mayHoldScratch(table); }));
 
     // The most slots a request could need for one life cycle, which is the stride every
-    // (row, life cycle) of the scratch staging gets. Counted in slots rather than blocks:
-    // a scratch block takes scratchPagesPerBlock sub-pages and a slot holds scale of them,
-    // which is also how the kernel indexes them -- scratchSlots[block * pages / scale].
+    // (row, life cycle) of the scratch staging gets. Over this batch's own tables rather
+    // than every buffer the manager has: a batch that declared none stages nothing, which
+    // is what leaving this zero says.
     //
-    // Not every block can be scratch, so the page table's width would be a loose bound: a
-    // block still in the window, or held as a sink, is never stale and so never scratch.
+    // Not floored at one. Zero is a real answer -- a step that cannot outrun the window
+    // adds no block that is already stale -- and staging for it would allocate a slot no
+    // request can reach, while giving a wrong bound the slack to go unnoticed.
     for (size_t index = static_cast<size_t>(mNumPlainTables); index < mIndexTables.size(); ++index)
     {
-        auto const& table = mIndexTables[index];
-        auto const& first = table.served.front().buffers.front();
-        auto const pages = mManager->getPageIndexConverter(first.layerId, first.role).scratchPagesPerBlock;
-        auto const blocks = mManager->_maxScratchBlocks(table.lifeCycle, mMaxBlocksPerSeq);
-        auto const slots = (static_cast<int64_t>(blocks) * pages + table.scale - 1) / table.scale;
-        mMaxScratchSlots = std::max<int>(mMaxScratchSlots, static_cast<int>(std::max<int64_t>(1, slots)));
+        auto const& first = mIndexTables[index].served.front().buffers.front();
+        // The step bound only where the caller gave one: unset, mMaxTotalInputTokens
+        // stands in for a decode step, which would under-count a batch that then prefills.
+        auto const slots = mManager->_scratchSlotsFor(first, mMaxBlocksPerSeq, mMaxTotalInputTokens);
+        mMaxScratchSlots = std::max(mMaxScratchSlots, slots);
+    }
+
+    // Scratch capability is the manager's answer for the life cycle, while the bound above
+    // is this batch's; a batch naming SHARED over an undecided life cycle has the first
+    // without the second. With no slot any member can reach there is nothing to substitute,
+    // so those tables take the plain path -- which is also what keeps the scratch kernel
+    // from running over staging that the bound just decided not to allocate.
+    if (mMaxScratchSlots == 0)
+    {
+        mNumPlainTables = static_cast<int>(mIndexTables.size());
     }
 
     if (mMaxScratchSlots > 0)
@@ -904,6 +915,14 @@ void Batch::_stageScratch()
             }
             begs[flat] = desc->range.beg.value();
             ends[flat] = desc->range.end.value();
+            // The slot check below is what keeps the copy in bounds. This one tests the
+            // bound the sizing was derived from, against a range an actual request
+            // reached -- so a mistake in that derivation is caught where it was made,
+            // rather than only when some request's conversion happens to need the slot
+            // the arithmetic lost.
+            TLLM_CHECK_DEBUG_WITH_INFO(desc->range.end.value() - desc->range.beg.value()
+                    <= mManager->_maxScratchBlocks(lcId, mMaxBlocksPerSeq, mMaxTotalInputTokens),
+                "A request's scratch range outruns the blocks the batch was sized for");
             TLLM_CHECK_WITH_INFO(desc->slotIds.size() <= static_cast<size_t>(mMaxScratchSlots),
                 "A request holds more scratch slots than the batch was sized for");
             std::copy(desc->slotIds.begin(), desc->slotIds.end(), rowSlots);
@@ -1088,7 +1107,7 @@ int32_t* Batch::_stagingRow(LifeCycleId lifeCycleId, int row) const
         + static_cast<int64_t>(mMaxBlocksPerSeq) * row;
 }
 
-int Batch::addKvCache(KvCache& kvCache, int requestedRow)
+int Batch::addKvCache(KvCache& kvCache, std::optional<int> requestedRow)
 {
     if (kvCache.mBatch != nullptr)
     {
@@ -1108,8 +1127,8 @@ int Batch::addKvCache(KvCache& kvCache, int requestedRow)
     }
     // Binding a row writes it, so the last publish must be done reading it.
     waitPublished();
-    int row = requestedRow;
-    if (row < 0)
+    int row = 0;
+    if (!requestedRow.has_value())
     {
         auto const free = std::find(mRows.begin(), mRows.end(), nullptr);
         if (free == mRows.end())
@@ -1120,7 +1139,8 @@ int Batch::addKvCache(KvCache& kvCache, int requestedRow)
     }
     else
     {
-        if (row >= mMaxBatchSize)
+        row = *requestedRow;
+        if (row < 0 || row >= mMaxBatchSize)
         {
             throw std::out_of_range("Batch::addKvCache: row is beyond max_batch_size");
         }
@@ -1200,7 +1220,7 @@ std::shared_ptr<KvCache> Batch::removeKvCache(KvCache& kvCache)
         throw LogicError("KvCache is not a member of this Batch");
     }
     waitPublished();
-    int const row = kvCache.mBatchRow;
+    int const row = *kvCache.mBatchRow;
     // Checked before anything is touched, so a rejected removal leaves the batch as it was.
     //
     // Flushing a history the member never takes up is pointless, so the two agreeing is what
@@ -1220,7 +1240,7 @@ std::shared_ptr<KvCache> Batch::removeKvCache(KvCache& kvCache)
     // Membership ends first, so the unbinding below goes through the same setter a caller
     // would use. Nothing binds a seated member's buffer, including the Batch.
     kvCache.mBatch = nullptr;
-    kvCache.mBatchRow = -1;
+    kvCache.mBatchRow = std::nullopt;
     for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
     {
         // Hands the indices back to the cache's own storage before the row is reused.
@@ -1284,7 +1304,7 @@ void Batch::move(int dstRow, int srcRow)
 
 void Batch::_detach(KvCache& kvCache) noexcept
 {
-    if (kvCache.mBatch != this || kvCache.mBatchRow < 0)
+    if (kvCache.mBatch != this || !kvCache.mBatchRow.has_value())
     {
         return;
     }
@@ -1554,9 +1574,9 @@ bool Batch::isContiguous() const noexcept
     return std::none_of(firstFree, mRows.end(), [](std::shared_ptr<KvCache> const& row) { return row != nullptr; });
 }
 
-int Batch::rowOf(KvCache const& kvCache) const
+std::optional<int> Batch::rowOf(KvCache const& kvCache) const
 {
-    return kvCache.mBatch == this ? kvCache.mBatchRow : -1;
+    return kvCache.mBatch == this ? kvCache.mBatchRow : std::nullopt;
 }
 
 void Batch::prepareSparseWriteIndices(
@@ -1604,6 +1624,9 @@ void Batch::prepareSparseWriteIndices(
     resolve.inFlightSlot = scratch.inFlightSlot;
     resolve.maxInFlightUnits = scratch.maxInFlightUnits;
     resolve.missCount = scratch.missCount;
+    // No selection on this path, so there is nothing to resolve into a slot.
+    resolve.selected = nullptr;
+    resolve.outSlot = nullptr;
     launchSparseResolve(resolve, stream);
 
     // The in-flight list stands in for a selection: the resolve writes kNoSparseSlot past the

@@ -1549,7 +1549,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         {
             // Not equality: a step may resize a row more than once, and a row whose growth
             // failed rolls back to a history below the one flushed for it.
-            int const flushed = mBatch != nullptr ? mBatch->flushedHistory(mBatchRow) : 0;
+            int const flushed = mBatch != nullptr ? mBatch->flushedHistory(*mBatchRow) : 0;
             TLLM_CHECK_WITH_INFO(newHist <= flushed,
                 "A sparse KvCache cannot advance history past what has been written back; call "
                 "Batch::flushSparseUnits() with the new history first");
@@ -3254,7 +3254,7 @@ int KvCache::updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc,
         TLLM_CHECK_WITH_INFO(mBatch == nullptr || !mBatch->_publishInFlight(),
             "A publish is still reading the staged page indices of Batch row %d; call Batch::waitPublished() before "
             "an operation that locks or unlocks a seated member's pages",
-            mBatchRow);
+            mBatchRow.value_or(-1));
     }
     auto& buf = mBasePageIndices[bi][lc];
     return std::visit(

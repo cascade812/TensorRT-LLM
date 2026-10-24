@@ -239,7 +239,7 @@ SparseCacheLease::SparseCacheLease(SparseCacheLease&& other) noexcept
     , mView(other.mView)
 {
     other.mArena = nullptr;
-    other.mIndex = -1;
+    other.mIndex = std::nullopt;
 }
 
 SparseCacheLease& SparseCacheLease::operator=(SparseCacheLease&& other) noexcept
@@ -251,7 +251,7 @@ SparseCacheLease& SparseCacheLease::operator=(SparseCacheLease&& other) noexcept
         mIndex = other.mIndex;
         mView = other.mView;
         other.mArena = nullptr;
-        other.mIndex = -1;
+        other.mIndex = std::nullopt;
     }
     return *this;
 }
@@ -260,9 +260,9 @@ void SparseCacheLease::release() noexcept
 {
     if (mArena != nullptr)
     {
-        mArena->_release(mIndex);
+        mArena->_release(*mIndex);
         mArena = nullptr;
-        mIndex = -1;
+        mIndex = std::nullopt;
         mView = SparseCacheView{};
     }
 }

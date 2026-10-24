@@ -654,7 +654,9 @@ class TestSparseBufferConfig(unittest.TestCase):
                 AttentionLayerConfig(
                     0,
                     [data, scales, BufferConfig("index", 256)],
-                    sparse_cache=SparseCacheConfig(num_selected_blocks=2, max_cached_units=4),
+                    sparse_cache=SparseCacheConfig(
+                        num_selected_blocks=2, max_cached_units=4, unit_tokens=128
+                    ),
                 )
             ],
         )
@@ -696,7 +698,9 @@ class TestSparseBufferConfig(unittest.TestCase):
         layer = AttentionLayerConfig(
             0,
             [BufferConfig("key", 4096)],
-            sparse_cache=SparseCacheConfig(num_selected_blocks=2, max_cached_units=4),
+            sparse_cache=SparseCacheConfig(
+                num_selected_blocks=2, max_cached_units=4, unit_tokens=128
+            ),
         )
         with self.assertRaisesRegex(ValueError, "no sparse buffer to serve"):
             self._make_config(layer)
@@ -710,7 +714,9 @@ class TestSparseBufferConfig(unittest.TestCase):
                 # layer carries one -- which is also the shape a model uses.
                 BufferConfig("index", 256),
             ],
-            sparse_cache=SparseCacheConfig(num_selected_blocks=16, max_cached_units=8),
+            sparse_cache=SparseCacheConfig(
+                num_selected_blocks=16, max_cached_units=8, unit_tokens=128
+            ),
         )
         with self.assertRaisesRegex(ValueError, "maxCachedUnits"):
             self._make_config(layer)
@@ -730,7 +736,9 @@ class TestSparseBufferConfig(unittest.TestCase):
                 # layer carries one -- which is also the shape a model uses.
                 BufferConfig("index", 256),
             ],
-            sparse_cache=SparseCacheConfig(num_selected_blocks=16, max_cached_units=64),
+            sparse_cache=SparseCacheConfig(
+                num_selected_blocks=16, max_cached_units=64, unit_tokens=4
+            ),
         )
         with self.assertRaisesRegex(ValueError, "divide evenly"):
             self._make_config(layer)
@@ -774,7 +782,9 @@ class TestSparseBufferConfig(unittest.TestCase):
         layer = AttentionLayerConfig(
             0,
             [BufferConfig("key", 4096, is_sparse=True)],
-            sparse_cache=SparseCacheConfig(num_selected_blocks=2, max_cached_units=4),
+            sparse_cache=SparseCacheConfig(
+                num_selected_blocks=2, max_cached_units=4, unit_tokens=4
+            ),
         )
         with self.assertRaisesRegex((ValueError, RuntimeError), "wholly sparse"):
             KVCacheManager(self._make_config(layer))
@@ -833,7 +843,9 @@ class TestSparseTierFlexibility(unittest.TestCase):
                             # data it selects over are one attention computation.
                             BufferConfig("index", 256),
                         ],
-                        sparse_cache=SparseCacheConfig(num_selected_blocks=2, max_cached_units=4),
+                        sparse_cache=SparseCacheConfig(
+                            num_selected_blocks=2, max_cached_units=4, unit_tokens=128
+                        ),
                     )
                 ],
             )
@@ -865,7 +877,9 @@ class TestSparseTierFlexibility(unittest.TestCase):
                         BufferConfig("key", 4096, is_sparse=True),
                         BufferConfig("index", 256),
                     ],
-                    sparse_cache=SparseCacheConfig(num_selected_blocks=2, max_cached_units=4),
+                    sparse_cache=SparseCacheConfig(
+                        num_selected_blocks=2, max_cached_units=4, unit_tokens=128
+                    ),
                 )
             ],
             host_sparse_pool_quota=host_quota,
@@ -958,7 +972,9 @@ class TestSparseCacheReservation(unittest.TestCase):
         # sparse storage and locking, it simply has no GPU cache to read through.
         # The cache must exceed the selection, since the surplus is the in-flight headroom.
         sparse_cache = (
-            SparseCacheConfig(num_selected_blocks=2, max_cached_units=max_cached_units)
+            SparseCacheConfig(
+                num_selected_blocks=2, max_cached_units=max_cached_units, unit_tokens=128
+            )
             if max_cached_units > 0
             else None
         )
@@ -1251,7 +1267,9 @@ class TestSparseCacheReservation(unittest.TestCase):
                             # data it selects over are one attention computation.
                             BufferConfig("index", 256),
                         ],
-                        sparse_cache=SparseCacheConfig(num_selected_blocks=2, max_cached_units=4),
+                        sparse_cache=SparseCacheConfig(
+                            num_selected_blocks=2, max_cached_units=4, unit_tokens=128
+                        ),
                     )
                 ],
             )
@@ -1366,14 +1384,14 @@ class TestSparseCacheReservation(unittest.TestCase):
                     self.assertTrue(cache.resume(handle))
                     # Resuming alone takes none: a request that is not being stepped cannot
                     # fetch, and a resumed one may still be receiving its history.
-                    self.assertEqual(_introspection.sparse_cache_base_cell(cache, lc_id), -1)
+                    self.assertIsNone(_introspection.sparse_cache_base_cell(cache, lc_id))
                     batch.add_kv_cache(cache)
-                    self.assertGreaterEqual(_introspection.sparse_cache_base_cell(cache, lc_id), 0)
+                    self.assertIsNotNone(_introspection.sparse_cache_base_cell(cache, lc_id))
                     batch.remove_kv_cache(cache)
-                    self.assertEqual(_introspection.sparse_cache_base_cell(cache, lc_id), -1)
+                    self.assertIsNone(_introspection.sparse_cache_base_cell(cache, lc_id))
                     # Returned rather than leaked: the same cells are available again.
                     batch.add_kv_cache(cache)
-                    self.assertGreaterEqual(_introspection.sparse_cache_base_cell(cache, lc_id), 0)
+                    self.assertIsNotNone(_introspection.sparse_cache_base_cell(cache, lc_id))
                     batch.remove_kv_cache(cache)
             finally:
                 cache.close()
@@ -1434,7 +1452,7 @@ class TestSparseCacheReservation(unittest.TestCase):
                 )
         finally:
             if cache is not None:
-                if batch is not None and batch.row_of(cache) >= 0:
+                if batch is not None and batch.row_of(cache) is not None:
                     batch.remove_kv_cache(cache)
                 cache.close()
             manager.shutdown()
@@ -1486,7 +1504,7 @@ class TestSparseCacheReservation(unittest.TestCase):
                     caches[1].resize(129, 128)
         finally:
             for cache in caches:
-                if batch is not None and batch.row_of(cache) >= 0:
+                if batch is not None and batch.row_of(cache) is not None:
                     batch.remove_kv_cache(cache)
                 cache.close()
             manager.shutdown()
@@ -1520,7 +1538,7 @@ class TestSparseCacheReservation(unittest.TestCase):
                 self.assertEqual(_introspection.sparse_flush_counts(cache, lc_id), [-1])
         finally:
             if cache is not None:
-                if batch is not None and batch.row_of(cache) >= 0:
+                if batch is not None and batch.row_of(cache) is not None:
                     batch.remove_kv_cache(cache)
                 cache.close()
             manager.shutdown()
@@ -2084,7 +2102,9 @@ class TestSparseFetch(unittest.TestCase):
                             BufferConfig("index", 256)
                         ],
                         sparse_cache=SparseCacheConfig(
-                            num_selected_blocks=cls.SELECTED, max_cached_units=cls.CACHED_UNITS
+                            num_selected_blocks=cls.SELECTED,
+                            max_cached_units=cls.CACHED_UNITS,
+                            unit_tokens=cls.TOKENS_PER_BLOCK,
                         ),
                     )
                 ],
@@ -2138,7 +2158,7 @@ class TestSparseFetch(unittest.TestCase):
                 yield torch, manager, batch, cache, handle
         finally:
             if cache is not None:
-                if batch is not None and batch.row_of(cache) >= 0:
+                if batch is not None and batch.row_of(cache) is not None:
                     batch.remove_kv_cache(cache)
                 cache.close()
             manager.shutdown()
@@ -2225,7 +2245,7 @@ class TestSparseFetch(unittest.TestCase):
                 # away and this proves nothing.
                 self.assertNotEqual(out[0, 0, :].tolist(), out[1, 0, :].tolist())
             finally:
-                if batch.row_of(second) >= 0:
+                if batch.row_of(second) is not None:
                     batch.remove_kv_cache(second)
                 second.close()
 
@@ -2892,7 +2912,7 @@ class TestIndexTables(unittest.TestCase):
                 yield batch, cache
         finally:
             if cache is not None:
-                if batch.row_of(cache) >= 0:
+                if batch.row_of(cache) is not None:
                     batch.remove_kv_cache(cache)
                 cache.close()
 
@@ -3000,7 +3020,7 @@ class TestIndexTables(unittest.TestCase):
                 )
         finally:
             if cache is not None:
-                if batch.row_of(cache) >= 0:
+                if batch.row_of(cache) is not None:
                     batch.remove_kv_cache(cache)
                 cache.close()
             manager.shutdown()
@@ -3065,7 +3085,7 @@ class TestIndexTables(unittest.TestCase):
                 self.assertEqual(batch.num_index_tables, 1)
         finally:
             if cache is not None:
-                if batch is not None and batch.row_of(cache) >= 0:
+                if batch is not None and batch.row_of(cache) is not None:
                     batch.remove_kv_cache(cache)
                 cache.close()
             manager.shutdown()
@@ -3126,7 +3146,7 @@ class TestIndexTables(unittest.TestCase):
                 self.assertIn("SHARED life cycle", str(caught.exception))
         finally:
             if cache is not None:
-                if batch is not None and batch.row_of(cache) >= 0:
+                if batch is not None and batch.row_of(cache) is not None:
                     batch.remove_kv_cache(cache)
                 cache.close()
             manager.shutdown()
@@ -3218,7 +3238,9 @@ class TestIndexMode(unittest.TestCase):
         """Per life cycle, not per batch: the sliding group alone pays for PER_LAYER."""
         manager = self._manager(scratch_reuse=True)
         try:
-            batch = Batch(manager, NULL_STREAM, max_batch_size=1, max_blocks_per_seq=4)
+            batch = Batch(
+                manager, NULL_STREAM, index_tables=[], max_batch_size=1, max_blocks_per_seq=4
+            )
             self.assertEqual(
                 batch.index_mode(manager.get_layer_group_id(self.WINDOWED_LAYER)),
                 PageIndexMode.PER_LAYER,
@@ -3236,6 +3258,7 @@ class TestIndexMode(unittest.TestCase):
             batch = Batch(
                 manager,
                 NULL_STREAM,
+                index_tables=[],
                 max_batch_size=1,
                 max_blocks_per_seq=4,
                 mode=PageIndexMode.PER_LAYER,
@@ -3360,7 +3383,7 @@ class TestBatchPageTable(unittest.TestCase):
             batch.resize(list(sizes), list(sizes))
             yield cache
         finally:
-            if batch.row_of(cache) >= 0:
+            if batch.row_of(cache) is not None:
                 batch.remove_kv_cache(cache)
             cache.close()
 
@@ -3443,7 +3466,7 @@ class TestBatchPageTable(unittest.TestCase):
                 with self.assertRaisesRegex(Exception, "remove it from the Batch first"):
                     cache.suspend()
                 batch.remove_kv_cache(cache)
-                self.assertEqual(cache.batch_row, -1)
+                self.assertEqual(cache.batch_row, None)
                 self.assertEqual(
                     self._row(torch, batch, manager, 1), [BAD_PAGE_INDEX] * self.BLOCKS
                 )
@@ -3491,7 +3514,9 @@ class TestSparseDataPath(unittest.TestCase):
                             BufferConfig("index", 256),
                         ],
                         sparse_cache=SparseCacheConfig(
-                            num_selected_blocks=cls.SELECTED, max_cached_units=cls.CELLS
+                            num_selected_blocks=cls.SELECTED,
+                            max_cached_units=cls.CELLS,
+                            unit_tokens=cls.TPB,
                         ),
                     )
                 ],
@@ -3672,7 +3697,9 @@ class TestSparseWriteIndices(unittest.TestCase):
                             BufferConfig("index", 256),
                         ],
                         sparse_cache=SparseCacheConfig(
-                            num_selected_blocks=cls.SELECTED, max_cached_units=cls.CELLS
+                            num_selected_blocks=cls.SELECTED,
+                            max_cached_units=cls.CELLS,
+                            unit_tokens=cls.TPB,
                         ),
                     )
                 ],
@@ -3865,7 +3892,9 @@ class TestSparseWriteIndices(unittest.TestCase):
                             BufferConfig("index", 256)
                         ],
                         sparse_cache=SparseCacheConfig(
-                            num_selected_blocks=self.SELECTED, max_cached_units=self.CELLS
+                            num_selected_blocks=self.SELECTED,
+                            max_cached_units=self.CELLS,
+                            unit_tokens=self.TPB,
                         ),
                     )
                 ],
@@ -3939,7 +3968,9 @@ class TestSparseWriteIndices(unittest.TestCase):
                             BufferConfig("index", 256),
                         ],
                         sparse_cache=SparseCacheConfig(
-                            num_selected_blocks=self.SELECTED, max_cached_units=self.CELLS
+                            num_selected_blocks=self.SELECTED,
+                            max_cached_units=self.CELLS,
+                            unit_tokens=self.TPB,
                         ),
                     )
                     for layer in range(layers)
@@ -4135,7 +4166,9 @@ class TestSparseQuantisedDataPath(unittest.TestCase):
                             BufferConfig("index", 256),
                         ],
                         sparse_cache=SparseCacheConfig(
-                            num_selected_blocks=cls.SELECTED, max_cached_units=cls.CELLS
+                            num_selected_blocks=cls.SELECTED,
+                            max_cached_units=cls.CELLS,
+                            unit_tokens=cls.TPB,
                         ),
                     )
                 ],
@@ -4441,7 +4474,9 @@ class TestBatch(unittest.TestCase):
 
         manager = self._manager()
         try:
-            batch = Batch(manager, NULL_STREAM, max_batch_size=2, max_blocks_per_seq=4)
+            batch = Batch(
+                manager, NULL_STREAM, index_tables=[], max_batch_size=2, max_blocks_per_seq=4
+            )
             lg_id = manager.get_layer_group_id(0)
             table = torch.from_dlpack(_introspection.batch_gpu_coalesced_page_table(batch, lg_id))
             history = torch.from_dlpack(batch.history_lengths())
@@ -4488,7 +4523,9 @@ class TestBatch(unittest.TestCase):
                             # data it selects over are one attention computation.
                             BufferConfig("index", 256),
                         ],
-                        sparse_cache=SparseCacheConfig(num_selected_blocks=2, max_cached_units=4),
+                        sparse_cache=SparseCacheConfig(
+                            num_selected_blocks=2, max_cached_units=4, unit_tokens=128
+                        ),
                     )
                 ],
             )
@@ -4529,7 +4566,7 @@ class TestBatch(unittest.TestCase):
                 self.assertEqual(_introspection.batch_sparse_view_entries(batch, lg_id), [0, 0])
         finally:
             if cache is not None:
-                if batch is not None and batch.row_of(cache) >= 0:
+                if batch is not None and batch.row_of(cache) is not None:
                     batch.remove_kv_cache(cache)
                 cache.close()
             manager.shutdown()
@@ -4540,7 +4577,9 @@ class TestBatch(unittest.TestCase):
         try:
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=4)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=3, max_blocks_per_seq=4
+                )
                 self.assertEqual(batch.num_kv_caches, 0)
                 self.assertTrue(batch.is_contiguous, "an empty batch has no hole")
 
@@ -4564,7 +4603,7 @@ class TestBatch(unittest.TestCase):
                 self.assertTrue(batch.is_contiguous)
 
                 for cache in caches:
-                    if batch.row_of(cache) >= 0:
+                    if batch.row_of(cache) is not None:
                         batch.remove_kv_cache(cache)
                     cache.close()
         finally:
@@ -4575,7 +4614,9 @@ class TestBatch(unittest.TestCase):
         try:
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=4)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=3, max_blocks_per_seq=4
+                )
                 first = manager.create_kv_cache()
                 second = manager.create_kv_cache()
                 third = manager.create_kv_cache()
@@ -4589,7 +4630,7 @@ class TestBatch(unittest.TestCase):
                 # row indices have to survive a graph capture.
                 batch.remove_kv_cache(second)
                 self.assertEqual(batch.row_of(third), 2)
-                self.assertEqual(batch.row_of(second), -1)
+                self.assertEqual(batch.row_of(second), None)
 
                 fourth = manager.create_kv_cache()
                 self.assertTrue(fourth.resume(handle))
@@ -4608,7 +4649,9 @@ class TestBatch(unittest.TestCase):
         try:
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=2, max_blocks_per_seq=4)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=2, max_blocks_per_seq=4
+                )
                 first = manager.create_kv_cache()
                 second = manager.create_kv_cache()
                 for cache in (first, second):
@@ -4620,7 +4663,7 @@ class TestBatch(unittest.TestCase):
                 with self.assertRaisesRegex(Exception, "beyond max_batch_size"):
                     batch.add_kv_cache(second, 2)
                 # Neither attempt seated it, and neither disturbed the member already there.
-                self.assertEqual(batch.row_of(second), -1)
+                self.assertEqual(batch.row_of(second), None)
                 self.assertEqual(batch.row_of(first), 0)
                 self.assertEqual(batch.num_kv_caches, 1)
 
@@ -4641,7 +4684,9 @@ class TestBatch(unittest.TestCase):
         try:
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=4)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=3, max_blocks_per_seq=4
+                )
                 cache = manager.create_kv_cache()
                 caches.append(cache)
                 self.assertTrue(cache.resume(handle))
@@ -4661,7 +4706,7 @@ class TestBatch(unittest.TestCase):
                         batch[bad]
         finally:
             for cache in caches:
-                if batch is not None and batch.row_of(cache) >= 0:
+                if batch is not None and batch.row_of(cache) is not None:
                     batch.remove_kv_cache(cache)
                 cache.close()
             manager.shutdown()
@@ -4675,7 +4720,9 @@ class TestBatch(unittest.TestCase):
         try:
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=4)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=3, max_blocks_per_seq=4
+                )
                 lg = manager.get_layer_group_id(0)
                 table = torch.from_dlpack(_introspection.batch_gpu_coalesced_page_table(batch, lg))
                 address = table.data_ptr()
@@ -4707,7 +4754,7 @@ class TestBatch(unittest.TestCase):
                 self.assertEqual(torch.from_dlpack(batch.capacities()).tolist(), [128, 0, 128])
         finally:
             for cache in caches:
-                if batch is not None and batch.row_of(cache) >= 0:
+                if batch is not None and batch.row_of(cache) is not None:
                     batch.remove_kv_cache(cache)
                 cache.close()
             manager.shutdown()
@@ -4719,7 +4766,9 @@ class TestBatch(unittest.TestCase):
         try:
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=4)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=3, max_blocks_per_seq=4
+                )
                 for _ in range(2):
                     cache = manager.create_kv_cache()
                     caches.append(cache)
@@ -4752,7 +4801,7 @@ class TestBatch(unittest.TestCase):
                 self.assertEqual([batch.row_of(cache) for cache in caches], [0, 2])
         finally:
             for cache in caches:
-                if batch is not None and batch.row_of(cache) >= 0:
+                if batch is not None and batch.row_of(cache) is not None:
                     batch.remove_kv_cache(cache)
                 cache.close()
             manager.shutdown()
@@ -4768,7 +4817,9 @@ class TestBatch(unittest.TestCase):
         try:
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=2, max_blocks_per_seq=4)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=2, max_blocks_per_seq=4
+                )
                 cache = manager.create_kv_cache()
                 self.assertTrue(cache.resume(handle))
                 row = batch.add_kv_cache(cache)
@@ -4782,7 +4833,7 @@ class TestBatch(unittest.TestCase):
                 returned = batch.remove_row(row)
                 self.assertIsNotNone(returned)
                 self.assertEqual(batch.num_kv_caches, 0)
-                self.assertEqual(batch.row_of(returned), -1)
+                self.assertEqual(batch.row_of(returned), None)
                 returned.close()
 
                 # A row nobody occupies has nothing to hand back.
@@ -4795,8 +4846,12 @@ class TestBatch(unittest.TestCase):
         try:
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                one = Batch(manager, handle, max_batch_size=2, max_blocks_per_seq=4)
-                two = Batch(manager, handle, max_batch_size=2, max_blocks_per_seq=4)
+                one = Batch(
+                    manager, handle, index_tables=[], max_batch_size=2, max_blocks_per_seq=4
+                )
+                two = Batch(
+                    manager, handle, index_tables=[], max_batch_size=2, max_blocks_per_seq=4
+                )
                 cache = manager.create_kv_cache()
                 self.assertTrue(cache.resume(handle))
                 one.add_kv_cache(cache)
@@ -4823,12 +4878,14 @@ class TestBatch(unittest.TestCase):
         )
         cache = None
         try:
-            batch = Batch(manager, NULL_STREAM, max_batch_size=1, max_blocks_per_seq=4)
+            batch = Batch(
+                manager, NULL_STREAM, index_tables=[], max_batch_size=1, max_blocks_per_seq=4
+            )
             cache = manager.create_kv_cache()
             cache.beam_width = 2
             with self.assertRaisesRegex(Exception, "beam"):
                 batch.add_kv_cache(cache)
-            self.assertEqual(batch.row_of(cache), -1, "a refused member takes no row")
+            self.assertEqual(batch.row_of(cache), None, "a refused member takes no row")
         finally:
             if cache is not None:
                 cache.close()
@@ -4839,7 +4896,9 @@ class TestBatch(unittest.TestCase):
         try:
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=4)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=1, max_blocks_per_seq=4
+                )
                 first = manager.create_kv_cache()
                 second = manager.create_kv_cache()
                 self.assertTrue(first.resume(handle))
@@ -4862,6 +4921,7 @@ class TestBatch(unittest.TestCase):
                 batch = Batch(
                     manager,
                     cast(CudaStream, stream.handle),
+                    index_tables=[],
                     max_batch_size=2,
                     max_blocks_per_seq=3,
                 )
@@ -4882,7 +4942,9 @@ class TestBatch(unittest.TestCase):
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=2, max_blocks_per_seq=4)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=2, max_blocks_per_seq=4
+                )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 cache.resize(256, 0)  # 128-token blocks, so two of them
@@ -4900,7 +4962,7 @@ class TestBatch(unittest.TestCase):
                 self.assertEqual(table[4:], [self.BAD] * 4)
         finally:
             if cache is not None:
-                if batch is not None and batch.row_of(cache) >= 0:
+                if batch is not None and batch.row_of(cache) is not None:
                     batch.remove_kv_cache(cache)
                 cache.close()
             manager.shutdown()
@@ -4913,7 +4975,9 @@ class TestBatch(unittest.TestCase):
             lg_id = manager.get_layer_group_id(0)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=8)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=3, max_blocks_per_seq=8
+                )
                 for _ in range(2):
                     cache = manager.create_kv_cache()
                     caches.append(cache)
@@ -4933,7 +4997,7 @@ class TestBatch(unittest.TestCase):
                 self.assertEqual(table[16:24], [self.BAD] * 8, "the free row stays absent")
         finally:
             for cache in caches:
-                if batch is not None and batch.row_of(cache) >= 0:
+                if batch is not None and batch.row_of(cache) is not None:
                     batch.remove_kv_cache(cache)
                 cache.close()
             manager.shutdown()
@@ -4947,7 +5011,9 @@ class TestBatch(unittest.TestCase):
             lg_id = manager.get_layer_group_id(0)
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=3, max_blocks_per_seq=8)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=3, max_blocks_per_seq=8
+                )
                 # Seeded before joining: the Batch only accepts a history its row already
                 # had the capacity for, and these start at nothing.
                 for capacity, history in ((256, 128), (384, 256)):
@@ -4973,7 +5039,7 @@ class TestBatch(unittest.TestCase):
                     )
         finally:
             for cache in caches:
-                if batch is not None and batch.row_of(cache) >= 0:
+                if batch is not None and batch.row_of(cache) is not None:
                     batch.remove_kv_cache(cache)
                 cache.close()
             manager.shutdown()
@@ -4985,7 +5051,9 @@ class TestBatch(unittest.TestCase):
         try:
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=4)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=1, max_blocks_per_seq=4
+                )
                 cache = manager.create_kv_cache()
                 self.assertTrue(cache.resume(handle))
                 # Seeded before joining: the Batch only accepts a history its row already
@@ -5013,7 +5081,9 @@ class TestBatch(unittest.TestCase):
         try:
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=1, max_blocks_per_seq=8
+                )
                 cache = manager.create_kv_cache()
                 self.assertTrue(cache.resume(handle))
                 # Advanced while unbatched, which is what makes the row's own state stale.
@@ -5028,7 +5098,7 @@ class TestBatch(unittest.TestCase):
                 )
         finally:
             if cache is not None:
-                if batch is not None and batch.row_of(cache) >= 0:
+                if batch is not None and batch.row_of(cache) is not None:
                     batch.remove_kv_cache(cache)
                 cache.close()
             manager.shutdown()
@@ -5038,7 +5108,9 @@ class TestBatch(unittest.TestCase):
         try:
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=2, max_blocks_per_seq=4)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=2, max_blocks_per_seq=4
+                )
                 # Indexed by row, so a short list would silently misalign members.
                 with self.assertRaisesRegex(Exception, "per row"):
                     batch.resize([128], [0])
@@ -5053,7 +5125,9 @@ class TestBatch(unittest.TestCase):
         try:
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=1, max_blocks_per_seq=8
+                )
                 cache = manager.create_kv_cache()
                 self.assertTrue(cache.resume(handle))
                 # Seeded before joining: the Batch only accepts a history its row already
@@ -5074,7 +5148,7 @@ class TestBatch(unittest.TestCase):
                 self.assertEqual(_introspection.batch_watermarks(batch), ([128], [256]))
         finally:
             if cache is not None:
-                if batch is not None and batch.row_of(cache) >= 0:
+                if batch is not None and batch.row_of(cache) is not None:
                     batch.remove_kv_cache(cache)
                 cache.close()
             manager.shutdown()
@@ -5098,7 +5172,9 @@ class TestBatch(unittest.TestCase):
         try:
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=2, max_blocks_per_seq=pool)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=2, max_blocks_per_seq=pool
+                )
                 for _ in range(2):
                     cache = manager.create_kv_cache()
                     caches.append(cache)
@@ -5121,7 +5197,7 @@ class TestBatch(unittest.TestCase):
                 self.assertEqual(capacity, [each, each], "row 1's growth rolled itself back")
         finally:
             for cache in caches:
-                if batch is not None and batch.row_of(cache) >= 0:
+                if batch is not None and batch.row_of(cache) is not None:
                     batch.remove_kv_cache(cache)
                 cache.close()
             manager.shutdown()
@@ -5129,7 +5205,9 @@ class TestBatch(unittest.TestCase):
     def test_wait_published_is_a_noop_when_nothing_is_in_flight(self):
         manager = self._manager()
         try:
-            batch = Batch(manager, NULL_STREAM, max_batch_size=1, max_blocks_per_seq=4)
+            batch = Batch(
+                manager, NULL_STREAM, index_tables=[], max_batch_size=1, max_blocks_per_seq=4
+            )
             # Safe to call at the top of a step whether or not a publish happened.
             batch.wait_published()
             batch.wait_published()
@@ -5150,7 +5228,9 @@ class TestBatch(unittest.TestCase):
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=8)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=1, max_blocks_per_seq=8
+                )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 cache.resize(256, 0)
@@ -5167,7 +5247,7 @@ class TestBatch(unittest.TestCase):
                 self.assertEqual(sum(1 for i in second if i != self.BAD), 4, second)
         finally:
             if cache is not None:
-                if batch is not None and batch.row_of(cache) >= 0:
+                if batch is not None and batch.row_of(cache) is not None:
                     batch.remove_kv_cache(cache)
                 cache.close()
             manager.shutdown()
@@ -5179,7 +5259,9 @@ class TestBatch(unittest.TestCase):
             cache = manager.create_kv_cache()
             with TemporaryCudaStream([]) as stream:
                 handle = cast(CudaStream, stream.handle)
-                batch = Batch(manager, handle, max_batch_size=1, max_blocks_per_seq=4)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=1, max_blocks_per_seq=4
+                )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 cache.resize(256, 0)

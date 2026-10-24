@@ -460,7 +460,9 @@ def test_sparse_cache_config_sizes_the_cache_for_any_selection_unit(
     )
 
     assert cache.num_selected_blocks == num_selected_units
-    assert cache.unit_tokens == unit_tokens
+    # The config names a definite unit size: a caller passing none means a whole page,
+    # and the helper resolves that rather than storing the absence.
+    assert cache.unit_tokens == (TOKENS_PER_BLOCK if unit_tokens is None else unit_tokens)
     # The default cache holds two selections plus the unit being written, in whole cells.
     assert cache.max_cached_units == cells * units_per_page
     (arena,) = sparse_arena_shapes(

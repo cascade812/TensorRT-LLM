@@ -2926,12 +2926,10 @@ class KVCacheManagerV2(BaseResourceManager):
             device=device,
         )
 
-        min_scale = int(scales.min().item()) if scales.numel() > 0 else 1
-        max_scratch_pages = int(scratch_pages.max().item()) if scratch_pages.numel() > 0 else 1
-        self._max_scratch_slots = max(
-            1,
-            (self.max_blocks_per_seq * max_scratch_pages + min_scale - 1) // min_scale,
-        )
+        # Asked rather than derived: a block still in the window, or held as a sink, is
+        # never stale and so never scratch, and that reasoning belongs with the window and
+        # rewind margins the manager already holds.
+        self._max_scratch_slots = max(1, self.impl.max_scratch_slots(self.max_blocks_per_seq))
         scratch_slots_shape = (
             self.num_pools,
             staging_capacity,
@@ -4019,7 +4017,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _set_page_index_bufs(self, request_id: int, kv_cache: _KVCache) -> None:
         assert kv_cache.beam_width <= self.max_beam_width
-        if kv_cache.batch_row >= 0:
+        if kv_cache.batch_row is not None:
             # A member's page indices belong to its Batch row; binding a second buffer
             # would take the writes with it and strand that row at whatever it held when
             # the cache joined. Adapters that need separate host tables must snapshot

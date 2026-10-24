@@ -38,7 +38,7 @@ AttentionLayerConfig makeAttentionLayer(LayerId layerId, bool isSparse, size_t b
         .layerId = layerId, .buffers = {BufferConfig{.role = "key", .size = bufferSize, .isSparse = isSparse}}};
     if (isSparse)
     {
-        layer.sparseCache = SparseCacheConfig{/*numSelectedBlocks=*/1, /*maxCachedUnits=*/2};
+        layer.sparseCache = SparseCacheConfig{/*numSelectedBlocks=*/1, /*maxCachedUnits=*/2, /*unitTokens=*/4};
     }
     return layer;
 }

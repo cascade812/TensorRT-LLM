@@ -92,12 +92,12 @@ struct SparseCacheView
 // ---------------------------------------------------------------------------
 struct SparseCacheInit
 {
-    int32_t numLayers = 0;
-    int32_t numBuffers = 0;
-    int32_t entriesPerLayer = 0;
+    int32_t numLayers;
+    int32_t numBuffers;
+    int32_t entriesPerLayer;
     //! Cells one buffer gets, i.e. entriesPerLayer / unitsPerPage. A lease is this many cells
     //! per buffer, laid out buffer-major.
-    int32_t cellsPerBuffer = 0;
+    int32_t cellsPerBuffer;
     //! [numBuffers] the layer each buffer belongs to, non-decreasing.
     std::vector<int32_t> bufferLayer;
     //! [numBuffers] each buffer's index among those sharing its pool.
@@ -146,7 +146,7 @@ private:
     friend class SparseCellArena;
 
     SparseCellArena* mArena = nullptr;
-    int mIndex = -1;
+    std::optional<int> mIndex;
     SparseCacheView mView;
 };
 

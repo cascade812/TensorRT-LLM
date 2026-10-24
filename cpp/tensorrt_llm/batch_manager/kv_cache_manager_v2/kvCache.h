@@ -319,12 +319,12 @@ public:
         return mStatus;
     }
 
-    // Row this cache occupies in its Batch, or -1 when it belongs to none.
+    // Row this cache occupies in its Batch; nullopt when it belongs to none.
     //
     // Also the answer to who owns its page index buffers: a member's are the Batch's rows,
     // so setBasePageIndexBuf refuses while it is seated -- including for the Batch, which
     // ends the membership before handing the indices back.
-    int batchRow() const noexcept
+    std::optional<int> batchRow() const noexcept
     {
         return mBatchRow;
     }
@@ -751,7 +751,7 @@ private:
     // Set while this cache is a Batch member; the Batch clears both on removal and the
     // destructor detaches, so a dropped request cannot leave a row pointing at it.
     Batch* mBatch = nullptr;
-    int mBatchRow = -1;
+    std::optional<int> mBatchRow;
 
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
     std::vector<FuncGuard<std::function<void()>>> mPartialCopyRetentionHolds;

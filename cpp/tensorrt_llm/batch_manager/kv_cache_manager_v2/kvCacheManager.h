@@ -128,12 +128,12 @@ struct SparseCacheShape
 struct SparseBufferPlan
 {
     BufferId id;
-    PoolIndex poolIndex{0};  //!< Which hot pool holds its bytes; pools partition by size.
-    size_t size = 0;         //!< One cell.
-    uint32_t pageOffset = 0; //!< Its offset within its hot slot.
+    PoolIndex poolIndex; //!< Which hot pool holds its bytes; pools partition by size.
+    size_t size;         //!< One cell.
+    uint32_t pageOffset; //!< Its offset within its hot slot.
     SelectionUnitLayout layout;
-    int32_t layerRow = 0;    //!< Metadata row: the dense index of its layer in the group.
-    int32_t slotInPool = 0;  //!< Its index among the life cycle's buffers sharing its pool.
+    int32_t layerRow;    //!< Metadata row: the dense index of its layer in the group.
+    int32_t slotInPool;  //!< Its index among the life cycle's buffers sharing its pool.
 };
 
 class Batch;
@@ -279,6 +279,14 @@ public:
     {
         return mConfig.enableSwaScratchReuse();
     }
+
+    //! The most scratch slots one request can need, over every life cycle and buffer,
+    //! given the widest page table a row will get. Zero where nothing can hold scratch.
+    //!
+    //! Sizes scratch staging. A caller that stages scratch slots itself asks this rather
+    //! than deriving it: which blocks can be stale turns on the window, the sinks and the
+    //! rewind margin, and a second copy of that reasoning is a second thing to keep right.
+    [[nodiscard]] int maxScratchSlots(int maxBlocksPerSeq) const;
 
     //! Whether managed KV caches support the given page index mode for one life cycle,
     //! which is the granularity a Batch decides at. True means every request supports it;
@@ -662,14 +670,31 @@ private:
     [[nodiscard]] SparseLayerSpan _sparseLayerSpan(std::vector<BufferId> const& buffers, char const* api) const;
 
     //! The most blocks of one request that can take scratch slots in this life cycle,
-    //! given the widest page table a batch will give a row.
+    //! given the widest page table a batch will give a row and, where the caller knows it,
+    //! the most tokens one step may ingest.
     //!
-    //! Sizes the Batch's scratch staging, so it answers for the worst request rather than
-    //! for any particular one: capacity filling the page table with no history behind it,
-    //! which is a prefill chunk as long as the row can hold. Blocks still in the window or
-    //! held as sinks are never stale and so never scratch, which is what makes this
-    //! smaller than the page table.
-    [[nodiscard]] int _maxScratchBlocks(LifeCycleId lcId, int maxBlocksPerSeq) const;
+    //! Sizes scratch staging, so it answers for the worst request rather than any
+    //! particular one. Blocks still in the window or held as sinks are never stale and so
+    //! never scratch, which is what makes this smaller than the page table.
+    //!
+    //! `maxTotalInputTokens` usually bounds it far harder. Scratch is the blocks a step
+    //! *adds* that are *already* stale at capacity, so a step ingesting T tokens can make
+    //! at most `(T - window - rewind + 1) / tpb` of them -- the window and rewind come off
+    //! in tokens, before the division. Under chunked prefill that is the chunk rather than
+    //! the context, and it is zero whenever a chunk cannot outrun the window.
+    //!
+    //! Pass it only where the caller truly bounds a step; the Batch's decode-shaped
+    //! default would under-count a batch that then runs prefill.
+    [[nodiscard]] int _maxScratchBlocks(
+        LifeCycleId lcId, int maxBlocksPerSeq, std::optional<int> maxTotalInputTokens = std::nullopt) const;
+
+    //! Slots one buffer's worst request needs, which is its scratch blocks converted at
+    //! that buffer's own sub-pages-per-block and slot width. Zero where it can hold none.
+    //!
+    //! Callers differ in which buffers they ask about -- a Batch only its tables', the
+    //! manager every one -- so they share this rather than the loop around it.
+    [[nodiscard]] int _scratchSlotsFor(
+        BufferId const& buffer, int maxBlocksPerSeq, std::optional<int> maxTotalInputTokens = std::nullopt) const;
 
     // Throw unless every KvCache has been closed. `api` names the caller so the message
     // points at the mistake rather than at whatever breaks later.

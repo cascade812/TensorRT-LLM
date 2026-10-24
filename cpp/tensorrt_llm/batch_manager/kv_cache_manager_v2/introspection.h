@@ -70,9 +70,10 @@ public:
     // life cycle has no cache reserved.
     static std::vector<int32_t> sparseCacheResidentOrdinals(KvCache const& kvCache, int lcId);
 
-    // White-box hook: the first cell of this request's lease on the life cycle's arena, or
-    // -1 when it holds none. A lease is one contiguous run, so its first cell identifies it.
-    static int sparseCacheBaseCell(KvCache const& kvCache, int lcId, int pool);
+    // White-box hook: the first cell of this request's lease on the life cycle's arena;
+    // nullopt when it holds none. A lease is one contiguous run, so its first cell
+    // identifies it.
+    static std::optional<int> sparseCacheBaseCell(KvCache const& kvCache, int lcId, int pool);
 
     // White-box hook: units the last write-back moved per buffer, -1 where none has run.
     static std::vector<int32_t> sparseFlushCounts(KvCache const& kvCache, int lcId);

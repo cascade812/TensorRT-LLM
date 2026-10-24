@@ -130,12 +130,12 @@ std::vector<int32_t> KvCacheIntrospection::sparseCacheResidentOrdinals(KvCache c
     return kvCache.mSparseCache[id].readResidentOrdinals();
 }
 
-int KvCacheIntrospection::sparseCacheBaseCell(KvCache const& kvCache, int lcId, int pool)
+std::optional<int> KvCacheIntrospection::sparseCacheBaseCell(KvCache const& kvCache, int lcId, int pool)
 {
     LifeCycleId const id{lcId};
     if (id >= kvCache.mSparseCache.size() || kvCache.mSparseCache[id].empty())
     {
-        return -1;
+        return std::nullopt;
     }
     // Relative to the pool's own arena region, which is what getSparseCacheBaseAddress
     // reports for a buffer drawing on it.
@@ -215,7 +215,7 @@ std::vector<int32_t> KvCacheIntrospection::sparseFlushCounts(KvCache const& kvCa
     auto const layers = static_cast<size_t>(scratch.numLayers);
     std::vector<int32_t> out(layers);
     cuCheck(cuMemcpyDtoH(out.data(),
-        reinterpret_cast<CUdeviceptr>(scratch.flushCount + static_cast<size_t>(kvCache.mBatchRow) * layers),
+        reinterpret_cast<CUdeviceptr>(scratch.flushCount + static_cast<size_t>(*kvCache.mBatchRow) * layers),
         sizeof(int32_t) * layers));
     return out;
 }

@@ -145,7 +145,7 @@ def test_create_kv_cache_swa_endpoint_priority(
     manager.impl = Mock()
     manager.impl.create_kv_cache.return_value.beam_width = 1
     # Belongs to no Batch, so it still owns its page index buffers.
-    manager.impl.create_kv_cache.return_value.batch_row = -1
+    manager.impl.create_kv_cache.return_value.batch_row = None
 
     manager._create_kv_cache(0, None, None, is_dummy=is_dummy, expected_prompt_length=prompt)
 
@@ -724,7 +724,9 @@ def test_zero_size_filter_keeps_a_sparse_fetch_path() -> None:
     manager.num_kv_heads_per_layer = [1, 1]
     manager.head_dim_per_layer = [64, 64]
     manager.max_attention_window_vec = [None, None]
-    cache = SparseCacheConfig(num_selected_blocks=1, max_cached_units=2)
+    cache = SparseCacheConfig(
+        num_selected_blocks=1, max_cached_units=2, unit_tokens=TOKENS_PER_BLOCK
+    )
     config = KVCacheManagerConfig(
         tokens_per_block=TOKENS_PER_BLOCK,
         cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
@@ -2833,7 +2835,9 @@ def _index_mapper_capacity_for(
                         BufferConfig(role=Role.KEY, size=128, is_sparse=sparse),
                         BufferConfig(role=Role.VALUE, size=128),
                     ],
-                    sparse_cache=SparseCacheConfig(num_selected_blocks=1, max_cached_units=2)
+                    sparse_cache=SparseCacheConfig(
+                        num_selected_blocks=1, max_cached_units=2, unit_tokens=tokens_per_block
+                    )
                     if sparse
                     else None,
                 )
@@ -3029,10 +3033,10 @@ def test_sparse_arena_retains_padding_with_full_live_batch(
             caches.append(cache)
             assert cache.resume(stream)
             assert cache.resize(1)
-            assert _introspection.sparse_cache_base_cell(cache, lc_id) == -1
+            assert _introspection.sparse_cache_base_cell(cache, lc_id) is None
             if index >= reserved:
                 batch.add_kv_cache(cache)
-                assert _introspection.sparse_cache_base_cell(cache, lc_id) >= 0
+                assert _introspection.sparse_cache_base_cell(cache, lc_id) is not None
         assert batch.max_batch_size == max_batch_size
         batch.publish()
         batch.wait_published()
@@ -3046,12 +3050,12 @@ def test_sparse_arena_retains_padding_with_full_live_batch(
         with pytest.raises(Exception, match="full"):
             batch.add_kv_cache(extra)
         batch.remove_kv_cache(caches[-2])
-        assert _introspection.sparse_cache_base_cell(caches[-2], lc_id) == -1
+        assert _introspection.sparse_cache_base_cell(caches[-2], lc_id) is None
         batch.add_kv_cache(extra)
-        assert _introspection.sparse_cache_base_cell(extra, lc_id) >= 0
+        assert _introspection.sparse_cache_base_cell(extra, lc_id) is not None
     finally:
         for cache in caches:
-            if batch.row_of(cache) >= 0:
+            if batch.row_of(cache) is not None:
                 batch.remove_kv_cache(cache)
             cache.close()
         core.shutdown()
@@ -3874,7 +3878,9 @@ def _offload_layers() -> list[AttentionLayerConfig]:
                 BufferConfig(role=Role.KEY, size=1024, is_sparse=True),
                 BufferConfig(role=Role.VALUE, size=256),
             ],
-            sparse_cache=SparseCacheConfig(num_selected_blocks=1, max_cached_units=2),
+            sparse_cache=SparseCacheConfig(
+                num_selected_blocks=1, max_cached_units=2, unit_tokens=TOKENS_PER_BLOCK
+            ),
         ),
         AttentionLayerConfig(
             layer_id=LayerId(1),

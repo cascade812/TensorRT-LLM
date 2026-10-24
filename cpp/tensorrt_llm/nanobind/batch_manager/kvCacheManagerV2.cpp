@@ -1694,8 +1694,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("validate", &kv::DiskCacheTierConfig::validate) DEF_COPY(kv::DiskCacheTierConfig);
 
     nb::class_<kv::SparseCacheConfig>(m, "SparseCacheConfig")
-        .def(nb::init<int, int, std::optional<int>>(), nb::arg("num_selected_blocks"), nb::arg("max_cached_units"),
-            nb::arg("unit_tokens") = std::nullopt)
+        .def(nb::init<int, int, int>(), nb::arg("num_selected_blocks"), nb::arg("max_cached_units"),
+            nb::arg("unit_tokens"))
         .def_rw("num_selected_blocks", &kv::SparseCacheConfig::numSelectedBlocks)
         .def_rw("max_cached_units", &kv::SparseCacheConfig::maxCachedUnits)
         .def_rw("unit_tokens", &kv::SparseCacheConfig::unitTokens) DEF_COPY(kv::SparseCacheConfig);
@@ -2056,7 +2056,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("is_active", &kv::KvCache::isActive)
         .def_prop_ro("num_blocks", [](kv::KvCache const& self) { return self.numBlocks().value(); })
         .def_prop_ro("batch_row", &kv::KvCache::batchRow,
-            "Row this cache occupies in its Batch, or -1 when it belongs to none.\n\n"
+            "Row this cache occupies in its Batch; None when it belongs to none.\n\n"
             "Also the answer to who owns its page index buffers: a member's are the Batch's "
             "rows, so set_base_page_index_buf refuses and suspend() leaves them bound.")
         .def_prop_ro("num_committed_blocks", &kv::KvCache::numCommittedBlocks)
@@ -2742,20 +2742,24 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::Batch>(m, "Batch")
         .def(
             "__init__",
-            [](kv::Batch* self, kv::KvCacheManager& manager, intptr_t stream, int maxBatchSize, int maxBlocksPerSeq,
-                std::optional<kv::PageIndexMode> mode, std::vector<kv::IndexTableSpec> indexTables,
+            [](kv::Batch* self, kv::KvCacheManager& manager, intptr_t stream,
+                std::vector<kv::IndexTableSpec> indexTables, std::optional<int> maxBatchSize,
+                std::optional<int> maxBlocksPerSeq, std::optional<kv::PageIndexMode> mode,
                 std::optional<int> maxTotalInputTokens)
             {
-                new (self) kv::Batch(manager, reinterpret_cast<CUstream>(stream), maxBatchSize, maxBlocksPerSeq, mode,
-                    std::move(indexTables), maxTotalInputTokens);
+                new (self) kv::Batch(manager, reinterpret_cast<CUstream>(stream), std::move(indexTables), maxBatchSize,
+                    maxBlocksPerSeq, mode, maxTotalInputTokens);
             },
-            nb::arg("manager"), nb::arg("stream"), nb::arg("max_batch_size") = 0, nb::arg("max_blocks_per_seq") = 0,
-            nb::arg("mode") = nb::none(), nb::arg("index_tables") = std::vector<kv::IndexTableSpec>{},
+            nb::arg("manager"), nb::arg("stream"), nb::arg("index_tables"), nb::arg("max_batch_size") = nb::none(),
+            nb::arg("max_blocks_per_seq") = nb::none(), nb::arg("mode") = nb::none(),
             nb::arg("max_total_input_tokens") = nb::none(), nb::keep_alive<1, 2>(),
             "The KV caches stepped together, and their device-side page tables.\n\n"
+            "index_tables names what a consumer needs addressable together, and is required: pass [] "
+            "to convert no indices, which is a choice about what the consumer reads rather than an "
+            "absence the Batch could fill in.\n\n"
             "max_batch_size and max_blocks_per_seq bound device arrays whose shape must not change "
-            "between steps, so neither can be grown later. Zero derives them from the manager's "
-            "constraints, which fails when none were declared.\n\n"
+            "between steps, so neither can be grown later. Left unset they are derived from the "
+            "manager's constraints, which fails when none were declared.\n\n"
             "max_total_input_tokens is the tokens one step may ingest across every row. It sizes the "
             "write-back's work list; left unset it assumes a decode step, where each row advances by "
             "one token and so crosses at most one unit boundary.\n\n"
@@ -2772,9 +2776,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "The Batch stages the host page indices itself; host_page_table() exposes them for a "
             "consumer that needs the same numbers, which leaves one buffer with one writer and a "
             "member's binding alive for the whole decode.")
-        .def("add_kv_cache", &kv::Batch::addKvCache, nb::arg("kv_cache"), nb::arg("row") = -1,
+        .def("add_kv_cache", &kv::Batch::addKvCache, nb::arg("kv_cache"), nb::arg("row") = nb::none(),
             nb::call_guard<nb::gil_scoped_release>(),
-            "Seat a cache in `row`, or in the lowest free row when it is negative, returning the "
+            "Seat a cache in `row`, or in the lowest free row when none is given, returning the "
             "row. Raises when the row is taken or out of range, the batch is full, or the cache "
             "already belongs to a batch.\n\n"
             "The batch holds a reference while the cache is seated, so a caller may keep only the "
@@ -3059,7 +3063,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             "int32[max_batch] per-row capacity, in tokens. Published with history_lengths().")
 
-        .def("row_of", &kv::Batch::rowOf, nb::arg("kv_cache"), "Row of a member, or -1.")
+        .def("row_of", &kv::Batch::rowOf, nb::arg("kv_cache"), "Row of a member; None when this cache is not one.")
         .def(
             "__getitem__", [](kv::Batch const& self, int row) { return self[row]; }, nb::arg("row"),
             "The member seated in `row`, or None when that row is free. The inverse of "
@@ -3453,6 +3457,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("enable_partial_match", &kv::KvCacheManager::enablePartialMatch)
         .def_prop_ro("enable_partial_commit", &kv::KvCacheManager::enablePartialCommit)
         .def_prop_ro("enable_swa_scratch_reuse", &kv::KvCacheManager::isSwaScratchReuseEnabled)
+        .def("max_scratch_slots", &kv::KvCacheManager::maxScratchSlots, nb::arg("max_blocks_per_seq"),
+            "The most scratch slots one request can need, over every life cycle and buffer, given the "
+            "widest page table a row will get. Zero where nothing can hold scratch.\n\n"
+            "Sizes scratch staging. A caller that stages scratch slots itself asks this rather than "
+            "deriving it: which blocks can be stale turns on the window, the sinks and the rewind "
+            "margin, and a second copy of that reasoning is a second thing to keep right.")
         .def(
             "supports_index_mode",
             [](kv::KvCacheManager const& self, kv::PageIndexMode mode, int layerGroupId) -> nb::object

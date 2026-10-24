@@ -32,14 +32,14 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 struct IndexTableDesc
 {
     //! Raw slot ids for this table's life cycle: [numRows][rawRowStride].
-    int32_t const* raw = nullptr;
+    int32_t const* raw;
     //! Destination: [numRows][numBuffers][blocksPerRow], so a row's buffers are adjacent.
-    int32_t* converted = nullptr;
+    int32_t* converted;
     //! Offset added to each buffer's indices, in page-index units. Length numBuffers.
-    int32_t const* offsets = nullptr;
-    int32_t numBuffers = 0;
+    int32_t const* offsets;
+    int32_t numBuffers;
     //! Slot id to page index, i.e. how many buffers the pool coalesces.
-    int32_t scale = 1;
+    int32_t scale;
 
     //! Scratch metadata for this table's life cycle, null when it cannot hold scratch.
     //!

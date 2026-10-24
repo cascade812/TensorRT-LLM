@@ -350,11 +350,13 @@ void KvCacheManager::_buildSparseArenas()
         auto const plan = _sparseBufferPlan(lcId);
         TLLM_CHECK(!plan.empty());
 
-        SparseCacheInit shape;
-        shape.numLayers = _sparseCacheLayerCount(lcId);
-        shape.numBuffers = sparseCacheBufferCount(lcId);
-        shape.cellsPerBuffer = _sparseCacheSubSlotsPerBuffer(lcId);
-        shape.entriesPerLayer = shape.cellsPerBuffer * sparseCacheUnitsPerPage(lcId);
+        auto const cellsPerBuffer = _sparseCacheSubSlotsPerBuffer(lcId);
+        SparseCacheInit shape{
+            .numLayers = _sparseCacheLayerCount(lcId),
+            .numBuffers = sparseCacheBufferCount(lcId),
+            .entriesPerLayer = cellsPerBuffer * sparseCacheUnitsPerPage(lcId),
+            .cellsPerBuffer = cellsPerBuffer,
+        };
 
         // The arena mirrors the hot pool group: one region per pool the life cycle's sparse
         // buffers draw on, sized by that pool's cell and the buffers sharing it.
@@ -721,7 +723,35 @@ PageIndexConverter KvCacheManager::getPageIndexConverter(LayerId layerId, DataRo
     return PageIndexConverter{scale, attr.expansion, offset, scratchPages};
 }
 
-int KvCacheManager::_maxScratchBlocks(LifeCycleId lcId, int maxBlocksPerSeq) const
+int KvCacheManager::_scratchSlotsFor(
+    BufferId const& buffer, int maxBlocksPerSeq, std::optional<int> maxTotalInputTokens) const
+{
+    auto const lcId = _bufferAttr(buffer.layerId, buffer.role).lifeCycleId;
+    auto const blocks = _maxScratchBlocks(lcId, maxBlocksPerSeq, maxTotalInputTokens);
+    if (blocks <= 0)
+    {
+        return 0;
+    }
+    // A scratch block takes scratchPagesPerBlock sub-pages and a slot holds scale of them,
+    // which is how the conversion indexes them: scratchSlots[block * pages / scale].
+    auto const converter = getPageIndexConverter(buffer.layerId, buffer.role);
+    auto const slots
+        = (static_cast<int64_t>(blocks) * converter.scratchPagesPerBlock + converter.scale - 1) / converter.scale;
+    return static_cast<int>(slots);
+}
+
+int KvCacheManager::maxScratchSlots(int maxBlocksPerSeq) const
+{
+    int result = 0;
+    for (auto const& id : allBufferIds())
+    {
+        result = std::max(result, _scratchSlotsFor(id, maxBlocksPerSeq));
+    }
+    return result;
+}
+
+int KvCacheManager::_maxScratchBlocks(
+    LifeCycleId lcId, int maxBlocksPerSeq, std::optional<int> maxTotalInputTokens) const
 {
     if (!mConfig.enableSwaScratchReuse() || maxBlocksPerSeq <= 0)
     {
@@ -732,14 +762,31 @@ int KvCacheManager::_maxScratchBlocks(LifeCycleId lcId, int maxBlocksPerSeq) con
     {
         return 0;
     }
-    // Deferred to getStaleRange rather than restated: which blocks are stale turns on the
-    // sink count and on the in-flight token the window always keeps, and a second copy of
-    // that arithmetic here would be a second place for it to drift.
     auto const tpb = tokensPerBlock();
-    auto const capacity = static_cast<int64_t>(maxBlocksPerSeq) * tpb;
     auto const rewind = mConfig.swaScratchReuse->maxRewindLen;
+
+    // Capacity-limited: a request whose history is empty and whose capacity fills the page
+    // table. Deferred to getStaleRange rather than restated, since which blocks are stale
+    // turns on the sink count and on the in-flight token the window always keeps.
+    auto const capacity = static_cast<int64_t>(maxBlocksPerSeq) * tpb;
     auto const stale = attn->getStaleRange(static_cast<int>(std::max<int64_t>(0, capacity - rewind)), tpb);
-    return std::max(0, stale.end.value() - stale.beg.value());
+    auto bound = static_cast<int64_t>(stale.end.value() - stale.beg.value());
+
+    if (maxTotalInputTokens.has_value())
+    {
+        // Input-limited: scratch is the blocks a step adds that are already stale at
+        // capacity, so a step of T tokens reaches across T - window - rewind + 1 of them.
+        // The subtraction is in tokens, before the division: converting to blocks first
+        // and subtracting after would lose the alignment this is exact at.
+        //
+        // Exact rather than an estimate. With the stale end and the input start a fixed
+        // distance apart, the block count depends only on where that end falls inside its
+        // block, and is largest when it falls on the boundary -- which is also when the
+        // input start does, both giving this quotient.
+        auto const reach = static_cast<int64_t>(*maxTotalInputTokens) - *attn->windowSize - rewind + 1;
+        bound = std::min(bound, reach / tpb);
+    }
+    return static_cast<int>(std::max<int64_t>(0, bound));
 }
 
 std::optional<bool> KvCacheManager::supportsIndexMode(PageIndexMode mode, LifeCycleId lcId) const

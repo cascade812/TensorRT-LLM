@@ -376,8 +376,11 @@ class SparseCacheConfig:
     ``num_selected_blocks``, since equality would leave no cell for the unit being written.
     """
 
-    unit_tokens: int | None = None
-    """Original tokens one selection unit spans. ``None`` means a unit is a whole page.
+    unit_tokens: int
+    """Original tokens one selection unit spans.
+
+    A whole page is ``tokens_per_block``, which a caller wanting that states rather than
+    omits -- there is no unit size that suits a layer which did not name one.
 
     Must divide ``tokens_per_block``; the quotient is how many units a page holds.
     Distinct from ``BufferConfig.tokens_per_block_override``, which reinterprets a buffer's
@@ -974,13 +977,18 @@ class Batch:
         self,
         manager: KVCacheManager,
         stream: CudaStream,
-        max_batch_size: int = 0,
-        max_blocks_per_seq: int = 0,
+        index_tables: Sequence[IndexTableSpec],
+        max_batch_size: int | None = None,
+        max_blocks_per_seq: int | None = None,
         mode: PageIndexMode | None = None,
-        index_tables: Sequence[IndexTableSpec] = (),
         max_total_input_tokens: int | None = None,
     ) -> None:
         """Bound the device arrays, whose shape must not change between steps.
+
+        ``index_tables`` names what a consumer needs addressable together, and is
+        required: ``[]`` is how a caller that converts no indices says so, which is a
+        choice about what the consumer reads rather than an absence the batch could fill
+        in.
 
         ``max_total_input_tokens`` is the tokens one step may ingest across every row. It
         sizes the write-back's work list: a row advancing ``t`` tokens crosses at most
@@ -994,9 +1002,9 @@ class Batch:
         against each other, and two streams would leave that to the caller. Joining binds
         the member to it, and a member cannot be moved off it.
 
-        Neither can be grown later, so neither is inferred: zero derives it from the
-        manager's ``constraints``, which fails when none were declared. A pool-sizing hint
-        is a default, never a substitute for a batch bound.
+        Neither can be grown later, so neither is inferred: left unset each derives from
+        the manager's ``constraints``, which fails when none were declared. A pool-sizing
+        hint is a default, never a substitute for a batch bound.
 
         The batch stages the host page indices itself; :meth:`coalesced_page_table` exposes
         them for a consumer that needs the same numbers. One buffer with one writer is what
@@ -1748,6 +1756,17 @@ class KVCacheManager:
         scratch slots -- anything without a sliding window -- which the collapsing form
         cannot express. Configuration only, so it never varies with what a request is doing.
         """
+
+    def max_scratch_slots(self, max_blocks_per_seq: int) -> int:
+        """The most scratch slots one request can need, over every life cycle and buffer.
+
+        Given the widest page table a row will get; zero where nothing can hold scratch.
+
+        Sizes scratch staging. A caller that stages scratch slots itself asks this rather
+        than deriving it: which blocks can be stale turns on the window, the sinks and the
+        rewind margin, and a second copy of that reasoning is a second thing to keep right.
+        """
+
     @property
     def num_layers(self) -> int: ...
     @property

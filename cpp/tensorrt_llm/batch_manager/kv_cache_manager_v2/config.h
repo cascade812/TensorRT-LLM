@@ -149,10 +149,10 @@ inline std::optional<size_t> cacheTierMaxQuota(CacheTierConfig const& cfg)
 // ---------------------------------------------------------------------------
 struct SelectionUnitLayout
 {
-    uint32_t numChunks = 1;   //!< One per head for a head-major page; 1 otherwise.
-    uint32_t chunkBytes = 0;  //!< Contiguous bytes of one unit within one chunk.
-    uint32_t chunkStride = 0; //!< Distance between consecutive chunks.
-    uint32_t unitStride = 0;  //!< Distance between consecutive selection units.
+    uint32_t numChunks;   //!< One per head for a head-major page; 1 otherwise.
+    uint32_t chunkBytes;  //!< Contiguous bytes of one unit within one chunk.
+    uint32_t chunkStride; //!< Distance between consecutive chunks.
+    uint32_t unitStride;  //!< Distance between consecutive selection units.
 
     //! Derive the layout of a densely packed page.
     //!
@@ -161,14 +161,11 @@ struct SelectionUnitLayout
     //! @param numChunks Pieces a unit is gathered from; see BufferConfig::sparseUnitChunks.
     static SelectionUnitLayout derive(size_t pageBytes, int unitsPerPage, int numChunks)
     {
-        SelectionUnitLayout out;
-        out.numChunks = static_cast<uint32_t>(numChunks);
-        out.chunkStride = static_cast<uint32_t>(pageBytes / static_cast<size_t>(numChunks));
-        out.chunkBytes = out.chunkStride / static_cast<uint32_t>(unitsPerPage);
+        auto const chunkStride = static_cast<uint32_t>(pageBytes / static_cast<size_t>(numChunks));
+        auto const chunkBytes = chunkStride / static_cast<uint32_t>(unitsPerPage);
         // Units pack densely inside a chunk, which is what makes the page's own extent
         // enough to place them: a unit's stride is its size.
-        out.unitStride = out.chunkBytes;
-        return out;
+        return SelectionUnitLayout{static_cast<uint32_t>(numChunks), chunkBytes, chunkStride, chunkBytes};
     }
 
     //! @param unitSize Bytes of one selection unit, i.e. size / unitsPerPage.
@@ -270,7 +267,10 @@ struct BufferConfig
 struct SparseCacheConfig
 {
     //! Selection width: units a sparse-attention step selects for this layer.
-    int numSelectedBlocks = 0;
+    //!
+    //! No default: there is no width that suits a layer which did not state one, and a
+    //! zero would only be caught later by validate().
+    int numSelectedBlocks;
 
     //! Cells one buffer gets in a request's GPU cache, counting both populations: the
     //! history it caches and every unit still in flight.
@@ -279,21 +279,23 @@ struct SparseCacheConfig
     //! selection retains nothing between steps, so what it holds above the selection is
     //! what survives to be hit next step. Only one unit of it is ever in flight, because a
     //! sparse request contributes one query token per step, so the rest is all reuse.
-    int maxCachedUnits = 0;
+    int maxCachedUnits;
 
-    //! Original tokens one selection unit spans. Unset means a unit is a whole page.
+    //! Original tokens one selection unit spans. A whole page is `tokensPerBlock`, which a
+    //! caller wanting that states rather than omits -- there is no unit size that suits a
+    //! layer which did not name one.
     //!
     //! Must divide KVCacheManagerConfig::tokensPerBlock; the quotient is how many units a
     //! page holds. Distinct from BufferConfig::tokensPerBlockOverride, which is a
     //! storage-wide reinterpretation of a buffer's page: this names the sparse cache's
     //! granularity and nothing else, so pages, page indices and index spaces all keep the
     //! manager's tokensPerBlock.
-    std::optional<int> unitTokens;
+    int unitTokens;
 
     //! Selection units one page holds, given the manager's tokensPerBlock.
     [[nodiscard]] int unitsPerPage(int tokensPerBlock) const
     {
-        return tokensPerBlock / unitTokens.value_or(tokensPerBlock);
+        return tokensPerBlock / unitTokens;
     }
 
     void validate(int tokensPerBlock) const
@@ -314,7 +316,7 @@ struct SparseCacheConfig
                 "SparseCacheConfig: maxCachedUnits must exceed numSelectedBlocks, to leave room for units in "
                 "flight");
         }
-        if (unitTokens.has_value() && (*unitTokens <= 0 || tokensPerBlock % *unitTokens != 0))
+        if (unitTokens <= 0 || tokensPerBlock % unitTokens != 0)
         {
             throw std::invalid_argument("SparseCacheConfig: unitTokens must be a divisor of tokensPerBlock");
         }

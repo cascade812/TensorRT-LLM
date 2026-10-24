@@ -370,14 +370,19 @@ class SparseBatchShape:
         max_blocks_per_seq: Columns of each page table.
         selection_widths: Units one step selects, for each life cycle with a sparse
             fetch path.
+        layer_counts: Layers of each of those life cycles. The write-back keeps a work
+            list per layer, so this scales that term; a zero would drop it and under-size
+            the allocation, which is why it is required rather than defaulted.
+        flush_capacities: Units one step can write back per layer, for each of those life
+            cycles, from the step's token budget.
     """
 
     num_life_cycles: int
     max_batch_size: int
     max_blocks_per_seq: int
     selection_widths: tuple[int, ...]
-    layer_counts: tuple[int, ...] = ()
-    flush_capacities: tuple[int, ...] = ()
+    layer_counts: tuple[int, ...]
+    flush_capacities: tuple[int, ...]
 
     @property
     def mirror_bytes(self) -> int:
@@ -410,11 +415,9 @@ class SparseBatchShape:
         the step's token budget.
         """
         rows = self.max_batch_size
-        layers = self.layer_counts or (0,) * len(self.selection_widths)
-        flush = self.flush_capacities or (rows,) * len(self.selection_widths)
         total = 0
         for width, num_layers, flush_capacity in zip(
-            self.selection_widths, layers, flush, strict=True
+            self.selection_widths, self.layer_counts, self.flush_capacities, strict=True
         ):
             total += rows * (width + 1 + _SPARSE_MAX_FLUSH_UNITS)
             total += 3 * rows * width + 1
@@ -525,7 +528,9 @@ def sparse_cache_config(
     return SparseCacheConfig(
         num_selected_blocks=num_selected_units,
         max_cached_units=cells * units_per_page,
-        unit_tokens=unit_tokens,
+        # Resolved rather than passed through: the config names a unit size, and a whole
+        # page is one of them. None is this helper's convenience, not the config's.
+        unit_tokens=tokens_per_block // units_per_page,
     )
 
 
