@@ -95,14 +95,23 @@ An explicit `mode` applies to every life cycle. Unset, each life cycle takes SHA
 the manager answers `true` and PER_LAYER otherwise -- preferring SHARED, which is the
 smaller table.
 
+Naming SHARED is allowed where the manager answers `nullopt`, and naming it is the only way
+to get it there. The manager answers for every request a life cycle could carry, so a
+sliding window leaves it undecided; a batch that will hold only decode members knows more
+than that, because scratch covers the blocks a prefill chunk adds and a one-token request
+adds none. A named mode is therefore a claim about this batch's members rather than about
+the configuration, and `publish()` holds the caller to it on every step. A derived mode is
+never allowed to outrun the manager, since nothing would be checking it.
+
 The decision is fixed at construction because a converted table's shape is baked into a
 captured graph. It cannot follow a member's scratch state, which varies per step.
 
 `KvCache::supportsIndexMode(PageIndexMode, LifeCycleId)` exists only to assert: at publish,
-for each member and each SHARED life cycle, check the member holds no scratch slots there. A
-violation means a request acquired scratch inside a SHARED batch, which the prefill/decode
-split says cannot happen. The check is an `empty()` test per (member, SHARED life cycle), so
-it stays in release builds.
+for each member and each SHARED life cycle, check the member holds no scratch slots there.
+Where the mode was derived, a violation means a request acquired scratch inside a SHARED
+batch, which the prefill/decode split says cannot happen. Where it was named, this is the
+check that makes naming it safe. The check is an `empty()` test per (member, SHARED life
+cycle), so it stays in release builds.
 
 ## Requests and tables
 
@@ -204,6 +213,41 @@ addressed produces wrong page addresses at step time rather than an error:
 That shape is not a choice -- it follows from the pool layout -- so
 `KvCacheManager::sparseIndexTableSpecs()` hands it out. A Batch still has to be given it:
 the declaration stays explicit, and only the re-derivation is saved.
+
+## Considered: converting per layer into a reused buffer
+
+PER_LAYER costs one table per layer, where SHARED costs one per life cycle. A layer's
+converted indices are dead as soon as its attention has read them, and next step's page
+table differs anyway, so the memory looks reusable: convert on demand, one layer at a time,
+into a single buffer the caller recycles -- and overlap the conversion with the preceding
+layer's MLP or MoE. The batch would take its specs in groups declared at construction, and
+a new call would convert one group into a caller-provided buffer.
+
+It is not worth it, because the memory it reclaims is not the memory that matters.
+
+What forces PER_LAYER is scratch substitution, and scratch is a prefill phenomenon:
+`computeScratchRange` intersects the blocks stale at capacity with the blocks the current
+chunk is adding, and in decode the only block being added is the newest, which is still in
+window. A decode request therefore holds no scratch, and a decode-only batch answers
+`supportsIndexMode(SHARED)` for every life cycle. So the batch that dominates memory --
+many concurrent rows, decode -- already takes the smaller table, and the batch that needs
+PER_LAYER is the prefill one, whose row count is small and whose tables are correspondingly
+cheap.
+
+Reaching that does need something, but something smaller: prefill and decode want different
+index modes, and the mode is fixed per batch at construction, so they have to be two batches
+running in parallel, each publishing its own page table. That is expressible today -- the
+attention op already takes `AttentionInputType::ContextOnly` and `GenerationOnly`, so the
+two batches are two op calls rather than one, and each call reads its own
+`maxBlocksPerSequence`, so the two page tables need not agree on width. What it does cost is
+the host-side readers that index one aggregated block-offset buffer by absolute batch row --
+speculative decoding's draft swap and token relocation, the sparse path, KV-cache sharing --
+each of which would have to choose a table by phase.
+
+So the cheaper route to the same saving is the mode split, not on-demand conversion. If this
+is revisited, note that the two interact: with prefill and decode separated, the prefill
+batch is the only PER_LAYER one left, and per-layer conversion would be reclaiming a
+fraction of an already small allocation.
 
 ## Not in scope
 

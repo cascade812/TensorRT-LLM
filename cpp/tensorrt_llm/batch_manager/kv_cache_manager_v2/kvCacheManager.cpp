@@ -721,6 +721,27 @@ PageIndexConverter KvCacheManager::getPageIndexConverter(LayerId layerId, DataRo
     return PageIndexConverter{scale, attr.expansion, offset, scratchPages};
 }
 
+int KvCacheManager::_maxScratchBlocks(LifeCycleId lcId, int maxBlocksPerSeq) const
+{
+    if (!mConfig.enableSwaScratchReuse() || maxBlocksPerSeq <= 0)
+    {
+        return 0;
+    }
+    auto const* attn = std::get_if<AttnLifeCycle>(&lifeCycles().getLifeCycle(lcId));
+    if (attn == nullptr || !attn->windowSize.has_value())
+    {
+        return 0;
+    }
+    // Deferred to getStaleRange rather than restated: which blocks are stale turns on the
+    // sink count and on the in-flight token the window always keeps, and a second copy of
+    // that arithmetic here would be a second place for it to drift.
+    auto const tpb = tokensPerBlock();
+    auto const capacity = static_cast<int64_t>(maxBlocksPerSeq) * tpb;
+    auto const rewind = mConfig.swaScratchReuse->maxRewindLen;
+    auto const stale = attn->getStaleRange(static_cast<int>(std::max<int64_t>(0, capacity - rewind)), tpb);
+    return std::max(0, stale.end.value() - stale.beg.value());
+}
+
 std::optional<bool> KvCacheManager::supportsIndexMode(PageIndexMode mode, LifeCycleId lcId) const
 {
     switch (mode)

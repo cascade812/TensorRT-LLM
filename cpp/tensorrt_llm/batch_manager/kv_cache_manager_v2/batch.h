@@ -193,6 +193,21 @@ public:
     //! cycle takes the smaller table -- SHARED where the manager says it is always
     //! available, PER_LAYER otherwise.
     //!
+    //! Set, it overrides that answer rather than being checked against it, and SHARED may
+    //! be named where KvCacheManager::supportsIndexMode() returns nullopt. That answer
+    //! covers every request the life cycle could carry, so a sliding window leaves it
+    //! undecided; naming SHARED is the caller's narrower claim that no member of *this*
+    //! batch will hold scratch slots there. A decode-only batch is the case it exists for:
+    //! scratch covers the blocks a prefill chunk adds, and a one-token request adds none.
+    //! That is what lets prefill and decode run as two batches over one manager with SWA
+    //! scratch enabled, the decode one still taking SHARED for the sliding life cycles --
+    //! which is where the table count is worth saving, since it holds the most rows.
+    //!
+    //! The claim is validated, not trusted: every publish() checks each member against
+    //! KvCache::supportsIndexMode(SHARED, lc) and throws if one holds scratch after all.
+    //! Seat only members that keep it -- the throw arrives mid-step, with the batch already
+    //! built around the smaller table.
+    //!
     //! The mode is fixed here because a converted table's shape is baked into a captured
     //! graph. It cannot follow a member's scratch state, which varies per step.
     //! @param indexTables what consumers need addressable together. Requests whose
@@ -748,6 +763,15 @@ private:
     //! layer's indices differ from another's in the same life cycle, so a life cycle that
     //! cannot hold scratch takes SHARED and the single smaller table that implies.
     TypedVec<LifeCycleId, PageIndexMode> mIndexModes;
+
+    //! Whether the caller named the mode rather than letting it be derived.
+    //!
+    //! A named SHARED is a claim about this batch's members -- that none will hold scratch
+    //! slots -- which configuration alone cannot settle, since the manager answers for every
+    //! request a life cycle could carry. A decode-only batch is the case that makes it true:
+    //! scratch covers the blocks a prefill chunk adds, so a request contributing one token
+    //! holds none. publish() checks the claim against each member, every step.
+    bool mIndexModeNamed = false;
 
     //! One converted index table: the specs it serves, and what a consumer needs to read
     //! it. `concatOffsets` is in page-index units, parallel to a request's buffers.

@@ -3005,6 +3005,132 @@ class TestIndexTables(unittest.TestCase):
                 cache.close()
             manager.shutdown()
 
+    def test_a_named_shared_serves_a_member_that_keeps_the_claim(self):
+        """The case the escape hatch exists for: manager undecided, member clear.
+
+        The manager answers for every request this sliding life cycle could carry, so it
+        will not promise SHARED. A member whose capacity never reaches the window holds
+        nothing stale, so it takes no scratch and says so itself -- and the batch that
+        named SHARED publishes it against one table for all four layers.
+        """
+        num_layers, window, tpb = 4, 128, 32
+        manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=tpb,
+                cache_tiers=[GpuCacheTierConfig(quota=64 << 20)],
+                layers=[
+                    AttentionLayerConfig(
+                        layer_id=LayerId(i),
+                        buffers=[BufferConfig(role=DataRole("key"), size=8192)],
+                        sliding_window_size=window,
+                        num_sink_tokens=0,
+                    )
+                    for i in range(num_layers)
+                ],
+                swa_scratch_reuse=SwaScratchReuseConfig(max_rewind_len=0),
+            )
+        )
+        cache = None
+        batch = None
+        try:
+            lg = manager.get_layer_group_id(0)
+            # The manager will not promise it...
+            self.assertIsNone(manager.supports_index_mode(PageIndexMode.SHARED, lg))
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=1,
+                    max_blocks_per_seq=4,
+                    mode=PageIndexMode.SHARED,
+                    index_tables=[IndexTableSpec([BufferId(0, "key")])],
+                )
+                # One table for the life cycle, not one per layer: the saving being claimed.
+                self.assertEqual(batch.num_index_tables, 1)
+
+                tokens = tpb  # One block, far short of the window, so nothing goes stale.
+                cache = manager.create_kv_cache(None, [TokenId(i) for i in range(tokens)])
+                self.assertTrue(cache.resume(handle))
+                self.assertTrue(cache.resize(tokens))
+                # ...but the member itself does, which is what makes the claim true.
+                self.assertFalse(cache.has_scratch_slots)
+                self.assertTrue(cache.supports_index_mode(PageIndexMode.SHARED, lg))
+
+                batch.add_kv_cache(cache)
+                batch.publish()
+                batch.wait_published()
+                # Published, and every layer still reads the one table.
+                self.assertEqual(batch.index_mode(lg), PageIndexMode.SHARED)
+                self.assertEqual(batch.num_index_tables, 1)
+        finally:
+            if cache is not None:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
+            manager.shutdown()
+
+    def test_a_named_shared_is_held_to_its_claim_at_publish(self):
+        """Naming SHARED asserts no member holds scratch; publish is what enforces it.
+
+        Construction lets the claim stand because configuration cannot settle it -- the
+        manager answers for every request the life cycle could carry. So the batch admits
+        a member that does hold scratch, and the publish that would hand its layers one
+        table for indices that differ between them refuses instead.
+        """
+        num_layers, window, tpb, prompt_len = 4, 128, 32, 1024
+        manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=tpb,
+                cache_tiers=[GpuCacheTierConfig(quota=64 << 20)],
+                layers=[
+                    AttentionLayerConfig(
+                        layer_id=LayerId(i),
+                        buffers=[BufferConfig(role=DataRole("key"), size=8192)],
+                        sliding_window_size=window,
+                        num_sink_tokens=0,
+                    )
+                    for i in range(num_layers)
+                ],
+                swa_scratch_reuse=SwaScratchReuseConfig(max_rewind_len=0),
+            )
+        )
+        cache = None
+        batch = None
+        try:
+            lg = manager.get_layer_group_id(0)
+            self.assertIsNone(manager.supports_index_mode(PageIndexMode.SHARED, lg))
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                # Named, so construction allows what the manager would not derive.
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=1,
+                    max_blocks_per_seq=div_up(prompt_len, tpb),
+                    mode=PageIndexMode.SHARED,
+                    index_tables=[IndexTableSpec([BufferId(0, "key")])],
+                )
+                self.assertEqual(batch.index_mode(lg), PageIndexMode.SHARED)
+
+                # A prefill-sized grow is what takes scratch slots, so this member breaks
+                # the claim the batch was built on.
+                cache = manager.create_kv_cache(None, [TokenId(i) for i in range(prompt_len)])
+                self.assertTrue(cache.resume(handle))
+                self.assertTrue(cache.resize(prompt_len))
+                self.assertTrue(cache.has_scratch_slots, "config produced no scratch")
+
+                with self.assertRaises(RuntimeError) as caught:
+                    batch.add_kv_cache(cache)
+                    batch.publish()
+                self.assertIn("SHARED life cycle", str(caught.exception))
+        finally:
+            if cache is not None:
+                if batch is not None and batch.row_of(cache) >= 0:
+                    batch.remove_kv_cache(cache)
+                cache.close()
+            manager.shutdown()
+
     def test_an_unrequested_buffer_has_no_slot(self):
         manager = self._manager(roles=("key", "value"))
         try:
@@ -3119,6 +3245,52 @@ class TestIndexMode(unittest.TestCase):
                 # SHARED was available and still not taken.
                 self.assertTrue(manager.supports_index_mode(PageIndexMode.SHARED, lg))
                 self.assertEqual(batch.index_mode(lg), PageIndexMode.PER_LAYER)
+        finally:
+            manager.shutdown()
+
+    def test_naming_shared_takes_it_where_the_manager_will_not_promise_it(self):
+        """A named SHARED is a claim about this batch's members, not about requests.
+
+        The manager answers for every request a life cycle could carry, so a sliding one
+        stays undecided. A batch that will only ever hold decode members knows better:
+        scratch covers the blocks a prefill chunk adds, and a one-token request adds none.
+        """
+        manager = self._manager(scratch_reuse=True)
+        try:
+            windowed = manager.get_layer_group_id(self.WINDOWED_LAYER)
+            self.assertIsNone(manager.supports_index_mode(PageIndexMode.SHARED, windowed))
+
+            spec = IndexTableSpec([BufferId(self.WINDOWED_LAYER, Role.KEY)])
+            batch = Batch(
+                manager,
+                NULL_STREAM,
+                max_batch_size=1,
+                max_blocks_per_seq=4,
+                mode=PageIndexMode.SHARED,
+                index_tables=[spec],
+            )
+            self.assertEqual(batch.index_mode(windowed), PageIndexMode.SHARED)
+            # One table for the life cycle, which is the whole point of taking SHARED.
+            self.assertEqual(batch.num_index_tables, 1)
+        finally:
+            manager.shutdown()
+
+    def test_a_derived_shared_is_still_refused_where_scratch_is_possible(self):
+        """Only a named mode may outrun the manager: nothing would check a derived one."""
+        manager = self._manager(scratch_reuse=True)
+        try:
+            batch = Batch(
+                manager,
+                NULL_STREAM,
+                max_batch_size=1,
+                max_blocks_per_seq=4,
+                index_tables=[IndexTableSpec([BufferId(self.WINDOWED_LAYER, Role.KEY)])],
+            )
+            # Derived, so the sliding life cycle took the table it can prove correct.
+            self.assertEqual(
+                batch.index_mode(manager.get_layer_group_id(self.WINDOWED_LAYER)),
+                PageIndexMode.PER_LAYER,
+            )
         finally:
             manager.shutdown()
 

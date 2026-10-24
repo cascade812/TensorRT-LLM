@@ -281,8 +281,9 @@ public:
     }
 
     //! Whether managed KV caches support the given page index mode for one life cycle,
-    //! which is the granularity a Batch decides at. True or false is definitive; nullopt
-    //! means it depends on the individual KvCache, which must then be asked.
+    //! which is the granularity a Batch decides at. True means every request supports it;
+    //! nullopt means it depends on the individual KvCache, which must then be asked. Never
+    //! false, so an engaged optional means support -- which some callers rely on.
     //!
     //! Only scratch-slot substitution can make one layer's converted indices differ from
     //! another's in the same life cycle, so SHARED is definitive for a life cycle that can
@@ -659,6 +660,16 @@ private:
     };
 
     [[nodiscard]] SparseLayerSpan _sparseLayerSpan(std::vector<BufferId> const& buffers, char const* api) const;
+
+    //! The most blocks of one request that can take scratch slots in this life cycle,
+    //! given the widest page table a batch will give a row.
+    //!
+    //! Sizes the Batch's scratch staging, so it answers for the worst request rather than
+    //! for any particular one: capacity filling the page table with no history behind it,
+    //! which is a prefill chunk as long as the row can hold. Blocks still in the window or
+    //! held as sinks are never stale and so never scratch, which is what makes this
+    //! smaller than the page table.
+    [[nodiscard]] int _maxScratchBlocks(LifeCycleId lcId, int maxBlocksPerSeq) const;
 
     // Throw unless every KvCache has been closed. `api` names the caller so the message
     // points at the mistake rather than at whatever breaks later.

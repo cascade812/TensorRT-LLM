@@ -81,6 +81,7 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, int maxBatchSize, int max
     // Prefer SHARED: one table per life cycle rather than one per layer. The manager
     // answers from configuration alone, so this cannot drift with what a member is doing.
     mIndexModes = TypedVec<LifeCycleId, PageIndexMode>(mManager->numLifeCycles(), PageIndexMode::PER_LAYER);
+    mIndexModeNamed = mode.has_value();
     for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
     {
         mIndexModes[lcId]
@@ -415,10 +416,16 @@ void Batch::_buildIndexTables(std::vector<IndexTableSpec> const& specs)
         auto const lifeCycle = mManager->_bufferAttr(first.layerId, first.role).lifeCycleId;
         // Substitution replaces one layer's page, so every layer of the life cycle can no
         // longer read one table. SHARED is exactly the claim that they can.
+        // Derived SHARED has to be provable from configuration, because nothing else would
+        // check it. A named one is the caller's claim about this batch's members, which
+        // publish() tests against each of them, so it is allowed to outrun what the manager
+        // can prove about requests in general.
         bool const mayHoldScratch = !mManager->supportsIndexMode(PageIndexMode::SHARED, lifeCycle).has_value();
-        TLLM_CHECK_WITH_INFO(!mayHoldScratch || mIndexModes[lifeCycle] == PageIndexMode::PER_LAYER,
+        TLLM_CHECK_WITH_INFO(!mayHoldScratch || mIndexModes[lifeCycle] == PageIndexMode::PER_LAYER || mIndexModeNamed,
             "A life cycle that can hold scratch slots needs PER_LAYER index tables; its layers stop sharing one "
-            "set of converted indices as soon as a scratch slot is substituted");
+            "set of converted indices as soon as a scratch slot is substituted. Name SHARED on the Batch to "
+            "assert no member of it will hold scratch there -- as a decode-only batch does -- and publish() "
+            "will hold you to it");
         auto const scale = mManager->getPageIndexScale(first.layerId, first.role);
         auto const mode = mIndexModes[lifeCycle];
 
@@ -690,8 +697,7 @@ void Batch::_allocateIndexTables()
 
     std::vector<size_t> order(mIndexTables.size());
     std::iota(order.begin(), order.end(), size_t{0});
-    std::stable_partition(
-        order.begin(), order.end(), [&](size_t index) { return !mayHoldScratch(mIndexTables[index]); });
+    std::ranges::stable_partition(order, [&](size_t index) { return !mayHoldScratch(mIndexTables[index]); });
 
     std::vector<IndexTable> sorted;
     std::vector<int> remap(mIndexTables.size());
@@ -709,13 +715,20 @@ void Batch::_allocateIndexTables()
     mNumPlainTables = static_cast<int>(std::count_if(
         mIndexTables.begin(), mIndexTables.end(), [&](IndexTable const& table) { return !mayHoldScratch(table); }));
 
-    // Mirrors the runtime's bound: the most slots a request could need for one life cycle.
+    // The most slots a request could need for one life cycle, which is the stride every
+    // (row, life cycle) of the scratch staging gets. Counted in slots rather than blocks:
+    // a scratch block takes scratchPagesPerBlock sub-pages and a slot holds scale of them,
+    // which is also how the kernel indexes them -- scratchSlots[block * pages / scale].
+    //
+    // Not every block can be scratch, so the page table's width would be a loose bound: a
+    // block still in the window, or held as a sink, is never stale and so never scratch.
     for (size_t index = static_cast<size_t>(mNumPlainTables); index < mIndexTables.size(); ++index)
     {
         auto const& table = mIndexTables[index];
         auto const& first = table.served.front().buffers.front();
         auto const pages = mManager->getPageIndexConverter(first.layerId, first.role).scratchPagesPerBlock;
-        auto const slots = (static_cast<int64_t>(mMaxBlocksPerSeq) * pages + table.scale - 1) / table.scale;
+        auto const blocks = mManager->_maxScratchBlocks(table.lifeCycle, mMaxBlocksPerSeq);
+        auto const slots = (static_cast<int64_t>(blocks) * pages + table.scale - 1) / table.scale;
         mMaxScratchSlots = std::max<int>(mMaxScratchSlots, static_cast<int>(std::max<int64_t>(1, slots)));
     }
 
@@ -1376,18 +1389,23 @@ void Batch::publish()
 
     // A SHARED life cycle gives every layer the same converted indices, which only holds
     // while no member substitutes scratch slots there. Prefill acquires those and decode
-    // does not, so a batch that mixes them would have been given PER_LAYER; reaching here
-    // means the phases were mixed after the mode was fixed.
-    for (auto const& kvCache : mRows)
+    // does not, so a derived mode would have been PER_LAYER and reaching here means the
+    // phases were mixed after it was fixed. A named SHARED makes this the check that holds
+    // the caller to the claim: it is what lets a decode-only batch take the smaller table
+    // on a life cycle the manager cannot clear for requests in general.
+    // Life cycle outermost so the members are reached only for one the manager left
+    // undecided about the mode this batch gave it. PER_LAYER it always allows, and a
+    // SHARED it answers `true` for no request can hold scratch in, so either way every
+    // member would pass and the rows need not be walked.
+    for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
     {
-        if (kvCache == nullptr)
+        if (mManager->supportsIndexMode(mIndexModes[lcId], lcId) == std::optional<bool>(true))
         {
             continue;
         }
-        for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
+        for (auto const& kvCache : mRows)
         {
-            TLLM_CHECK_WITH_INFO(
-                mIndexModes[lcId] != PageIndexMode::SHARED || kvCache->supportsIndexMode(PageIndexMode::SHARED, lcId),
+            TLLM_CHECK_WITH_INFO(kvCache == nullptr || kvCache->supportsIndexMode(mIndexModes[lcId], lcId),
                 "Batch::publish: a member holds scratch slots in a SHARED life cycle; its layers no longer share "
                 "one converted index table");
         }

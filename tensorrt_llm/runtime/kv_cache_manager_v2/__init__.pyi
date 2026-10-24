@@ -1004,9 +1004,26 @@ class Batch:
         never mattered to that.
 
         ``mode`` applies to every life cycle. Left unset, each takes the smaller table:
-        ``SHARED`` where the manager reports it always available, ``PER_LAYER`` otherwise.
+        ``SHARED`` where :meth:`KVCacheManager.supports_index_mode` reports it always
+        available, ``PER_LAYER`` otherwise.
+
+        Set, it **overrides** that answer rather than being checked against it, so
+        ``SHARED`` may be named where the manager returns ``None``. The manager answers for
+        every request a life cycle could carry, so a sliding window leaves it undecided;
+        naming ``SHARED`` is the narrower claim that no member of *this* batch will hold
+        scratch slots there. A decode-only batch is the case it exists for: scratch covers
+        the blocks a prefill chunk adds, and a one-token request adds none. That is what
+        lets prefill and decode run as two batches over one manager with SWA scratch
+        enabled, the decode one still taking ``SHARED`` for the sliding life cycles -- where
+        the saving is worth having, since that batch holds the most rows.
+
+        The claim is validated rather than trusted. Every :meth:`publish` checks each member
+        against its own :meth:`_KVCache.supports_index_mode` and raises if one holds scratch
+        after all -- mid-step, with the batch already built around the smaller table. Seat
+        only members that keep the claim.
+
         It is fixed here because a converted table's shape is baked into a captured graph,
-        so it cannot follow a member's scratch state.
+        so it cannot follow a member's scratch state, which varies per step.
         """
 
     def add_kv_cache(self, kv_cache: _KVCache, row: int = -1) -> int:
@@ -1467,6 +1484,12 @@ class Batch:
         forward is still executing. The batch's stream then carries one linear
         device-to-device copy into the tables the fetch reads, and the conversion. Everything
         expensive is in the first stage, and only the second waits for anything.
+
+        Raises if a member holds scratch slots in a life cycle this batch gave ``SHARED``:
+        its layers no longer share one set of converted indices, so the single table the
+        batch was built around cannot serve them. Where ``mode`` was derived that means the
+        phases were mixed after construction fixed it; where ``SHARED`` was named, this is
+        the check that holds the caller to the claim.
 
         Raises if the previous publish has not been waited on. This call stages the
         watermarks and views itself, so it would be writing into the same hazard it is
