@@ -145,9 +145,11 @@ std::optional<int> KvCacheIntrospection::sparseCacheBaseCell(KvCache const& kvCa
 
 std::vector<int32_t> KvCacheIntrospection::batchPageTable(Batch const& batch, int layerGroupId)
 {
+    CUstream const stream = nullptr;
     auto const view = batch.gpuCoalescedPageTable(LayerGroupId{layerGroupId});
     std::vector<int32_t> out(static_cast<size_t>(view.numRows) * view.blocksPerRow);
-    cuCheck(cuMemcpyDtoH(out.data(), view.data, sizeof(int32_t) * out.size()));
+    cuCheck(cuMemcpyDtoHAsync(out.data(), view.data, sizeof(int32_t) * out.size(), stream));
+    cuCheck(cuStreamSynchronize(stream));
     return out;
 }
 
@@ -164,11 +166,13 @@ MemAddress KvCacheIntrospection::batchIndexTableBase(Batch const& batch, int lay
 
 std::vector<int32_t> KvCacheIntrospection::batchIndexTable(Batch const& batch, int tableId)
 {
+    CUstream const stream = nullptr;
     IndexTableId const typed{tableId};
     auto const numBuffers = static_cast<size_t>(batch.indexTable(typed).front().buffers.size());
     auto const perEntry = static_cast<size_t>(batch.maxBatchSize()) * static_cast<size_t>(batch.maxBlocksPerSeq());
     std::vector<int32_t> out(numBuffers * perEntry);
-    cuCheck(cuMemcpyDtoH(out.data(), batch.indexTableAddress(typed), sizeof(int32_t) * out.size()));
+    cuCheck(cuMemcpyDtoHAsync(out.data(), batch.indexTableAddress(typed), sizeof(int32_t) * out.size(), stream));
+    cuCheck(cuStreamSynchronize(stream));
     return out;
 }
 
@@ -179,10 +183,12 @@ GpuCoalescedPageTable KvCacheIntrospection::batchGpuCoalescedPageTable(Batch con
 
 std::vector<int32_t> KvCacheIntrospection::batchSparseViewEntries(Batch const& batch, int layerGroupId)
 {
+    CUstream const stream = nullptr;
     auto const rows = static_cast<size_t>(batch.maxBatchSize());
     std::vector<SparseCacheView> views(rows);
-    cuCheck(
-        cuMemcpyDtoH(views.data(), batch.sparseCacheViews(LayerGroupId{layerGroupId}), sizeof(SparseCacheView) * rows));
+    cuCheck(cuMemcpyDtoHAsync(
+        views.data(), batch.sparseCacheViews(LayerGroupId{layerGroupId}), sizeof(SparseCacheView) * rows, stream));
+    cuCheck(cuStreamSynchronize(stream));
 
     std::vector<int32_t> out;
     out.reserve(rows);
@@ -195,16 +201,19 @@ std::vector<int32_t> KvCacheIntrospection::batchSparseViewEntries(Batch const& b
 
 std::pair<std::vector<int32_t>, std::vector<int32_t>> KvCacheIntrospection::batchWatermarks(Batch const& batch)
 {
+    CUstream const stream = nullptr;
     auto const view = batch.watermarks();
     std::vector<int32_t> history(static_cast<size_t>(view.numRows));
     std::vector<int32_t> capacity(static_cast<size_t>(view.numRows));
-    cuCheck(cuMemcpyDtoH(history.data(), view.historyLength, sizeof(int32_t) * history.size()));
-    cuCheck(cuMemcpyDtoH(capacity.data(), view.capacity, sizeof(int32_t) * capacity.size()));
+    cuCheck(cuMemcpyDtoHAsync(history.data(), view.historyLength, sizeof(int32_t) * history.size(), stream));
+    cuCheck(cuMemcpyDtoHAsync(capacity.data(), view.capacity, sizeof(int32_t) * capacity.size(), stream));
+    cuCheck(cuStreamSynchronize(stream));
     return {std::move(history), std::move(capacity)};
 }
 
 std::vector<int32_t> KvCacheIntrospection::sparseFlushCounts(KvCache const& kvCache, int lcId)
 {
+    CUstream const stream = nullptr;
     LifeCycleId const id{lcId};
     if (id >= kvCache.mSparseCache.size() || kvCache.mBatch == nullptr)
     {
@@ -214,9 +223,10 @@ std::vector<int32_t> KvCacheIntrospection::sparseFlushCounts(KvCache const& kvCa
     auto const& scratch = kvCache.mBatch->sparseStepScratch(LayerGroupId{lcId});
     auto const layers = static_cast<size_t>(scratch.numLayers);
     std::vector<int32_t> out(layers);
-    cuCheck(cuMemcpyDtoH(out.data(),
+    cuCheck(cuMemcpyDtoHAsync(out.data(),
         reinterpret_cast<CUdeviceptr>(scratch.flushCount + static_cast<size_t>(*kvCache.mBatchRow) * layers),
-        sizeof(int32_t) * layers));
+        sizeof(int32_t) * layers, stream));
+    cuCheck(cuStreamSynchronize(stream));
     return out;
 }
 
@@ -226,17 +236,22 @@ namespace
 //! Device buffer holding a copy of `values`, for the resolve probe below.
 CudaUniqPtr<> deviceCopy(std::vector<int32_t> const& values)
 {
+    CUstream const stream = nullptr;
     CUdeviceptr ptr = 0;
     cuCheck(cuMemAlloc(&ptr, sizeof(int32_t) * values.size()));
     CudaUniqPtr<> owned{reinterpret_cast<std::byte*>(ptr)};
-    cuCheck(cuMemcpyHtoD(ptr, values.data(), sizeof(int32_t) * values.size()));
+    cuCheck(cuMemcpyHtoDAsync(ptr, values.data(), sizeof(int32_t) * values.size(), stream));
+    cuCheck(cuStreamSynchronize(stream));
     return owned;
 }
 
 std::vector<int32_t> readBack(CudaUniqPtr<> const& buffer, size_t count)
 {
+    CUstream const stream = nullptr;
     std::vector<int32_t> out(count);
-    cuCheck(cuMemcpyDtoH(out.data(), reinterpret_cast<CUdeviceptr>(buffer.get()), sizeof(int32_t) * count));
+    cuCheck(
+        cuMemcpyDtoHAsync(out.data(), reinterpret_cast<CUdeviceptr>(buffer.get()), sizeof(int32_t) * count, stream));
+    cuCheck(cuStreamSynchronize(stream));
     return out;
 }
 
@@ -248,6 +263,7 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     std::vector<int32_t> const& historyUnits, std::vector<int32_t> const& capacityUnits, int maxInFlightUnits,
     std::vector<int32_t> const& inactiveRows)
 {
+    CUstream const stream = nullptr;
     auto const numRows = static_cast<int>(historyUnits.size());
     auto const perRowEntries = static_cast<size_t>(numLayers) * entriesPerLayer;
     auto const entryCount = perRowEntries * static_cast<size_t>(numRows);
@@ -293,7 +309,7 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     CUdeviceptr viewPtr = 0;
     cuCheck(cuMemAlloc(&viewPtr, sizeof(SparseCacheView) * views.size()));
     CudaUniqPtr<> viewOwner{reinterpret_cast<std::byte*>(viewPtr)};
-    cuCheck(cuMemcpyHtoD(viewPtr, views.data(), sizeof(SparseCacheView) * views.size()));
+    cuCheck(cuMemcpyHtoDAsync(viewPtr, views.data(), sizeof(SparseCacheView) * views.size(), stream));
 
     // One launch per layer, as a step does: a layer's selection is not known until the
     // previous layer has run. The arrays are therefore layer-major, so each launch sees a
@@ -329,9 +345,9 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
         args.work.numLists = 1;
         args.missCount = reinterpret_cast<int32_t*>(missCount.get()) + countOffset;
 
-        launchSparseResolve(args, nullptr);
+        launchSparseResolve(args, stream);
     }
-    cuCheck(cuStreamSynchronize(nullptr));
+    cuCheck(cuStreamSynchronize(stream));
 
     SparseResolveProbe result;
     result.residentOrdinal = readBack(resident, entryCount);
@@ -353,15 +369,16 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     std::vector<int32_t> const& missSlot, std::vector<int32_t> const& missCount, int selectionWidth,
     std::vector<int32_t> const& bufferLayer, bool writeBack, int gridCtas)
 {
+    CUstream const stream = nullptr;
     CUdeviceptr hostPtr = 0;
     cuCheck(cuMemAlloc(&hostPtr, hostPool.size()));
     CudaUniqPtr<> source{reinterpret_cast<std::byte*>(hostPtr)};
-    cuCheck(cuMemcpyHtoD(hostPtr, hostPool.data(), hostPool.size()));
+    cuCheck(cuMemcpyHtoDAsync(hostPtr, hostPool.data(), hostPool.size(), stream));
 
     CUdeviceptr devicePtr = 0;
     cuCheck(cuMemAlloc(&devicePtr, deviceArena.size()));
     CudaUniqPtr<> destination{reinterpret_cast<std::byte*>(devicePtr)};
-    cuCheck(cuMemcpyHtoD(devicePtr, deviceArena.data(), deviceArena.size()));
+    cuCheck(cuMemcpyHtoDAsync(devicePtr, deviceArena.data(), deviceArena.size(), stream));
 
     auto table = deviceCopy(pageTable);
     // The caller still describes work as [list][selectionWidth] with a count per list,
@@ -412,7 +429,7 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     CUdeviceptr viewPtr = 0;
     cuCheck(cuMemAlloc(&viewPtr, sizeof(SparseCacheView)));
     CudaUniqPtr<> viewOwner{reinterpret_cast<std::byte*>(viewPtr)};
-    cuCheck(cuMemcpyHtoD(viewPtr, &view, sizeof(SparseCacheView)));
+    cuCheck(cuMemcpyHtoDAsync(viewPtr, &view, sizeof(SparseCacheView), stream));
 
     // One descriptor per buffer, as the real path builds them: the hook drives the
     // addressing, so every buffer shares a pool and differs only by its slot in it.
@@ -437,7 +454,7 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     CUdeviceptr descPtr = 0;
     cuCheck(cuMemAlloc(&descPtr, sizeof(SparseCopyDesc) * descs.size()));
     CudaUniqPtr<> descOwner{reinterpret_cast<std::byte*>(descPtr)};
-    cuCheck(cuMemcpyHtoD(descPtr, descs.data(), sizeof(SparseCopyDesc) * descs.size()));
+    cuCheck(cuMemcpyHtoDAsync(descPtr, descs.data(), sizeof(SparseCopyDesc) * descs.size(), stream));
 
     SparseUnitCopyArgs args;
     args.views = reinterpret_cast<SparseCacheView const*>(viewPtr);
@@ -456,20 +473,22 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     args.bufferLayer = reinterpret_cast<int32_t*>(bufferLayerBuf.get());
     args.gridCtas = gridCtas;
 
-    launchSparseUnitCopy(args, nullptr);
-    cuCheck(cuStreamSynchronize(nullptr));
+    launchSparseUnitCopy(args, stream);
+    cuCheck(cuStreamSynchronize(stream));
 
     // Write-back moves into the cold pool, so that is the side worth returning.
     CUdeviceptr const result = writeBack ? hostPtr : devicePtr;
     size_t const resultBytes = writeBack ? hostPool.size() : deviceArena.size();
     std::vector<uint8_t> out(resultBytes);
-    cuCheck(cuMemcpyDtoH(out.data(), result, resultBytes));
+    cuCheck(cuMemcpyDtoHAsync(out.data(), result, resultBytes, stream));
+    cuCheck(cuStreamSynchronize(stream));
     return out;
 }
 
 KvCacheIntrospection::SparseFlushList KvCacheIntrospection::sparseFlushList(std::vector<int32_t> const& residentOrdinal,
     int numLayers, int entriesPerLayer, int fromUnits, int toUnits, int maxFlushUnits)
 {
+    CUstream const stream = nullptr;
     auto const entryCount = static_cast<size_t>(numLayers) * entriesPerLayer;
     if (residentOrdinal.size() != entryCount)
     {
@@ -494,7 +513,7 @@ KvCacheIntrospection::SparseFlushList KvCacheIntrospection::sparseFlushList(std:
     CUdeviceptr viewPtr = 0;
     cuCheck(cuMemAlloc(&viewPtr, sizeof(SparseCacheView)));
     CudaUniqPtr<> viewOwner{reinterpret_cast<std::byte*>(viewPtr)};
-    cuCheck(cuMemcpyHtoD(viewPtr, &view, sizeof(SparseCacheView)));
+    cuCheck(cuMemcpyHtoDAsync(viewPtr, &view, sizeof(SparseCacheView), stream));
 
     SparseFlushListArgs args;
     args.views = reinterpret_cast<SparseCacheView const*>(viewPtr);
@@ -510,8 +529,8 @@ KvCacheIntrospection::SparseFlushList KvCacheIntrospection::sparseFlushList(std:
     args.work.numLists = numLayers;
     args.outCount = reinterpret_cast<int32_t*>(outCount.get());
 
-    launchSparseFlushList(args, nullptr);
-    cuCheck(cuStreamSynchronize(nullptr));
+    launchSparseFlushList(args, stream);
+    cuCheck(cuStreamSynchronize(stream));
 
     SparseFlushList result;
     result.row = readBack(outRow, listCount);

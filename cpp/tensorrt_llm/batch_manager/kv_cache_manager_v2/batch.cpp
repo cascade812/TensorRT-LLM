@@ -119,7 +119,7 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, std::vector<IndexTableSpe
 
     for (auto const base : {device, deviceStaging})
     {
-        cuCheck(cuMemcpyHtoD(base, staging, _totalBytes()));
+        cuCheck(cuMemcpyHtoDAsync(base, staging, _totalBytes(), cudaStream()));
     }
 
     _allocateStepScratch();
@@ -132,6 +132,10 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, std::vector<IndexTableSpe
 
     // Last: a descriptor names where in the index tables a buffer's converted indices sit.
     _allocateCopyDesc();
+
+    // Everything above is staged on the Batch's stream. A consumer reading this Batch from
+    // another stream has nothing ordering it against that, so the state is made visible here.
+    cuCheck(cuStreamSynchronize(cudaStream()));
 }
 
 void Batch::_allocateCopyDesc()
@@ -201,7 +205,8 @@ void Batch::_allocateCopyDesc()
     }
     mCopyDesc = allocateDeviceMemory<SparseCopyDesc>(host.size());
     auto const* device = mCopyDesc.get();
-    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(device), host.data(), sizeof(SparseCopyDesc) * host.size()));
+    cuCheck(cuMemcpyHtoDAsync(
+        reinterpret_cast<CUdeviceptr>(device), host.data(), sizeof(SparseCopyDesc) * host.size(), cudaStream()));
     for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
     {
         auto& scratch = mScratch[lcId];
@@ -210,6 +215,8 @@ void Batch::_allocateCopyDesc()
             scratch.copyDesc = device + offset[static_cast<size_t>(lcId.value())];
         }
     }
+    // `host` does not outlive this scope, so the copy out of it has to have landed.
+    cuCheck(cuStreamSynchronize(cudaStream()));
 }
 
 int32_t Batch::_flushCapacity(LifeCycleId lifeCycle) const
@@ -277,7 +284,8 @@ void Batch::_allocateStepScratch()
     mStepScratch = allocateDeviceMemory<int32_t>(total + mCounterElements);
     // Its own allocation: the step's clear covers mCounters, and these have to survive it.
     mHitMiss = allocateDeviceMemory<SparseHitMiss>(1);
-    cuCheck(cuMemsetD32(reinterpret_cast<CUdeviceptr>(mHitMiss.get()), 0U, sizeof(SparseHitMiss) / sizeof(uint32_t)));
+    cuCheck(cuMemsetD32Async(
+        reinterpret_cast<CUdeviceptr>(mHitMiss.get()), 0U, sizeof(SparseHitMiss) / sizeof(uint32_t), cudaStream()));
 
     // The counters lead the block so that one clear covers every life cycle's.
     auto* counter = mStepScratch.get();
@@ -327,7 +335,8 @@ void Batch::_allocateStepScratch()
         scratch.flushCount = carve(rows * layers);
         // -1 so that "no write-back has run" stays distinguishable from "one ran and found
         // nothing to move", which is what lets a test tell the two apart.
-        cuCheck(cuMemsetD32(reinterpret_cast<CUdeviceptr>(scratch.flushCount), 0xFFFFFFFFU, rows * layers));
+        cuCheck(cuMemsetD32Async(
+            reinterpret_cast<CUdeviceptr>(scratch.flushCount), 0xFFFFFFFFU, rows * layers, cudaStream()));
     }
 }
 
@@ -342,14 +351,14 @@ SparseStepScratch const& Batch::sparseStepScratch(LifeCycleId lcId) const
 
 void Batch::setCudaStream(CUstream stream)
 {
-    if (stream == mCudaStream)
+    if (stream == cudaStream())
     {
         return;
     }
     // The Batch's own queued work -- the staging copy, the index conversion, the counter
     // resets -- is ordered on the old stream alone, and a Batch with no members still has
     // it. Each member's move below syncs that member, which is a different question.
-    CachedCudaEvent handover(reinterpret_cast<CudaStream>(mCudaStream));
+    CachedCudaEvent handover(reinterpret_cast<CudaStream>(cudaStream()));
     handover.waitInStream(reinterpret_cast<CudaStream>(stream));
     mCudaStream = stream;
     for (auto const& kvCache : mRows)
@@ -511,7 +520,7 @@ void Batch::_allocateFlushRanges()
         = 2 * static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(mManager->numLifeCycles().value());
     mFlushRanges = allocateDeviceMemory<int32_t>(elements);
     // An empty range asks for nothing, which is what a row that never flushes should read.
-    cuCheck(cuMemsetD32(reinterpret_cast<CUdeviceptr>(mFlushRanges.get()), 0, elements));
+    cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(mFlushRanges.get()), 0, elements, cudaStream()));
     mFlushRangeStaging.assign(elements, 0);
 }
 
@@ -622,7 +631,7 @@ void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
     detail::copyFlushRangesToDevice(reinterpret_cast<CUdeviceptr>(mFlushRanges.get()), mFlushRangeStaging.data(),
         mFlushRangeStaging.size(), upload);
     auto staged = mUploadStream.recordEvent();
-    staged.waitInStream(reinterpret_cast<CudaStream>(mCudaStream));
+    staged.waitInStream(reinterpret_cast<CudaStream>(cudaStream()));
 
     for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
     {
@@ -630,9 +639,9 @@ void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
         {
             continue;
         }
-        writeBackSparseUnits(lcId, mCudaStream);
+        writeBackSparseUnits(lcId, cudaStream());
     }
-    mFlushRead = CachedCudaEvent{reinterpret_cast<CudaStream>(mCudaStream)};
+    mFlushRead = CachedCudaEvent{reinterpret_cast<CudaStream>(cudaStream())};
 }
 
 void Batch::_checkSparseRunsAreAddressable() const
@@ -752,7 +761,8 @@ void Batch::_allocateIndexTables()
         // holding no scratch should look like.
         std::fill(host, host + elements, 0);
         mScratchDevice = allocateDeviceMemory<int32_t>(elements);
-        cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mScratchDevice.get()), host, sizeof(int32_t) * elements));
+        cuCheck(cuMemcpyHtoDAsync(
+            reinterpret_cast<CUdeviceptr>(mScratchDevice.get()), host, sizeof(int32_t) * elements, cudaStream()));
     }
 
     auto const rowBlocks = static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(mMaxBlocksPerSeq);
@@ -767,7 +777,7 @@ void Batch::_allocateIndexTables()
     mIndexTableMemory = allocateDeviceMemory<int32_t>(elements);
     auto const memory = reinterpret_cast<CUdeviceptr>(mIndexTableMemory.get());
     // A table a publish has not reached yet must read as absent rather than as slot zero.
-    cuCheck(cuMemsetD32(memory, static_cast<unsigned int>(kBadPageIndex.value()), elements));
+    cuCheck(cuMemsetD32Async(memory, static_cast<unsigned int>(kBadPageIndex.value()), elements, cudaStream()));
 
     // The descriptors and the offsets they point at share one allocation: the offsets are a
     // handful of ints per table and would otherwise be an allocation each.
@@ -818,8 +828,10 @@ void Batch::_allocateIndexTables()
         offsetHost.insert(offsetHost.end(), table.concatOffsets.begin(), table.concatOffsets.end());
     }
 
-    cuCheck(cuMemcpyHtoD(descs, descHost.data(), descBytes));
-    cuCheck(cuMemcpyHtoD(offsetsBase, offsetHost.data(), offsetsBytes));
+    cuCheck(cuMemcpyHtoDAsync(descs, descHost.data(), descBytes, cudaStream()));
+    cuCheck(cuMemcpyHtoDAsync(offsetsBase, offsetHost.data(), offsetsBytes, cudaStream()));
+    // Neither host vector outlives this scope, so the copies out of them have to have landed.
+    cuCheck(cuStreamSynchronize(cudaStream()));
 }
 
 void Batch::_convertIndices(CUstream stream)
@@ -1170,7 +1182,7 @@ int Batch::addKvCache(KvCache& kvCache, std::optional<int> requestedRow)
     // Joining is a stream change, so it carries the same cross-stream sync a direct move
     // would: work the member already enqueued has to retire before the Batch's stream
     // reaches anything that reads it.
-    kvCache._setCudaStream(mCudaStream);
+    kvCache._setCudaStream(cudaStream());
 
     // The arena lease goes with membership: a member is what gets stepped, so this is
     // exactly when the GPU cache is needed. After the stream change, because acquiring one
@@ -1183,7 +1195,7 @@ int Batch::addKvCache(KvCache& kvCache, std::optional<int> requestedRow)
         {
             continue;
         }
-        auto lease = arena.acquire(mCudaStream);
+        auto lease = arena.acquire(cudaStream());
         TLLM_CHECK_WITH_INFO(lease.has_value(),
             "Batch::addKvCache: the sparse cache arena is full, which cannot happen while it is sized from the "
             "same `constraints` the Batch takes its rows from");
@@ -1392,7 +1404,7 @@ void Batch::publish()
     if (mCounterElements > 0)
     {
         TLLM_CUDA_CHECK(cudaMemsetAsync(
-            mCounters, 0, sizeof(int32_t) * mCounterElements, reinterpret_cast<cudaStream_t>(mCudaStream)));
+            mCounters, 0, sizeof(int32_t) * mCounterElements, reinterpret_cast<cudaStream_t>(cudaStream())));
     }
 
     // Refusing rather than waiting, because by this point a wait would be too late to help.
@@ -1462,10 +1474,10 @@ void Batch::publish()
 
     // The staging now holds this step's tables, so carrying them across is all that is
     // left on the Batch's stream -- one copy, because the two layouts match.
-    mPublished.waitInStream(reinterpret_cast<CudaStream>(mCudaStream));
-    cuCheck(cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(mDevice.get()), staging, _totalBytes(), mCudaStream));
-    _convertIndices(mCudaStream);
-    mStagingRead = CachedCudaEvent{reinterpret_cast<CudaStream>(mCudaStream)};
+    mPublished.waitInStream(reinterpret_cast<CudaStream>(cudaStream()));
+    cuCheck(cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(mDevice.get()), staging, _totalBytes(), cudaStream()));
+    _convertIndices(cudaStream());
+    mStagingRead = CachedCudaEvent{reinterpret_cast<CudaStream>(cudaStream())};
 }
 
 void Batch::waitPublished()
@@ -1546,7 +1558,7 @@ void Batch::resetHitMissCounter()
     if (mHitMiss)
     {
         TLLM_CUDA_CHECK(
-            cudaMemsetAsync(mHitMiss.get(), 0, sizeof(SparseHitMiss), reinterpret_cast<cudaStream_t>(mCudaStream)));
+            cudaMemsetAsync(mHitMiss.get(), 0, sizeof(SparseHitMiss), reinterpret_cast<cudaStream_t>(cudaStream())));
     }
 }
 
@@ -1582,7 +1594,7 @@ std::optional<int> Batch::rowOf(KvCache const& kvCache) const
 void Batch::prepareSparseWriteIndices(
     std::vector<BufferId> const& buffers, int32_t* out, std::optional<CUstream> streamOpt)
 {
-    CUstream const stream = streamOpt.value_or(mCudaStream);
+    CUstream const stream = streamOpt.value_or(cudaStream());
     if (out == nullptr)
     {
         throw std::invalid_argument("prepareSparseWriteIndices: out must be a device pointer");
@@ -1771,7 +1783,7 @@ std::vector<int> Batch::sparseOutSlots(std::vector<BufferId> const& buffers) con
 void Batch::fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
     int32_t* out, std::optional<CUstream> streamOpt)
 {
-    CUstream const stream = streamOpt.value_or(mCudaStream);
+    CUstream const stream = streamOpt.value_or(cudaStream());
     if (selected == nullptr || out == nullptr)
     {
         throw std::invalid_argument("fetchSparsePages: selected and out must be device pointers");

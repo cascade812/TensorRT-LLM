@@ -74,6 +74,7 @@ LeaseLayout leaseLayout(SparseCacheInit const& shape)
 SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
     : mShape(shape)
 {
+    CUstream const stream = nullptr;
     if (shape.numLayers <= 0 || shape.numBuffers <= 0 || shape.entriesPerLayer <= 0 || shape.cellsPerBuffer <= 0)
     {
         throw std::invalid_argument("SparseCellArena requires a positive layer, buffer, entry and cell count");
@@ -152,10 +153,10 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
     mIdentity = reinterpret_cast<int32_t*>(shared + layerBytes + slotBytes);
     mMetadataBase = shared + sharedBytes;
 
-    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mSharedLayer), mShape.bufferLayer.data(),
-        sizeof(int32_t) * mShape.bufferLayer.size()));
-    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mSharedSlotInPool), mShape.bufferSlotInPool.data(),
-        sizeof(int32_t) * mShape.bufferSlotInPool.size()));
+    cuCheck(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(mSharedLayer), mShape.bufferLayer.data(),
+        sizeof(int32_t) * mShape.bufferLayer.size(), stream));
+    cuCheck(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(mSharedSlotInPool), mShape.bufferSlotInPool.data(),
+        sizeof(int32_t) * mShape.bufferSlotInPool.size(), stream));
 
     // The recency order every lease starts from: a per-layer identity permutation. Built once
     // here so a resume is a device-to-device copy rather than a host transfer.
@@ -165,13 +166,18 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
         auto const begin = identity.begin() + static_cast<ptrdiff_t>(layer) * mShape.entriesPerLayer;
         std::iota(begin, begin + mShape.entriesPerLayer, 0);
     }
-    cuCheck(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(mIdentity), identity.data(), sizeof(int32_t) * identity.size()));
+    cuCheck(cuMemcpyHtoDAsync(
+        reinterpret_cast<CUdeviceptr>(mIdentity), identity.data(), sizeof(int32_t) * identity.size(), stream));
 
     mFree.reserve(static_cast<size_t>(maxLeases));
     for (int i = maxLeases - 1; i >= 0; --i)
     {
         mFree.push_back(i);
     }
+
+    // The arena has no stream of its own, so the staging above is ordered on the null
+    // stream only. `identity` also dies with this scope. Both want it landed here.
+    cuCheck(cuStreamSynchronize(stream));
 }
 
 std::optional<SparseCacheLease> SparseCellArena::acquire(CUstream stream)
@@ -269,13 +275,15 @@ void SparseCacheLease::release() noexcept
 
 std::vector<int32_t> SparseCacheLease::readResidentOrdinals() const
 {
+    CUstream const stream = nullptr;
     if (empty())
     {
         return {};
     }
     std::vector<int32_t> out(mView.numEntries());
-    cuCheck(
-        cuMemcpyDtoH(out.data(), reinterpret_cast<CUdeviceptr>(mView.residentOrdinal), sizeof(int32_t) * out.size()));
+    cuCheck(cuMemcpyDtoHAsync(
+        out.data(), reinterpret_cast<CUdeviceptr>(mView.residentOrdinal), sizeof(int32_t) * out.size(), stream));
+    cuCheck(cuStreamSynchronize(stream));
     return out;
 }
 
