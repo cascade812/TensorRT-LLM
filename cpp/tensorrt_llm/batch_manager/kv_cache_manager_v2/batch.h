@@ -772,7 +772,7 @@ private:
         int entry = 0;
     };
 
-    std::map<std::pair<LayerId, DataRole>, BufferSlot> mBufferSlots;
+    std::map<BufferId, BufferSlot> mBufferSlots;
 
     //! The slot naming this buffer. Throws naming `api` when no index table spec has it.
     [[nodiscard]] BufferSlot const& _bufferSlot(LayerId layerId, DataRole const& role, char const* api) const;

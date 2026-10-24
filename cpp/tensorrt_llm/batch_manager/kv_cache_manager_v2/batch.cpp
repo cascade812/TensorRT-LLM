@@ -472,9 +472,8 @@ void Batch::_buildIndexTables(std::vector<IndexTableSpec> const& specs)
         for (size_t slot = 0; slot < spec.buffers.size(); ++slot)
         {
             auto const& buffer = spec.buffers[slot];
-            auto const key = std::make_pair(buffer.layerId, buffer.role);
             BufferSlot const resolved{tableId, static_cast<int>(slot)};
-            auto const [it, inserted] = mBufferSlots.emplace(key, resolved);
+            auto const [it, inserted] = mBufferSlots.emplace(buffer, resolved);
             // The base is not compared because it cannot differ here: two specs reach one
             // table only when their concatOffsets agree, and an offset is measured from
             // the spec's own base, so equal offsets at equal entries mean equal bases.
@@ -648,7 +647,7 @@ void Batch::_checkSparseRunsAreAddressable() const
 
             auto const slotOf = [this](SparseBufferPlan const& entry)
             {
-                auto const found = mBufferSlots.find(std::make_pair(entry.id.layerId, entry.id.role));
+                auto const found = mBufferSlots.find(entry.id);
                 TLLM_CHECK_WITH_INFO(found != mBufferSlots.end(),
                     "A sparse buffer has no index table spec; the fetch reads converted indices, so every "
                     "sparse buffer needs one");
@@ -915,7 +914,7 @@ std::vector<IndexTableSpec> const& Batch::indexTable(IndexTableId tableId) const
 
 Batch::BufferSlot const& Batch::_bufferSlot(LayerId layerId, DataRole const& role, char const* api) const
 {
-    auto const found = mBufferSlots.find(std::make_pair(layerId, role));
+    auto const found = mBufferSlots.find(BufferId{layerId, role});
     if (found == mBufferSlots.end())
     {
         throw std::out_of_range(std::string(api) + ": no index table spec named this buffer");
