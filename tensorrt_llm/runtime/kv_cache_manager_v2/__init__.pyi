@@ -1075,28 +1075,32 @@ class Batch:
         to share one.
         """
 
-    def index_table_slot(self, layer_id: LayerId, role: DataRole) -> tuple[int, int]:
-        """``(table, entry)`` serving this buffer.
+    def index_table_id(self, spec: IndexTableSpec) -> int:
+        """Which table serves this spec, which must be one the ``Batch`` was built with.
 
-        The normal query: a kernel asks where its indices are and at what entry, then binds
-        :meth:`index_table_base`. Iterating :meth:`index_table` is for introspection.
+        The query to prefer: a caller that asked for a table by naming its buffers gets it
+        back without going through a buffer, and equivalent specs resolve to the same id --
+        a layer's data and its block scales name one table between them. The spec's buffers
+        occupy entries ``[0, len(spec.buffers))`` in its own order, so an entry needs no
+        separate lookup.
+
+        Specs may not overlap, so a buffer belongs to exactly one. Read a subset of a table
+        by slicing it rather than by declaring the subset as a spec of its own.
         """
 
     def converted_index_table(self, table_id: int) -> DeviceArray:
-        """``int32[entries, max_batch, max_blocks_per_seq]`` converted indices for one table.
+        """``int32[max_batch, entries, max_blocks_per_seq]`` converted indices for one table.
+
+        A row carries every entry before the next row starts, which is the shape an
+        attention kernel takes a key and value page list in. One entry's plane is therefore
+        strided rather than contiguous: ``table[:, entry, :]``.
 
         A DLPack array over memory the ``Batch`` owns; it keeps the ``Batch`` alive for as
-        long as the array exists. A buffer reads the entry :meth:`index_table_slot` gives
-        it, having added :meth:`index_table_base`.
+        long as the array exists. A buffer reads the entry its position in the spec gives
+        it: a spec's buffers occupy entries ``[0, len(spec.buffers))`` in the spec's own
+        order, so a caller holding the spec needs no further lookup.
 
         The address is stable for the ``Batch``'s lifetime, so a captured graph may bake it.
-        """
-
-    def index_table_base(self, layer_id: LayerId, role: DataRole) -> MemAddress:
-        """What a kernel adds to a converted index for this buffer.
-
-        Every buffer of a request shares it, because the request's own offsets are already
-        in the entries.
         """
 
     def index_mode(self, layer_group_id: LayerGroupId) -> PageIndexMode:

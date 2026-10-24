@@ -2402,9 +2402,24 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     mIntrospection.def("batch_page_table", &kv::KvCacheIntrospection::batchPageTable, nb::arg("batch"),
         nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>());
 
+    mIntrospection.def(
+        "batch_index_table_slot",
+        [](kv::Batch const& batch, int layerId, kv::DataRole const& role)
+        {
+            auto const [table, entry] = kv::KvCacheIntrospection::batchIndexTableSlot(batch, layerId, role);
+            return nb::make_tuple(table, entry);
+        },
+        nb::arg("batch"), nb::arg("layer_id"), nb::arg("role"),
+        "(table, entry) serving this buffer. A consumer names a table by the spec it asked "
+        "for -- index_table_id -- and slices it at the buffer's position in that spec; this "
+        "is the same answer reached from the buffer.");
+    mIntrospection.def("batch_index_table_base", &kv::KvCacheIntrospection::batchIndexTableBase, nb::arg("batch"),
+        nb::arg("layer_id"), nb::arg("role"),
+        "What a converted index for this buffer is added to. Buffers sharing a pool share it, "
+        "their own offsets being already in the entries.");
     mIntrospection.def("batch_index_table", &kv::KvCacheIntrospection::batchIndexTable, nb::arg("batch"),
         nb::arg("table_id"),
-        "One converted index table, row-major [entries][max_batch][blocks_per_seq]. Reads the "
+        "One converted index table, row-major [max_batch][entries][blocks_per_seq]. Reads the "
         "device copy, so it shows what the last publish() converted. Synchronises.");
     mIntrospection.def(
         "batch_gpu_coalesced_page_table",
@@ -2798,23 +2813,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "Every request this table satisfies. A request's buffer order is its own mapping "
             "into the buffer dimension, so the first buffer of each sits at entry zero.")
         .def(
-            "index_table_slot",
-            [](kv::Batch const& self, int layerId, kv::DataRole const& role)
-            {
-                auto const [tableId, slot] = self.indexTableSlot(kv::LayerId{layerId}, role);
-                return nb::make_tuple(tableId.value(), slot);
-            },
-            nb::arg("layer_id"), nb::arg("role"),
-            "(table, entry) serving this buffer. Per-buffer introspection, and how the sparse "
-            "copy path resolves one buffer. An attention kernel takes a whole table instead: "
-            "see converted_index_table.")
-        .def(
-            "index_table_base",
-            [](kv::Batch const& self, int layerId, kv::DataRole const& role)
-            { return self.indexTableBase(kv::LayerId{layerId}, role); },
-            nb::arg("layer_id"), nb::arg("role"),
-            "What a converted index for this buffer is added to. Buffers sharing a pool share it, "
-            "their own offsets being already in the entries.")
+            "index_table_id",
+            [](kv::Batch const& self, kv::IndexTableSpec const& spec) { return self.indexTableOf(spec).value(); },
+            nb::arg("spec"),
+            "Which table serves this spec, which must be one the Batch was built with.\n\n"
+            "The query to prefer: a caller that asked for a table by naming its buffers gets it "
+            "back without going through a buffer, and equivalent specs resolve to the same id -- "
+            "a layer's data and its block scales name one table between them. The spec's buffers "
+            "occupy entries [0, len(spec.buffers)) in its own order, so an entry needs no "
+            "separate lookup, and converted_index_table(id)[:, entry, :] is a buffer's plane.")
         .def(
             "converted_index_table",
             [](nb::object self, int tableId)

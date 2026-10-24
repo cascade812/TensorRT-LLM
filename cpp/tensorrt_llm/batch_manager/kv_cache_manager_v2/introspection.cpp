@@ -151,6 +151,17 @@ std::vector<int32_t> KvCacheIntrospection::batchPageTable(Batch const& batch, in
     return out;
 }
 
+std::pair<int, int> KvCacheIntrospection::batchIndexTableSlot(Batch const& batch, int layerId, DataRole const& role)
+{
+    auto const [table, entry] = batch.indexTableSlot(LayerId{layerId}, role);
+    return {table.value(), entry};
+}
+
+MemAddress KvCacheIntrospection::batchIndexTableBase(Batch const& batch, int layerId, DataRole const& role)
+{
+    return batch.indexTableBase(LayerId{layerId}, role);
+}
+
 std::vector<int32_t> KvCacheIntrospection::batchIndexTable(Batch const& batch, int tableId)
 {
     IndexTableId const typed{tableId};

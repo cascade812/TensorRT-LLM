@@ -2517,8 +2517,8 @@ class TestIndexTables(unittest.TestCase):
             self.assertEqual(tuple(view.shape), (1, 2, 4))
             self.assertEqual(view.dtype, torch.int32)
             self.assertTrue(view.is_cuda)
-            # The entry a buffer reads is the one index_table_slot names.
-            self.assertEqual(batch.index_table_slot(0, "value")[1], 1)
+            # The entry a buffer reads is its position in the spec that named it.
+            self.assertEqual(_introspection.batch_index_table_slot(batch, 0, "value")[1], 1)
             with self.assertRaises(Exception):
                 batch.converted_index_table(batch.num_index_tables)
         finally:
@@ -2531,10 +2531,13 @@ class TestIndexTables(unittest.TestCase):
             spec = IndexTableSpec([BufferId(0, "key"), BufferId(0, "value")])
             batch = self._batch(manager, [spec])
             self.assertEqual(batch.num_index_tables, 1)
-            self.assertEqual(batch.index_table_slot(0, "key"), (0, 0))
-            self.assertEqual(batch.index_table_slot(0, "value"), (0, 1))
+            self.assertEqual(_introspection.batch_index_table_slot(batch, 0, "key"), (0, 0))
+            self.assertEqual(_introspection.batch_index_table_slot(batch, 0, "value"), (0, 1))
             # One base for the whole spec: the offsets are already in the entries.
-            self.assertEqual(batch.index_table_base(0, "key"), batch.index_table_base(0, "value"))
+            self.assertEqual(
+                _introspection.batch_index_table_base(batch, 0, "key"),
+                _introspection.batch_index_table_base(batch, 0, "value"),
+            )
         finally:
             manager.shutdown()
 
@@ -2548,7 +2551,8 @@ class TestIndexTables(unittest.TestCase):
             self.assertEqual(batch.index_mode(lg), PageIndexMode.SHARED)
             self.assertEqual(batch.num_index_tables, 1)
             self.assertEqual(
-                batch.index_table_slot(0, "key")[0], batch.index_table_slot(1, "key")[0]
+                _introspection.batch_index_table_slot(batch, 0, "key")[0],
+                _introspection.batch_index_table_slot(batch, 1, "key")[0],
             )
             # Two specs merged onto it, one per layer.
             self.assertEqual(len(batch.index_table(0)), 2)
@@ -2570,7 +2574,8 @@ class TestIndexTables(unittest.TestCase):
             )
             self.assertEqual(batch.num_index_tables, 2)
             self.assertNotEqual(
-                batch.index_table_slot(0, "key")[0], batch.index_table_slot(1, "key")[0]
+                _introspection.batch_index_table_slot(batch, 0, "key")[0],
+                _introspection.batch_index_table_slot(batch, 1, "key")[0],
             )
         finally:
             manager.shutdown()
@@ -2617,14 +2622,118 @@ class TestIndexTables(unittest.TestCase):
             self.assertEqual(batch.num_index_tables, 1)
             self.assertEqual(len(batch.index_table(0)), 2)
             # Same entries, so the same table at the same slots...
-            self.assertEqual(batch.index_table_slot(0, "key"), batch.index_table_slot(0, "k_scale"))
             self.assertEqual(
-                batch.index_table_slot(0, "value"), batch.index_table_slot(0, "v_scale")
+                _introspection.batch_index_table_slot(batch, 0, "key"),
+                _introspection.batch_index_table_slot(batch, 0, "k_scale"),
+            )
+            self.assertEqual(
+                _introspection.batch_index_table_slot(batch, 0, "value"),
+                _introspection.batch_index_table_slot(batch, 0, "v_scale"),
             )
             # ...reached through different bases, which is what keeps them distinct.
             self.assertNotEqual(
-                batch.index_table_base(0, "key"), batch.index_table_base(0, "k_scale")
+                _introspection.batch_index_table_base(batch, 0, "key"),
+                _introspection.batch_index_table_base(batch, 0, "k_scale"),
             )
+        finally:
+            manager.shutdown()
+
+    def test_a_spec_names_its_own_table_without_going_through_a_buffer(self):
+        """The spec a caller asked for is the handle it gets its table back by.
+
+        Mirrored specs resolve to one id, which is the same statement
+        ``index_table_slot`` makes per buffer -- asserted here from the spec side, since
+        that is the query a caller holding specs actually has.
+        """
+        manager = self._quantised_manager(paired_scales=True)
+        try:
+            data = IndexTableSpec([BufferId(0, "key"), BufferId(0, "value")])
+            scales = IndexTableSpec([BufferId(0, "k_scale"), BufferId(0, "v_scale")])
+            batch = self._batch(manager, [data, scales])
+
+            table = batch.index_table_id(data)
+            self.assertEqual(table, batch.index_table_id(scales), "mirrored specs are one table")
+            # The spec's buffers sit at entries [0, n) in its own order, so the per-buffer
+            # query adds nothing a holder of the spec did not already know.
+            for entry, role in enumerate(("key", "value")):
+                self.assertEqual(
+                    _introspection.batch_index_table_slot(batch, 0, role), (table, entry)
+                )
+            for entry, role in enumerate(("k_scale", "v_scale")):
+                self.assertEqual(
+                    _introspection.batch_index_table_slot(batch, 0, role), (table, entry)
+                )
+        finally:
+            manager.shutdown()
+
+    def test_a_buffer_and_its_spec_reach_the_same_table_memory(self):
+        """The two queries differ only in whether the caller still has to slice.
+
+        A buffer's table is the one its spec names, so the pointer is the same and the
+        entry is the whole of the difference -- which is what lets a caller hold specs and
+        never ask about a buffer.
+        """
+        try:
+            import torch
+        except ImportError:  # pragma: no cover - fast mode without torch
+            raise unittest.SkipTest("torch is needed to read the view")
+        # Unpaired, so the scale keeps a table of its own: with one table every buffer
+        # would reach the right memory by having nowhere else to go.
+        manager = self._quantised_manager(paired_scales=False)
+        try:
+            data = IndexTableSpec([BufferId(0, "key"), BufferId(0, "value")])
+            scale = IndexTableSpec([BufferId(0, "k_scale")])
+            batch = self._batch(manager, [data, scale])
+            self.assertEqual(batch.num_index_tables, 2, "the two specs must not have merged")
+
+            for spec, roles in ((data, ("key", "value")), (scale, ("k_scale",))):
+                owned = torch.from_dlpack(batch.converted_index_table(batch.index_table_id(spec)))
+                other = next(s for s in (data, scale) if s is not spec)
+                disowned = torch.from_dlpack(
+                    batch.converted_index_table(batch.index_table_id(other))
+                )
+                self.assertNotEqual(owned.data_ptr(), disowned.data_ptr())
+                for entry, role in enumerate(roles):
+                    table, slot = _introspection.batch_index_table_slot(batch, 0, role)
+                    from_buffer = torch.from_dlpack(batch.converted_index_table(table))
+                    self.assertEqual(from_buffer.data_ptr(), owned.data_ptr(), role)
+                    self.assertEqual(slot, entry, role)
+                    # The entry addresses a plane of that same memory rather than another
+                    # allocation, so a subset is a slice and never a table of its own.
+                    self.assertEqual(
+                        from_buffer[:, slot, :].data_ptr(),
+                        owned.data_ptr() + slot * owned.stride(1) * owned.element_size(),
+                        role,
+                    )
+        finally:
+            manager.shutdown()
+
+    def test_a_spec_the_batch_was_not_built_with_has_no_table(self):
+        manager = self._quantised_manager(paired_scales=True)
+        try:
+            data = IndexTableSpec([BufferId(0, "key"), BufferId(0, "value")])
+            scales = IndexTableSpec([BufferId(0, "k_scale"), BufferId(0, "v_scale")])
+            batch = self._batch(manager, [data, scales])
+            # A subset is not a spec: it names a slice of a table, not a table.
+            with self.assertRaises(IndexError):
+                batch.index_table_id(IndexTableSpec([BufferId(0, "key")]))
+        finally:
+            manager.shutdown()
+
+    def test_specs_may_not_overlap(self):
+        """A buffer belongs to one spec; a subset is read by slicing, not by declaring it.
+
+        Both orders are refused, so this is a property of the pair rather than of
+        whichever spec happened to be built first.
+        """
+        manager = self._quantised_manager(paired_scales=True)
+        try:
+            both = IndexTableSpec([BufferId(0, "key"), BufferId(0, "value")])
+            lone = IndexTableSpec([BufferId(0, "key")])
+            for order in ([both, lone], [lone, both]):
+                with self.assertRaises(RuntimeError) as caught:
+                    self._batch(manager, order)
+                self.assertIn("may not overlap", str(caught.exception))
         finally:
             manager.shutdown()
 
@@ -2703,7 +2812,7 @@ class TestIndexTables(unittest.TestCase):
             stride = manager.get_page_stride(layer, role)
             shift = (
                 manager.get_mem_pool_base_address(layer, role, mode)
-                - batch.index_table_base(layer, role)
+                - _introspection.batch_index_table_base(batch, layer, role)
             ) // stride
             reference = list(
                 manager.get_page_index_converter(layer, role)(raw[:blocks], mode, scratch)
@@ -2861,7 +2970,7 @@ class TestIndexTables(unittest.TestCase):
         try:
             batch = self._batch(manager, [IndexTableSpec([BufferId(0, "key")])])
             with self.assertRaises(Exception) as caught:
-                batch.index_table_slot(0, "value")
+                _introspection.batch_index_table_slot(batch, 0, "value")
             self.assertIn("no index table spec", str(caught.exception))
         finally:
             manager.shutdown()

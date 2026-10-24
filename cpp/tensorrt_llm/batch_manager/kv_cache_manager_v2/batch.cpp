@@ -478,7 +478,9 @@ void Batch::_buildIndexTables(std::vector<IndexTableSpec> const& specs)
             TLLM_CHECK_WITH_INFO(inserted
                     || (it->second.table == resolved.table && it->second.entry == resolved.entry
                         && it->second.base == resolved.base),
-                "A buffer appears in two index table specs that resolved differently");
+                "A buffer appears in two index table specs that resolved differently. Specs may "
+                "not overlap: name a buffer in one spec only, and read a subset of a table by "
+                "slicing it at the entry indexTableSlot() gives that buffer");
         }
     }
 }
@@ -912,6 +914,21 @@ Batch::BufferSlot const& Batch::_bufferSlot(LayerId layerId, DataRole const& rol
         throw std::out_of_range(std::string(api) + ": no index table spec named this buffer");
     }
     return found->second;
+}
+
+IndexTableId Batch::indexTableOf(IndexTableSpec const& spec) const
+{
+    for (size_t i = 0; i < mIndexTables.size(); ++i)
+    {
+        for (auto const& served : mIndexTables[i].served)
+        {
+            if (served.buffers == spec.buffers)
+            {
+                return IndexTableId{static_cast<int>(i)};
+            }
+        }
+    }
+    throw std::out_of_range("Batch::indexTableOf: no index table was built for this spec");
 }
 
 std::pair<IndexTableId, int> Batch::indexTableSlot(LayerId layerId, DataRole const& role) const

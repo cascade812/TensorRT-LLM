@@ -286,8 +286,26 @@ def batch_page_table(batch: Any, layer_group_id: int) -> list[int]:
     return list(_cpp().batch_page_table(batch, layer_group_id))
 
 
+def batch_index_table_slot(batch: Any, layer_id: int, role: str) -> tuple[int, int]:
+    """``(table, entry)`` serving one buffer.
+
+    A consumer names a table by the spec it asked for -- :meth:`Batch.index_table_id` --
+    and slices it at the buffer's position in that spec, which it already knows. This is
+    the same answer reached from the buffer, and exists so a test can compare the two.
+    """
+    return tuple(_cpp().batch_index_table_slot(batch, layer_id, role))
+
+
+def batch_index_table_base(batch: Any, layer_id: int, role: str) -> int:
+    """What a converted index for one buffer is added to.
+
+    Buffers sharing a pool share it, their own offsets being already in the entries.
+    """
+    return _cpp().batch_index_table_base(batch, layer_id, role)
+
+
 def batch_index_table(batch: Any, table_id: int) -> list[int]:
-    """A Batch's converted index table, row-major [entries][max_batch][blocks_per_seq].
+    """A Batch's converted index table, row-major [max_batch][entries][blocks_per_seq].
 
     Reads the device copy, so it shows what the last publish() converted rather than what
     the raw staging holds. Synchronises.

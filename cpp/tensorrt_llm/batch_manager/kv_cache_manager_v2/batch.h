@@ -238,16 +238,19 @@ public:
     //! the buffer dimension, so the first buffer of each sits at entry zero.
     [[nodiscard]] std::vector<IndexTableSpec> const& indexTable(IndexTableId tableId) const;
 
-    //! Which table serves this buffer, and its entry in that table's buffer dimension.
-    //! Per-buffer introspection, and what the sparse copy path resolves a single buffer
-    //! with. An attention kernel takes a whole table instead; see convertedIndexTable().
-    [[nodiscard]] std::pair<IndexTableId, int> indexTableSlot(LayerId layerId, DataRole const& role) const;
+    //! Which table serves this spec. The spec must be one the Batch was built with.
+    //!
+    //! The query to prefer: a caller that asked for a table by naming its buffers gets it
+    //! back without going through a buffer, and equivalent specs resolve to the same id --
+    //! a layer's data and its block scales name one table between them. The spec's buffers
+    //! occupy entries [0, buffers.size()) in its own order, so an entry needs no separate
+    //! lookup.
+    [[nodiscard]] IndexTableId indexTableOf(IndexTableSpec const& spec) const;
 
-    //! What a converted index for this buffer is added to. Buffers sharing a pool share
-    //! it, their own offsets being already in the entries.
-    [[nodiscard]] MemAddress indexTableBase(LayerId layerId, DataRole const& role) const;
-
-    //! Where one table's converted indices live: int32[entries][max_batch][blocks].
+    //! Where one table's converted indices live: int32[max_batch][entries][blocks].
+    //! A row carries every entry before the next row starts, which is what puts a spec's
+    //! key and value planes side by side. So one entry's plane is strided, not contiguous:
+    //! it begins at `entry * blocks` elements in and repeats every `entries * blocks`.
     //! Stable for the Batch's lifetime, so a captured graph may bake it.
     [[nodiscard]] CUdeviceptr indexTableAddress(IndexTableId tableId) const;
 
@@ -560,6 +563,18 @@ private:
     //! Reaches the step state below, which has no caller outside this class and the
     //! introspection hooks that report it. KvCache mirrors the same arrangement.
     friend class KvCacheIntrospection;
+
+    //! Which table serves this buffer, and its entry in that table's buffer dimension.
+    //!
+    //! Internal: the sparse copy path resolves a single buffer with it, and the
+    //! introspection hooks report it. A caller names a table by the spec it asked for --
+    //! indexTableOf() -- and reads a buffer by slicing that table at the buffer's position
+    //! in the spec, which it already knows. Specs may not overlap, so the two agree.
+    [[nodiscard]] std::pair<IndexTableId, int> indexTableSlot(LayerId layerId, DataRole const& role) const;
+
+    //! What a converted index for this buffer is added to. Buffers sharing a pool share
+    //! it, their own offsets being already in the entries.
+    [[nodiscard]] MemAddress indexTableBase(LayerId layerId, DataRole const& role) const;
 
     //! Write back every row's crossed units for one life cycle, from the ranges the Batch
     //! staged. One scan over (layer, row), then one copy per pool covering the whole batch.

@@ -81,7 +81,15 @@ public:
     // [max_batch][max_blocks_per_seq]. Synchronises.
     static std::vector<int32_t> batchPageTable(Batch const& batch, int layerGroupId);
 
-    //! One converted index table, row-major [entries][max_batch][blocks_per_seq].
+    //! White-box hook: (table, entry) serving one buffer. A consumer names a table by the
+    //! spec it asked for and slices it at the buffer's position in that spec; this is the
+    //! same answer reached from the buffer, which is what the tests compare.
+    static std::pair<int, int> batchIndexTableSlot(Batch const& batch, int layerId, DataRole const& role);
+
+    //! White-box hook: what a converted index for one buffer is added to.
+    static MemAddress batchIndexTableBase(Batch const& batch, int layerId, DataRole const& role);
+
+    //! One converted index table, row-major [max_batch][entries][blocks_per_seq].
     //! Reads the device copy, so it shows what the last publish() converted. Synchronises.
     static std::vector<int32_t> batchIndexTable(Batch const& batch, int tableId);
 
