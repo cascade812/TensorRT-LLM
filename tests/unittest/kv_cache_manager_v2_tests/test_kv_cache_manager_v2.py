@@ -2708,6 +2708,46 @@ class TestIndexTables(unittest.TestCase):
         finally:
             manager.shutdown()
 
+    def test_merged_specs_keep_pool_specs_of_their_own(self):
+        """One table, two bases -- which is the whole mechanism of the merge.
+
+        The data and its block scales share one set of converted entries and are told
+        apart only by what they add those entries to, so the pool spec is a property of
+        the spec and could not be answered for the table.
+        """
+        manager = self._quantised_manager(paired_scales=True)
+        try:
+            data = IndexTableSpec([BufferId(0, "key"), BufferId(0, "value")])
+            scales = IndexTableSpec([BufferId(0, "k_scale"), BufferId(0, "v_scale")])
+            batch = self._batch(manager, [data, scales])
+            self.assertEqual(batch.num_index_tables, 1, "the premise is that they merged")
+
+            data_base, data_stride = batch.pool_spec_for(data)
+            scale_base, scale_stride = batch.pool_spec_for(scales)
+            self.assertNotEqual(data_base, scale_base, "one base would read one pool twice")
+            # Separate pools of unequal buffer size, so the pages they count differ too.
+            self.assertNotEqual(data_stride, scale_stride)
+            for spec, base in ((data, data_base), (scales, scale_base)):
+                for buffer in spec.buffers:
+                    self.assertEqual(
+                        _introspection.batch_index_table_base(batch, buffer.layer_id, buffer.role),
+                        base,
+                        "every buffer of a spec is reached through the spec's own base",
+                    )
+        finally:
+            manager.shutdown()
+
+    def test_a_pool_spec_needs_a_spec_the_batch_was_built_with(self):
+        manager = self._quantised_manager(paired_scales=True)
+        try:
+            data = IndexTableSpec([BufferId(0, "key"), BufferId(0, "value")])
+            scales = IndexTableSpec([BufferId(0, "k_scale"), BufferId(0, "v_scale")])
+            batch = self._batch(manager, [data, scales])
+            with self.assertRaises(IndexError):
+                batch.pool_spec_for(IndexTableSpec([BufferId(0, "key")]))
+        finally:
+            manager.shutdown()
+
     def test_a_spec_the_batch_was_not_built_with_has_no_table(self):
         manager = self._quantised_manager(paired_scales=True)
         try:

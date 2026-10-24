@@ -1088,6 +1088,18 @@ class Batch:
         by slicing it rather than by declaring the subset as a spec of its own.
         """
 
+    def pool_spec_for(self, spec: IndexTableSpec) -> tuple[MemAddress, int]:
+        """``(base, page_stride)`` for this spec's converted indices.
+
+        A page index ``p`` of this spec addresses ``base + p * page_stride``.
+
+        Keyed by the spec because the base is. Specs whose converted entries coincide are
+        merged onto one table, and reading that one set of entries through different bases
+        is what keeps a quantised layer's data and its block scales apart -- so a table has
+        as many bases as it serves specs, and only the spec picks one. The spec's buffers
+        share a page stride, which is what lets one base address them all.
+        """
+
     def converted_index_table(self, table_id: int) -> DeviceArray:
         """``int32[max_batch, entries, max_blocks_per_seq]`` converted indices for one table.
 

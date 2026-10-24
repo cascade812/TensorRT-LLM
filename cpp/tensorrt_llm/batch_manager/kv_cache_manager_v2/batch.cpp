@@ -424,10 +424,10 @@ void Batch::_buildIndexTables(std::vector<IndexTableSpec> const& specs)
 
         // Under SHARED the base carries the per-layer offset, so the spec's own offsets
         // are relative to its first buffer. Under PER_LAYER the base is the pool group's
-        // and carries none, so every offset is absolute within the slot.
-        auto const base = mode == PageIndexMode::SHARED
-            ? mManager->getMemPoolBaseAddress(first.layerId, first.role, PageIndexMode::SHARED)
-            : mManager->getMemPoolBaseAddress(first.layerId, first.role, PageIndexMode::PER_LAYER);
+        // and carries none, so every offset is absolute within the slot. Derived the same
+        // way every reader derives it, so the offsets below and the base a caller is
+        // handed later cannot disagree.
+        auto const base = _specBase(spec);
 
         std::vector<int> offsets;
         offsets.reserve(spec.buffers.size());
@@ -473,11 +473,12 @@ void Batch::_buildIndexTables(std::vector<IndexTableSpec> const& specs)
         {
             auto const& buffer = spec.buffers[slot];
             auto const key = std::make_pair(buffer.layerId, buffer.role);
-            BufferSlot const resolved{tableId, static_cast<int>(slot), base};
+            BufferSlot const resolved{tableId, static_cast<int>(slot)};
             auto const [it, inserted] = mBufferSlots.emplace(key, resolved);
-            TLLM_CHECK_WITH_INFO(inserted
-                    || (it->second.table == resolved.table && it->second.entry == resolved.entry
-                        && it->second.base == resolved.base),
+            // The base is not compared because it cannot differ here: two specs reach one
+            // table only when their concatOffsets agree, and an offset is measured from
+            // the spec's own base, so equal offsets at equal entries mean equal bases.
+            TLLM_CHECK_WITH_INFO(inserted || (it->second.table == resolved.table && it->second.entry == resolved.entry),
                 "A buffer appears in two index table specs that resolved differently. Specs may "
                 "not overlap: name a buffer in one spec only, and read a subset of a table by "
                 "slicing it at the entry indexTableSlot() gives that buffer");
@@ -654,11 +655,17 @@ void Batch::_checkSparseRunsAreAddressable() const
                 return found->second;
             };
 
+            auto const baseOf = [this](SparseBufferPlan const& entry)
+            { return _specBase(_specOf(entry.id.layerId, entry.id.role, "Batch::_checkSparseRunsAreAddressable")); };
+
             auto const first = slotOf(plan[begin]);
+            auto const firstBase = baseOf(plan[begin]);
             for (size_t i = begin + 1; i < end; ++i)
             {
                 auto const slot = slotOf(plan[i]);
-                TLLM_CHECK_WITH_INFO(slot.table == first.table && slot.base == first.base,
+                // Both, because neither implies the other: a merged table serves several
+                // specs, each with its own base, so one table is not one base pointer.
+                TLLM_CHECK_WITH_INFO(slot.table == first.table && baseOf(plan[i]) == firstBase,
                     "Sparse buffers sharing a pool are copied in one launch, from one base pointer, so they must "
                     "share one index table spec");
                 TLLM_CHECK_WITH_INFO(slot.entry == first.entry + static_cast<int>(i - begin),
@@ -842,7 +849,7 @@ Batch::SparseIndexRun Batch::sparseIndexRun(LayerId layerId, DataRole const& rol
     run.bufferStride = mMaxBlocksPerSeq;
     run.rowStride = numBuffers * mMaxBlocksPerSeq;
     run.table = indexTableAddress(tableId) + sizeof(int32_t) * static_cast<size_t>(slot.entry) * run.bufferStride;
-    run.base = slot.base;
+    run.base = _specBase(_specOf(layerId, role, "Batch::sparseIndexRun"));
     return run;
 }
 
@@ -931,6 +938,48 @@ IndexTableId Batch::indexTableOf(IndexTableSpec const& spec) const
     throw std::out_of_range("Batch::indexTableOf: no index table was built for this spec");
 }
 
+IndexTableSpec const& Batch::_specOf(LayerId layerId, DataRole const& role, char const* api) const
+{
+    auto const& slot = _bufferSlot(layerId, role, api);
+    BufferId const wanted{layerId, role};
+    for (auto const& served : mIndexTables[static_cast<size_t>(slot.table.value())].served)
+    {
+        if (std::ranges::find(served.buffers, wanted) != served.buffers.end())
+        {
+            return served;
+        }
+    }
+    // Unreachable while construction records a slot only for a buffer a spec names.
+    throw LogicError(std::string(api) + ": a buffer's table does not serve the spec that named it");
+}
+
+MemAddress Batch::_specBase(IndexTableSpec const& spec) const
+{
+    auto const& first = spec.buffers.front();
+    auto const lifeCycle = mManager->_bufferAttr(first.layerId, first.role).lifeCycleId;
+    return mManager->getMemPoolBaseAddress(first.layerId, first.role, mIndexModes[lifeCycle]);
+}
+
+PoolSpec Batch::poolSpecFor(IndexTableSpec const& spec) const
+{
+    // Membership first: a spec the Batch never built has no base, and saying so beats
+    // handing back the pool of whichever buffer happens to be named.
+    static_cast<void>(indexTableOf(spec));
+
+    auto const& first = spec.buffers.front();
+    PoolSpec out;
+    out.base = _specBase(spec);
+    out.pageStride = mManager->getPageStride(first.layerId, first.role);
+    for (auto const& buffer : spec.buffers)
+    {
+        // One stride for the spec, because a reader has only one: the entries carry each
+        // buffer's offset in pages, which is a count of this stride and of no other.
+        TLLM_CHECK_WITH_INFO(mManager->getPageStride(buffer.layerId, buffer.role) == out.pageStride,
+            "An index table spec spans page strides, so one base cannot address its buffers");
+    }
+    return out;
+}
+
 std::pair<IndexTableId, int> Batch::indexTableSlot(LayerId layerId, DataRole const& role) const
 {
     auto const& slot = _bufferSlot(layerId, role, "Batch::indexTableSlot");
@@ -939,7 +988,7 @@ std::pair<IndexTableId, int> Batch::indexTableSlot(LayerId layerId, DataRole con
 
 MemAddress Batch::indexTableBase(LayerId layerId, DataRole const& role) const
 {
-    return _bufferSlot(layerId, role, "Batch::indexTableBase").base;
+    return _specBase(_specOf(layerId, role, "Batch::indexTableBase"));
 }
 
 void Batch::_drain() noexcept

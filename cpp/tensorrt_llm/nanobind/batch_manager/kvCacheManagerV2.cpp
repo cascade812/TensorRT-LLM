@@ -2823,6 +2823,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "occupy entries [0, len(spec.buffers)) in its own order, so an entry needs no "
             "separate lookup, and converted_index_table(id)[:, entry, :] is a buffer's plane.")
         .def(
+            "pool_spec_for",
+            [](kv::Batch const& self, kv::IndexTableSpec const& spec)
+            {
+                auto const pool = self.poolSpecFor(spec);
+                return nb::make_tuple(pool.base, pool.pageStride);
+            },
+            nb::arg("spec"),
+            "(base, page_stride) for this spec's converted indices: a page index p of this "
+            "spec addresses base + p * page_stride.\n\n"
+            "Keyed by the spec because the base is. Specs whose entries coincide are merged "
+            "onto one table, and reading that one set of entries through different bases is "
+            "what keeps a quantised layer's data and its block scales apart -- so a table has "
+            "as many bases as it serves specs, and only the spec picks one.")
+        .def(
             "converted_index_table",
             [](nb::object self, int tableId)
             {

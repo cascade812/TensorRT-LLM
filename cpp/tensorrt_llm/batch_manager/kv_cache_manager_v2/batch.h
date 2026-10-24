@@ -68,6 +68,20 @@ struct ConvertedIndexTable
     int32_t blocksPerRow = 0;
 };
 
+//! What a converted index means: the address it is relative to, and what it counts.
+//!
+//! A property of the spec rather than of the table it landed on. Specs whose converted
+//! entries coincide are merged onto one table, and reading that one set of entries through
+//! different bases is exactly what keeps a quantised layer's data and its block scales
+//! apart. So a table has as many of these as it serves specs, and only the spec picks one.
+struct PoolSpec
+{
+    //! What a converted index is added to.
+    MemAddress base = 0;
+    //! Bytes a converted index counts, which is the pool's page stride.
+    size_t pageStride = 0;
+};
+
 //! One lifecycle's page table as the host writes it, in the Batch's pinned staging.
 //! Packed like the device one, and for the same reason: the Batch allocates it.
 //!
@@ -247,34 +261,25 @@ public:
     //! lookup.
     [[nodiscard]] IndexTableId indexTableOf(IndexTableSpec const& spec) const;
 
-    //! Where one table's converted indices live: int32[max_batch][entries][blocks].
+    //! How to turn this spec's converted indices into addresses.
+    //!
+    //! Keyed by the spec because the base is: a merged table serves several specs and each
+    //! reads its entries through its own pool. The spec must be one the Batch was built
+    //! with, and its buffers must share a page stride -- they sit in one pool, which is
+    //! what lets one base serve them with their offsets already in the entries.
+    //!
+    //! The result is stable for the Batch's lifetime, so a captured graph may bake it.
+    [[nodiscard]] PoolSpec poolSpecFor(IndexTableSpec const& spec) const;
+
+    //! One table's converted indices: int32[max_batch][entries][blocks].
+    //!
     //! A row carries every entry before the next row starts, which is what puts a spec's
     //! key and value planes side by side. So one entry's plane is strided, not contiguous:
     //! it begins at `entry * blocks` elements in and repeats every `entries * blocks`.
-    //! Stable for the Batch's lifetime, so a captured graph may bake it.
-    [[nodiscard]] CUdeviceptr indexTableAddress(IndexTableId tableId) const;
-
-    //! One index table's converted indices, shaped. The same memory indexTableAddress
-    //! returns, with the extents a reader would otherwise have to assemble from
-    //! numIndexTables(), index_table_slot() and the Batch's own bounds.
+    //!
+    //! The address is stable for the Batch's lifetime, so a captured graph may bake it.
     [[nodiscard]] ConvertedIndexTable convertedIndexTable(IndexTableId tableId) const;
 
-    //! How a sparse copy addresses a run of buffers that begins at `first`.
-    //!
-    //! The run's buffers occupy consecutive entries of one request, which construction
-    //! checked, so naming the first is enough: the rest follow by BufferId.
-    struct SparseIndexRun
-    {
-        //! The run's first buffer, for row zero.
-        CUdeviceptr table = 0;
-        //! What a converted index is added to. Shared by the whole run.
-        MemAddress base = 0;
-        //! Elements between consecutive buffers, and between consecutive rows.
-        int bufferStride = 0;
-        int rowStride = 0;
-    };
-
-    [[nodiscard]] SparseIndexRun sparseIndexRun(LayerId layerId, DataRole const& role) const;
     ~Batch();
 
     Batch(Batch const&) = delete;
@@ -564,6 +569,30 @@ private:
     //! introspection hooks that report it. KvCache mirrors the same arrangement.
     friend class KvCacheIntrospection;
 
+    //! Where one table's converted indices live. Internal: convertedIndexTable() returns
+    //! the same address with the extents that make it readable, and is what a caller takes.
+    [[nodiscard]] CUdeviceptr indexTableAddress(IndexTableId tableId) const;
+
+    //! How a sparse copy addresses a run of buffers that begins at `first`.
+    //!
+    //! Internal: the sparse copy path is its only reader. A consumer names a table by the
+    //! spec it asked for and takes convertedIndexTable() with poolSpecFor().
+    //!
+    //! The run's buffers occupy consecutive entries of one request, which construction
+    //! checked, so naming the first is enough: the rest follow by BufferId.
+    struct SparseIndexRun
+    {
+        //! The run's first buffer, for row zero.
+        CUdeviceptr table = 0;
+        //! What a converted index is added to. Shared by the whole run.
+        MemAddress base = 0;
+        //! Elements between consecutive buffers, and between consecutive rows.
+        int bufferStride = 0;
+        int rowStride = 0;
+    };
+
+    [[nodiscard]] SparseIndexRun sparseIndexRun(LayerId layerId, DataRole const& role) const;
+
     //! Which table serves this buffer, and its entry in that table's buffer dimension.
     //!
     //! Internal: the sparse copy path resolves a single buffer with it, and the
@@ -741,13 +770,20 @@ private:
     {
         IndexTableId table{0};
         int entry = 0;
-        MemAddress base = 0;
     };
 
     std::map<std::pair<LayerId, DataRole>, BufferSlot> mBufferSlots;
 
     //! The slot naming this buffer. Throws naming `api` when no index table spec has it.
     [[nodiscard]] BufferSlot const& _bufferSlot(LayerId layerId, DataRole const& role, char const* api) const;
+
+    //! The spec that named this buffer. Exactly one does: specs may not overlap.
+    [[nodiscard]] IndexTableSpec const& _specOf(LayerId layerId, DataRole const& role, char const* api) const;
+
+    //! What a converted index of `spec` is added to: its first buffer's pool base, under
+    //! the index mode this Batch chose. Every buffer of the spec shares it, their own
+    //! offsets being already in the entries.
+    [[nodiscard]] MemAddress _specBase(IndexTableSpec const& spec) const;
 
     //! Validate the requests, merge those whose converted indices coincide, and record
     //! where each buffer landed.
