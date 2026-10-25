@@ -22,6 +22,7 @@
 #include "kv_cache_manager_v2/sparseCacheKernels.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
+#include "kv_cache_manager_v2/utils/generator.h"
 #include "kv_cache_manager_v2/utils/staticHostMem.h"
 
 #include <cuda.h>
@@ -641,7 +642,17 @@ private:
     //! staging only through setBasePageIndexBuf, for its page indices.
     void _stageRowState();
 
-    void _allocateStepScratch();
+    //! A buffer's layout: it yields how many int32 elements it needs and resumes with
+    //! the memory, so one allocation can serve several of them.
+    using LayoutGenerator = Generator<size_t, int32_t*>;
+
+    //! Yields the elements one life cycle's sparse scratch needs, then carves the slice
+    //! it is handed. Knows nothing of the counters, which are the driver's.
+    LayoutGenerator _layoutStepScratchForLifecycle(LifeCycleId lcId);
+
+    //! Sums what the life cycles need, yields that plus the counter block, and hands each
+    //! life cycle its slice. Drives the leaves above while being driven itself.
+    LayoutGenerator _layoutStepScratch();
 
     //! Entries one layer's write-back list must hold, from the step's token budget.
     [[nodiscard]] int32_t _flushCapacity(LifeCycleId lifeCycle) const;
@@ -653,9 +664,11 @@ private:
     //! Device room for the per-row unit ranges a write-back reads:
     //! [life cycle][2][maxBatchSize], as [from][to]. Allocated with the fetch scratch,
     //! which has the same lifetime.
-    void _allocateFlushRanges();
+    //! Yields the elements the write-back ranges need, then clears the slice.
+    LayoutGenerator _layoutFlushRanges();
 
-    CudaUniqPtr<int32_t> mFlushRanges;
+    //! Points into mDeviceArena; null when no life cycle holds a sparse cache.
+    int32_t* mFlushRanges = nullptr;
     //! Staged host-side, then handed to a copy that consumes it before returning.
     std::vector<int32_t> mFlushRangeStaging;
     //! Per row, the history its units have been written back to.
@@ -761,7 +774,7 @@ private:
 
     //! Host and device sides of the scratch metadata, laid out [begs][ends][slots].
     //! Empty when no table's life cycle can hold scratch.
-    std::unique_ptr<StaticHostMem> mScratchStaging;
+    StaticHostMem mScratchStaging;
     CudaUniqPtr<int32_t> mScratchDevice;
     //! Slot ids a request may hold for one life cycle, which bounds the staging.
     int mMaxScratchSlots = 0;
@@ -779,7 +792,7 @@ private:
 
     //! Pinned so the members' index writes land here with no extra copy, and so the
     //! publish is a single asynchronous transfer per layer group.
-    std::unique_ptr<StaticHostMem> mStaging;
+    StaticHostMem mStaging;
 
     //! What the fetch reads. Its address is baked into a captured graph, so it is written
     //! only on the caller's stream, after the replay that read the previous publish.
@@ -794,7 +807,9 @@ private:
     CachedCudaStream mUploadStream;
 
     //! One allocation holding every layer group's fetch scratch, carved per group.
-    CudaUniqPtr<int32_t> mStepScratch;
+    //! One device block split between the layout generators. The pointers they hand out
+    //! point into it, so it outlives every one of them.
+    CudaUniqPtr<int32_t> mDeviceArena;
     TypedVec<LifeCycleId, SparseStepScratch> mScratch;
 
     //! Recorded after the host-to-device fill, so the host can tell when the staged rows

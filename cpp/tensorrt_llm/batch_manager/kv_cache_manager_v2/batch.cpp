@@ -30,6 +30,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 
 #include <algorithm>
+#include <array>
 #include <numeric>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -95,8 +96,8 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, std::vector<IndexTableSpe
     // table beside another step's lengths -- an out-of-range read rather than a stale
     // answer.
     auto const elements = _totalElements();
-    mStaging = std::make_unique<StaticHostMem>(_totalBytes());
-    auto* staging = reinterpret_cast<int32_t*>(mStaging->address());
+    mStaging = StaticHostMem(_totalBytes());
+    auto* staging = reinterpret_cast<int32_t*>(mStaging.address());
     // A row that no member occupies must still read as "no such block" rather than as slot
     // zero, since the fetch has no other way to tell them apart.
     std::fill(staging, staging + _historyOffset(), kBadPageIndex.value());
@@ -121,8 +122,31 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, std::vector<IndexTableSpe
         cuCheck(cuMemcpyHtoDAsync(base, staging, _totalBytes(), cudaStream()));
     }
 
-    _allocateStepScratch();
-    _allocateFlushRanges();
+    {
+        // Each generator yields what it needs and then fills the slice it is handed, so
+        // one allocation serves them all even though the last count is unknown until the
+        // last generator has run.
+        std::array<LayoutGenerator, 2> layouts{_layoutStepScratch(), _layoutFlushRanges()};
+        size_t total = 0;
+        for (auto& layout : layouts)
+        {
+            total += layout.value().value_or(0);
+        }
+        if (total > 0)
+        {
+            mDeviceArena = allocateDeviceMemory<int32_t>(total);
+        }
+        auto* cursor = mDeviceArena.get();
+        for (auto& layout : layouts)
+        {
+            auto const elements = layout.value().value_or(0);
+            layout.send(cursor);
+            cursor += elements;
+            // One round each: a body that asked again would be destroyed suspended, with
+            // the rest of its layout silently unrun.
+            TLLM_CHECK_WITH_INFO(layout.done(), "A layout generator asked for memory twice");
+        }
+    }
 
     // After the modes: a request's offsets depend on where its life cycle puts the base.
     _buildIndexTables(indexTables);
@@ -236,102 +260,113 @@ int32_t Batch::_flushCapacity(LifeCycleId lifeCycle) const
     return mMaxBatchSize * mManager->_sparseCacheMaxInFlightUnits(lifeCycle);
 }
 
-void Batch::_allocateStepScratch()
+Batch::LayoutGenerator Batch::_layoutStepScratchForLifecycle(LifeCycleId lcId)
 {
-    mScratch = TypedVec<LifeCycleId, SparseStepScratch>(mManager->numLifeCycles(), SparseStepScratch{});
-
-    // Sized up front from configuration, so no step has to allocate.
+    int const width = mManager->_sparseCacheSelectionWidth(lcId);
+    if (mManager->sparseCacheMaxUnits(lcId) <= 0 || width <= 0)
+    {
+        co_return;
+    }
     auto const rows = static_cast<size_t>(mMaxBatchSize);
-    size_t total = 0;
-    for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
-    {
-        int const width = mManager->_sparseCacheSelectionWidth(lcId);
-        if (mManager->sparseCacheMaxUnits(lcId) <= 0 || width <= 0)
-        {
-            continue;
-        }
-        auto& scratch = mScratch[lcId];
-        scratch.selectionWidth = width;
-        scratch.maxInFlightUnits = mManager->_sparseCacheMaxInFlightUnits(lcId);
-        scratch.numLayers = mManager->_sparseCacheLayerCount(lcId);
-        auto const layers = static_cast<size_t>(scratch.numLayers);
-        // One list for the fetch, holding the worst case of every row missing its whole
-        // selection; one per layer for the write-back, each holding the units the step's
-        // token budget can carry across a watermark.
-        scratch.fetchWork.capacity = static_cast<int32_t>(rows) * width;
-        scratch.fetchWork.numLists = 1;
-        scratch.flushWork.capacity = _flushCapacity(lcId);
-        scratch.flushWork.numLists = scratch.numLayers;
-        // A counter per layer even though the fetch's list is one: the list is reused from
-        // layer to layer, but the counter has to read zero when a resolve starts, and
-        // per-layer counters let the whole step's be cleared in one go.
-        mCounterElements += 2 * layers;
-        auto const fetchEntries = 3 * static_cast<size_t>(scratch.fetchWork.capacity);
-        auto const flushEntries = layers * 3 * static_cast<size_t>(scratch.flushWork.capacity);
-        total += rows * (static_cast<size_t>(width) + 1 + static_cast<size_t>(scratch.maxInFlightUnits));
-        total += fetchEntries + flushEntries + rows * layers;
-    }
-    if (total == 0)
-    {
-        return;
-    }
+    auto& scratch = mScratch[lcId];
+    scratch.selectionWidth = width;
+    scratch.maxInFlightUnits = mManager->_sparseCacheMaxInFlightUnits(lcId);
+    scratch.numLayers = mManager->_sparseCacheLayerCount(lcId);
+    auto const layers = static_cast<size_t>(scratch.numLayers);
+    // One list for the fetch, holding the worst case of every row missing its whole
+    // selection; one per layer for the write-back, each holding the units the step's token
+    // budget can carry across a watermark.
+    scratch.fetchWork.capacity = static_cast<int32_t>(rows) * width;
+    scratch.fetchWork.numLists = 1;
+    scratch.flushWork.capacity = _flushCapacity(lcId);
+    scratch.flushWork.numLists = scratch.numLayers;
 
-    mStepScratch = allocateDeviceMemory<int32_t>(total + mCounterElements);
-    // Its own allocation: the step's clear covers mCounters, and these have to survive it.
-    mHitMiss = allocateDeviceMemory<SparseHitMiss>(1);
-    cuCheck(cuMemsetD32Async(
-        reinterpret_cast<CUdeviceptr>(mHitMiss.get()), 0U, sizeof(SparseHitMiss) / sizeof(uint32_t), cudaStream()));
+    auto const listEntries = [](SparseWorkList const& work)
+    { return static_cast<size_t>(work.capacity) * static_cast<size_t>(work.numLists); };
+    auto const fetchEntries = listEntries(scratch.fetchWork);
+    auto const flushEntries = listEntries(scratch.flushWork);
+    auto const outSlot = rows * static_cast<size_t>(width);
+    auto const inFlightSlot = rows * static_cast<size_t>(scratch.maxInFlightUnits);
+    auto const flushCount = rows * layers;
 
-    // The counters lead the block so that one clear covers every life cycle's.
-    auto* counter = mStepScratch.get();
-    mCounters = counter;
-    auto* cursor = counter + mCounterElements;
-    auto carve = [&cursor](size_t count)
+    int32_t* cursor = co_yield outSlot + rows + inFlightSlot + 3 * fetchEntries + 3 * flushEntries + flushCount;
+
+    auto const carve = [&cursor](size_t count)
     {
         auto* ptr = cursor;
         cursor += count;
         return ptr;
     };
-    auto const carveCounters = [&counter](size_t count)
+    scratch.outSlot = carve(outSlot);
+    scratch.missCount = carve(rows);
+    scratch.inFlightSlot = carve(inFlightSlot);
+    auto const carveList = [&carve](SparseWorkList& work, size_t entries)
     {
-        auto* ptr = counter;
-        counter += count;
-        return ptr;
+        work.row = carve(entries);
+        work.ordinal = carve(entries);
+        work.slot = carve(entries);
     };
+    carveList(scratch.fetchWork, fetchEntries);
+    carveList(scratch.flushWork, flushEntries);
+    scratch.flushCount = carve(flushCount);
+    // -1 so that "no write-back has run" stays distinguishable from "one ran and found
+    // nothing to move".
+    cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(scratch.flushCount), 0xFFFFFFFFU, flushCount, cudaStream()));
+}
+
+Batch::LayoutGenerator Batch::_layoutStepScratch()
+{
+    mScratch = TypedVec<LifeCycleId, SparseStepScratch>(mManager->numLifeCycles(), SparseStepScratch{});
+
+    // The counters stay here rather than in the leaves: they lead the block so that one
+    // clear covers every life cycle's, which a per-life-cycle slice would scatter.
+    std::vector<std::pair<LifeCycleId, LayoutGenerator>> leaves;
+    size_t mains = 0;
     for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
     {
-        auto& scratch = mScratch[lcId];
-        if (scratch.selectionWidth == 0)
+        auto leaf = _layoutStepScratchForLifecycle(lcId);
+        auto const needed = leaf.value();
+        if (!needed.has_value())
         {
             continue;
         }
-        auto const width = static_cast<size_t>(scratch.selectionWidth);
-        scratch.outSlot = carve(rows * width);
-        scratch.missCount = carve(rows);
-        scratch.inFlightSlot = carve(rows * static_cast<size_t>(scratch.maxInFlightUnits));
+        mains += *needed;
+        // A counter per layer for each of the two lists, even though the fetch's list is
+        // one: the list is reused from layer to layer, but the counter has to read zero
+        // when a resolve starts.
+        mCounterElements += 2 * static_cast<size_t>(mScratch[lcId].numLayers);
+        leaves.emplace_back(lcId, std::move(leaf));
+    }
+    if (leaves.empty())
+    {
+        co_return;
+    }
 
-        auto const carveList = [&carve](SparseWorkList& work)
-        {
-            auto const entries = static_cast<size_t>(work.capacity) * static_cast<size_t>(work.numLists);
-            work.row = carve(entries);
-            work.ordinal = carve(entries);
-            work.slot = carve(entries);
-        };
-        carveList(scratch.fetchWork);
-        carveList(scratch.flushWork);
-        auto const layerCount = static_cast<size_t>(scratch.numLayers);
+    int32_t* base = co_yield mains + mCounterElements;
+
+    // Its own allocation: the step's clear covers mCounters, and these have to survive it.
+    mHitMiss = allocateDeviceMemory<SparseHitMiss>(1);
+    cuCheck(cuMemsetD32Async(
+        reinterpret_cast<CUdeviceptr>(mHitMiss.get()), 0U, sizeof(SparseHitMiss) / sizeof(uint32_t), cudaStream()));
+
+    mCounters = base;
+    auto* counter = base;
+    auto* cursor = base + mCounterElements;
+    for (auto& [lcId, leaf] : leaves)
+    {
+        auto& scratch = mScratch[lcId];
+        auto const layers = static_cast<size_t>(scratch.numLayers);
         // The fetch takes one counter per layer against its single list, so a layer names
         // its own by offsetting this; the write-back's counters match its lists one to one.
-        scratch.fetchWork.total = carveCounters(layerCount);
-        scratch.flushWork.total = carveCounters(layerCount);
+        scratch.fetchWork.total = counter;
+        counter += layers;
+        scratch.flushWork.total = counter;
+        counter += layers;
         scratch.hitMiss = mHitMiss.get();
 
-        auto const layers = static_cast<size_t>(scratch.numLayers);
-        scratch.flushCount = carve(rows * layers);
-        // -1 so that "no write-back has run" stays distinguishable from "one ran and found
-        // nothing to move".
-        cuCheck(cuMemsetD32Async(
-            reinterpret_cast<CUdeviceptr>(scratch.flushCount), 0xFFFFFFFFU, rows * layers, cudaStream()));
+        auto const elements = *leaf.value();
+        leaf.send(cursor);
+        cursor += elements;
     }
 }
 
@@ -496,7 +531,7 @@ void Batch::_buildIndexTables(std::vector<IndexTableSpec> const& specs)
     }
 }
 
-void Batch::_allocateFlushRanges()
+Batch::LayoutGenerator Batch::_layoutFlushRanges()
 {
     mFlushedHistory.assign(static_cast<size_t>(mMaxBatchSize), 0);
 
@@ -507,20 +542,20 @@ void Batch::_allocateFlushRanges()
     }
     if (!anySparse)
     {
-        return;
+        co_return;
     }
 
     auto const elements
         = 2 * static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(mManager->numLifeCycles().value());
-    mFlushRanges = allocateDeviceMemory<int32_t>(elements);
+    mFlushRanges = co_yield elements;
     // An empty range asks for nothing, which is what a row that never flushes should read.
-    cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(mFlushRanges.get()), 0, elements, cudaStream()));
+    cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(mFlushRanges), 0, elements, cudaStream()));
     mFlushRangeStaging.assign(elements, 0);
 }
 
 int32_t const* Batch::flushFromUnits(LifeCycleId lifeCycle) const
 {
-    auto* base = reinterpret_cast<int32_t*>(mFlushRanges.get());
+    auto* base = mFlushRanges;
     return base + 2 * static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(lifeCycle.value());
 }
 
@@ -622,8 +657,8 @@ void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
         mFlushRead.waitInStream(reinterpret_cast<CudaStream>(upload));
         mFlushRead.close();
     }
-    detail::copyFlushRangesToDevice(reinterpret_cast<CUdeviceptr>(mFlushRanges.get()), mFlushRangeStaging.data(),
-        mFlushRangeStaging.size(), upload);
+    detail::copyFlushRangesToDevice(
+        reinterpret_cast<CUdeviceptr>(mFlushRanges), mFlushRangeStaging.data(), mFlushRangeStaging.size(), upload);
     auto staged = mUploadStream.recordEvent();
     staged.waitInStream(reinterpret_cast<CudaStream>(cudaStream()));
 
@@ -739,8 +774,8 @@ void Batch::_allocateIndexTables()
     if (mMaxScratchSlots > 0)
     {
         auto const elements = _scratchElements();
-        mScratchStaging = std::make_unique<StaticHostMem>(sizeof(int32_t) * elements);
-        auto* host = reinterpret_cast<int32_t*>(mScratchStaging->address());
+        mScratchStaging = StaticHostMem(sizeof(int32_t) * elements);
+        auto* host = reinterpret_cast<int32_t*>(mScratchStaging.address());
         // A zero range leaves every block on the plain path, which is what a member holding
         // no scratch looks like. The slots behind the ranges hold the sentinel instead,
         // since zero there would name slot zero.
@@ -886,13 +921,13 @@ size_t Batch::_scratchElements() const noexcept
 
 void Batch::_stageScratch()
 {
-    if (!mScratchStaging)
+    if (mScratchStaging.empty())
     {
         return;
     }
     auto const rows = static_cast<size_t>(mMaxBatchSize);
     auto const groups = static_cast<size_t>(mManager->numLifeCycles().value());
-    auto* const begs = reinterpret_cast<int32_t*>(mScratchStaging->address());
+    auto* const begs = reinterpret_cast<int32_t*>(mScratchStaging.address());
     auto* const ends = begs + groups * rows;
 
     // Only the ranges: a member's slot ids reach its row as they change, through the
@@ -1059,7 +1094,7 @@ size_t Batch::_totalBytes() const noexcept
 
 void Batch::_stageRowState()
 {
-    auto* bytes = reinterpret_cast<std::byte*>(mStaging->address());
+    auto* bytes = reinterpret_cast<std::byte*>(mStaging.address());
     auto* base = reinterpret_cast<int32_t*>(bytes);
     auto* history = base + _historyOffset();
     auto* capacity = base + _capacityOffset();
@@ -1084,7 +1119,7 @@ void Batch::_stageRowState()
 
 void Batch::_seedRowWatermarks(int row, int historyLength, int capacity)
 {
-    auto* base = reinterpret_cast<int32_t*>(mStaging->address());
+    auto* base = reinterpret_cast<int32_t*>(mStaging.address());
     auto const index = static_cast<size_t>(row);
     base[_historyOffset() + index] = historyLength;
     base[_capacityOffset() + index] = capacity;
@@ -1092,7 +1127,7 @@ void Batch::_seedRowWatermarks(int row, int historyLength, int capacity)
 
 int32_t* Batch::_stagingRow(LifeCycleId lifeCycleId, int row) const
 {
-    auto* base = reinterpret_cast<int32_t*>(mStaging->address());
+    auto* base = reinterpret_cast<int32_t*>(mStaging.address());
     return base + static_cast<int64_t>(_rowElements()) * lifeCycleId.value()
         + static_cast<int64_t>(mMaxBlocksPerSeq) * row;
 }
@@ -1102,7 +1137,7 @@ int32_t* Batch::_scratchSlotRow(LifeCycleId lifeCycleId, int row) const
     auto const rows = static_cast<size_t>(mMaxBatchSize);
     auto const groups = static_cast<size_t>(mManager->numLifeCycles().value());
     auto const flat = static_cast<size_t>(lifeCycleId.value()) * rows + static_cast<size_t>(row);
-    auto* base = reinterpret_cast<int32_t*>(mScratchStaging->address());
+    auto* base = reinterpret_cast<int32_t*>(mScratchStaging.address());
     return base + 2 * groups * rows + flat * static_cast<size_t>(mMaxScratchSlots);
 }
 
@@ -1452,11 +1487,11 @@ void Batch::publish()
     // One transfer for the whole table rather than one per changed row: a single driver
     // call on the upload stream overlaps compute, where per-row copies would cost a launch
     // apiece.
-    cuCheck(cuMemcpyHtoDAsync(staging, reinterpret_cast<void*>(mStaging->address()), _totalBytes(), upload));
-    if (mScratchStaging)
+    cuCheck(cuMemcpyHtoDAsync(staging, reinterpret_cast<void*>(mStaging.address()), _totalBytes(), upload));
+    if (!mScratchStaging.empty())
     {
         cuCheck(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(mScratchDevice.get()),
-            reinterpret_cast<void*>(mScratchStaging->address()), sizeof(int32_t) * _scratchElements(), upload));
+            reinterpret_cast<void*>(mScratchStaging.address()), sizeof(int32_t) * _scratchElements(), upload));
     }
     mPublished = mUploadStream.recordEvent();
 
