@@ -108,10 +108,12 @@ struct SparseHitMiss
 //! Every array is device memory.
 struct SparseResolveArgs
 {
-    //! [numRows] cache state per row, as Batch::sparseCacheViews() publishes it. A row with
-    //! a null residentOrdinal holds no reservation -- free, or a member that has suspended --
-    //! and is skipped.
-    SparseCacheView const* views;
+    //! [numRows] the arena slot each row holds, as Batch::sparseLeases() publishes it. A
+    //! row holding kNoSparseLease has no reservation -- free, or a member that has
+    //! suspended -- and is skipped.
+    int32_t const* leases;
+    //! The life cycle's arena, which every row's lease is addressed within.
+    SparseArenaView arena;
     int32_t numRows;
     //! Which of the life cycle's layers this call resolves: the metadata row every sparse
     //! buffer of that layer shares.
@@ -296,10 +298,12 @@ static_assert(sizeof(SparseCopyDesc) == 64, "A copy descriptor is meant to be fo
 //! which of the two is the source changes.
 struct SparseUnitCopyArgs
 {
-    //! [numRows] per-row cache state: the lease and the per-buffer pool slots live here,
-    //! because a batched copy spans rows whose metadata belongs to different requests and
-    //! so is not contiguous. A row with a null residentOrdinal holds no reservation.
-    SparseCacheView const* views = nullptr;
+    //! [numRows] the arena slot each row holds; a batched copy spans rows whose cells
+    //! belong to different requests and so are not contiguous. kNoSparseLease means the
+    //! row holds no reservation.
+    int32_t const* leases = nullptr;
+    //! The life cycle's arena: where a lease's cells sit, and the per-buffer pool slots.
+    SparseArenaView arena;
     int32_t numRows = 0;
 
     //! One descriptor per BufferId of the life cycle, indexed by `blockIdx.y` directly.
@@ -372,9 +376,11 @@ void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream);
 //! So one selection resolves to a different index per buffer.
 struct SparseOutIndexArgs
 {
-    //! [numRows] per-row cache state; a row with a null residentOrdinal is filled with
-    //! kBadPageIndex and nothing else, which is what a free row should look like.
-    SparseCacheView const* views;
+    //! [numRows] the arena slot each row holds; a row holding kNoSparseLease is filled
+    //! with kBadPageIndex and nothing else, which is what a free row should look like.
+    int32_t const* leases;
+    //! The life cycle's arena, which turns a lease into the cells its indices name.
+    SparseArenaView arena;
     int32_t numRows;
 
     //! [numRows][selectionWidth] the ordinals selected, and the entries the resolve gave
@@ -420,12 +426,14 @@ void launchSparseOutIndices(SparseOutIndexArgs const& args, CUstream stream);
 //! ordinal range, and the map has to be read in full either way.
 struct SparseFlushListArgs
 {
-    //! [numRows] per-row cache state. A row with a null residentOrdinal holds no
+    //! [numRows] the arena slot each row holds. kNoSparseLease means the row holds no
     //! reservation and is skipped, as in the fetch.
-    SparseCacheView const* views = nullptr;
+    int32_t const* leases = nullptr;
+    //! The life cycle's arena, which every row's lease is addressed within.
+    SparseArenaView arena;
     int32_t numRows = 0;
-    //! Layers of this life cycle. The grid needs it on the host, where the views are not
-    //! readable, and every row of one life cycle has the same count.
+    //! Layers of this life cycle. The grid needs it on the host, and every row of one life
+    //! cycle has the same count.
     int32_t numLayers = 0;
 
     //! [numRows] each: the unit ordinals that row's watermark moved across, as [from, to).

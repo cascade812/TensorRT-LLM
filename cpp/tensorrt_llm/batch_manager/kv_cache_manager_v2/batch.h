@@ -583,15 +583,15 @@ private:
 
     //! Per-row sparse cache state for one layer group, as the fetch kernel sees it.
     //!
-    //! A device array of SparseCacheView, indexed by row. A free row, or a member whose
-    //! cache is not reserved, reads as a default-constructed view -- null pointers and zero
-    //! counts -- which the kernel skips.
+    //! A device int32 array indexed by row, holding the arena slot each row's member leased.
+    //! A free row, or a member whose cache is not reserved, reads as kNoSparseLease, which
+    //! the kernel skips.
     //!
-    //! The views hold pointers into each request's own allocation, so what is mirrored is
-    //! the handle rather than the memory: the reservation stays with the request. They move
-    //! whenever a member resumes or suspends, which is why they are restaged on every
-    //! publish alongside the watermarks.
-    [[nodiscard]] CUdeviceptr sparseCacheViews(LayerGroupId layerGroupId) const;
+    //! An index rather than the pointers it implies: a lease's cells and its metadata are
+    //! both arithmetic from the arena's bases, which a launch carries once in SparseArenaView
+    //! rather than once per row. The slot changes whenever a member resumes or suspends,
+    //! which is why it is restaged on every publish alongside the watermarks.
+    [[nodiscard]] CUdeviceptr sparseLeases(LayerGroupId layerGroupId) const;
 
     //! Scratch for one layer group's fetch. Null pointers when the group carries no sparse
     //! cache, which is what makes "nothing to fetch here" cheap to detect.
@@ -688,8 +688,8 @@ private:
     //! Recorded after the write-back, so the next call's staging can wait for its reads.
     CachedCudaEvent mFlushRead = CachedCudaEvent::makeNull();
 
-    //! Byte offset of the cache view region within the staged block.
-    [[nodiscard]] size_t _viewsOffsetBytes() const noexcept;
+    //! Element offset of the per-row lease region within the staged block.
+    [[nodiscard]] size_t _leasesOffset() const noexcept;
     //! Bytes of one staged block: the page table, the row state and the views. A device
     //! block is the same size, being a copy of it.
     [[nodiscard]] size_t _totalBytes() const noexcept;

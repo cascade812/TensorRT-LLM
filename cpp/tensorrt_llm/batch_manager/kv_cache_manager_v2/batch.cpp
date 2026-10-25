@@ -110,12 +110,10 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, std::vector<IndexTableSpe
     // zero, since the fetch has no other way to tell them apart.
     std::fill(staging, staging + _historyOffset(), kBadPageIndex.value());
     // Watermarks of a free row are zero: a request with nothing eligible.
-    std::fill(staging + _historyOffset(), staging + elements, 0);
-
-    // Views start default-constructed, so an unpublished batch reads as having no caches.
-    auto* views = reinterpret_cast<SparseCacheView*>(reinterpret_cast<std::byte*>(staging) + _viewsOffsetBytes());
-    auto const numViews = static_cast<size_t>(mManager->numLifeCycles().value()) * static_cast<size_t>(mMaxBatchSize);
-    std::fill(views, views + numViews, SparseCacheView{});
+    std::fill(staging + _historyOffset(), staging + _leasesOffset(), 0);
+    // No row holds a lease yet, which is what an unpublished batch should read as. Zero
+    // would name arena slot zero.
+    std::fill(staging + _leasesOffset(), staging + elements, kNoSparseLease);
 
     // The scratch slot metadata is the block's tail, so one transfer per step carries it
     // along with the page tables rather than needing a second.
@@ -1084,32 +1082,26 @@ size_t Batch::_capacityOffset() const noexcept
 
 size_t Batch::_totalElements() const noexcept
 {
-    return _capacityOffset() + static_cast<size_t>(mMaxBatchSize);
+    return _leasesOffset()
+        + static_cast<size_t>(mManager->numLifeCycles().value()) * static_cast<size_t>(mMaxBatchSize);
 }
 
-size_t Batch::_viewsOffsetBytes() const noexcept
+size_t Batch::_leasesOffset() const noexcept
 {
-    // The views hold pointers, so the region starts at their alignment rather than wherever
-    // the int32 arrays happen to end.
-    size_t const bytes = sizeof(int32_t) * _totalElements();
-    size_t const align = alignof(SparseCacheView);
-    return (bytes + align - 1) / align * align;
+    return _capacityOffset() + static_cast<size_t>(mMaxBatchSize);
 }
 
 size_t Batch::_totalBytes() const noexcept
 {
-    return _viewsOffsetBytes()
-        + sizeof(SparseCacheView) * static_cast<size_t>(mManager->numLifeCycles().value())
-        * static_cast<size_t>(mMaxBatchSize);
+    return sizeof(int32_t) * _totalElements();
 }
 
 void Batch::_stageRowState()
 {
-    auto* bytes = reinterpret_cast<std::byte*>(mStaging.address());
-    auto* base = reinterpret_cast<int32_t*>(bytes);
+    auto* base = reinterpret_cast<int32_t*>(mStaging.address());
     auto* history = base + _historyOffset();
     auto* capacity = base + _capacityOffset();
-    auto* views = reinterpret_cast<SparseCacheView*>(bytes + _viewsOffsetBytes());
+    auto* leases = base + _leasesOffset();
 
     for (size_t row = 0; row < mRows.size(); ++row)
     {
@@ -1119,11 +1111,11 @@ void Batch::_stageRowState()
 
         for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
         {
-            auto& slot = views[static_cast<size_t>(lc.value()) * mRows.size() + row];
-            // A free row, or a member holding no reservation for this group, leaves the
-            // default view: null pointers the kernel reads as "nothing to resolve here".
-            slot = kvCache == nullptr || lc >= kvCache->mSparseCache.size() ? SparseCacheView{}
-                                                                            : kvCache->mSparseCache[lc].view();
+            auto& slot = leases[static_cast<size_t>(lc.value()) * mRows.size() + row];
+            // A free row, or a member holding no reservation for this group, publishes no
+            // lease, which the kernels read as "nothing to resolve here".
+            slot = kvCache == nullptr || lc >= kvCache->mSparseCache.size() ? kNoSparseLease
+                                                                            : kvCache->mSparseCache[lc].index();
         }
     }
 }
@@ -1546,14 +1538,15 @@ GpuCoalescedPageTable Batch::gpuCoalescedPageTable(LifeCycleId lifeCycleId) cons
     return view;
 }
 
-CUdeviceptr Batch::sparseCacheViews(LifeCycleId lifeCycleId) const
+CUdeviceptr Batch::sparseLeases(LifeCycleId lifeCycleId) const
 {
     if (lifeCycleId.value() < 0 || lifeCycleId >= mManager->numLifeCycles())
     {
-        throw std::out_of_range("Batch::sparseCacheViews: unknown layer group");
+        throw std::out_of_range("Batch::sparseLeases: unknown layer group");
     }
-    return reinterpret_cast<CUdeviceptr>(mDevice.get()) + _viewsOffsetBytes()
-        + sizeof(SparseCacheView) * static_cast<size_t>(lifeCycleId.value()) * static_cast<size_t>(mMaxBatchSize);
+    return reinterpret_cast<CUdeviceptr>(mDevice.get())
+        + sizeof(int32_t)
+        * (_leasesOffset() + static_cast<size_t>(lifeCycleId.value()) * static_cast<size_t>(mMaxBatchSize));
 }
 
 WatermarkView Batch::watermarks() const
@@ -1638,7 +1631,8 @@ void Batch::prepareSparseWriteIndices(
     }
 
     int const unitsPerPage = mManager->sparseCacheUnitsPerPage(lcId);
-    auto const views = reinterpret_cast<SparseCacheView const*>(sparseCacheViews(lgId));
+    auto const leases = reinterpret_cast<int32_t const*>(sparseLeases(lgId));
+    auto const arena = mManager->_sparseArena(lgId).view();
     auto const marks = watermarks();
     auto const numRows = maxBatchSize();
 
@@ -1651,7 +1645,8 @@ void Batch::prepareSparseWriteIndices(
     // in-flight ordinal never satisfies it. A change that made that write unconditional would
     // fault here rather than quietly copying stale bytes over what the model wrote.
     SparseResolveArgs resolve;
-    resolve.views = views;
+    resolve.leases = leases;
+    resolve.arena = arena;
     resolve.numRows = numRows;
     resolve.layerInGroup = span.layerInGroup;
     resolve.numLayers = mManager->_sparseCacheLayerCount(lcId);
@@ -1693,7 +1688,8 @@ void Batch::prepareSparseWriteIndices(
             written[static_cast<size_t>(slots[static_cast<size_t>(buffer - span.bufferBase)])] = true;
         }
         SparseOutIndexArgs indices;
-        indices.views = views;
+        indices.leases = leases;
+        indices.arena = arena;
         indices.numRows = numRows;
         indices.selected = nullptr;
         indices.outSlot = scratch.inFlightSlot;
@@ -1719,14 +1715,16 @@ void Batch::prepareSparseWriteIndices(
 void Batch::writeBackSparseUnits(LifeCycleId lifeCycle, CUstream stream)
 {
     LayerGroupId const lgId{lifeCycle.value()};
-    auto const views = reinterpret_cast<SparseCacheView const*>(sparseCacheViews(lgId));
+    auto const leases = reinterpret_cast<int32_t const*>(sparseLeases(lgId));
+    auto const arena = mManager->_sparseArena(lgId).view();
     auto const numRows = maxBatchSize();
 
     // Which units each row crossed. One scan covers every (layer, row); a row whose
     // watermark did not move reports none.
     auto const& scratch = sparseStepScratch(lgId);
     SparseFlushListArgs listArgs;
-    listArgs.views = views;
+    listArgs.leases = leases;
+    listArgs.arena = arena;
     listArgs.numRows = numRows;
     listArgs.numLayers = scratch.numLayers;
     listArgs.fromUnits = flushFromUnits(lifeCycle);
@@ -1738,7 +1736,8 @@ void Batch::writeBackSparseUnits(LifeCycleId lifeCycle, CUstream stream)
     // One launch for every pool and every layer: the descriptors the Batch built already
     // say where each pool's buffers and index tables are, and a flush list is per layer.
     SparseUnitCopyArgs copy;
-    copy.views = views;
+    copy.leases = leases;
+    copy.arena = arena;
     copy.numRows = numRows;
     copy.copyDesc = scratch.copyDesc;
     copy.bufferBase = 0;
@@ -1833,13 +1832,15 @@ void Batch::fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const
 
     int const unitsPerPage = mManager->sparseCacheUnitsPerPage(lcId);
     LayerGroupId const lgId{lcId.value()};
-    auto const views = reinterpret_cast<SparseCacheView const*>(sparseCacheViews(lgId));
+    auto const leases = reinterpret_cast<int32_t const*>(sparseLeases(lgId));
+    auto const arena = mManager->_sparseArena(lgId).view();
     auto const marks = watermarks();
     auto const table = gpuCoalescedPageTable(lgId);
     auto const numRows = maxBatchSize();
 
     SparseResolveArgs resolve;
-    resolve.views = views;
+    resolve.leases = leases;
+    resolve.arena = arena;
     resolve.numRows = numRows;
     resolve.layerInGroup = layerInGroup;
     resolve.numLayers = mManager->_sparseCacheLayerCount(lcId);
@@ -1867,7 +1868,8 @@ void Batch::fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const
     // clip each pool to the layer's buffers and name its index table, so nothing here
     // depends on which layer is being resolved beyond choosing the row.
     SparseUnitCopyArgs copy;
-    copy.views = views;
+    copy.leases = leases;
+    copy.arena = arena;
     copy.numRows = numRows;
     // The same descriptors as the write-back: a run never spans layers, so it already
     // names this layer's index table. Only the buffer range below differs.
@@ -1911,7 +1913,8 @@ void Batch::fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const
             written[static_cast<size_t>(slots[static_cast<size_t>(buffer - bufferBase)])] = true;
         }
         SparseOutIndexArgs indices;
-        indices.views = views;
+        indices.leases = leases;
+        indices.arena = arena;
         indices.numRows = numRows;
         indices.selected = selected;
         indices.outSlot = scratch.outSlot;

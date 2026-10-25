@@ -4606,7 +4606,7 @@ class TestBatch(unittest.TestCase):
         finally:
             manager.shutdown()
 
-    def test_sparse_cache_views_are_staged_per_row(self):
+    def test_sparse_leases_are_staged_per_row(self):
         """What is mirrored is the handle, not the memory: the reservation stays per request.
 
         A view appears for a member holding one and stays absent for a free row, so the

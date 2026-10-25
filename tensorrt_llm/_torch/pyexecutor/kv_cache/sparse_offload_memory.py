@@ -68,12 +68,8 @@ _MIB = float(1 << 20)
 SPARSE_ARENA_ALIGNMENT = 256
 # Every arena and Batch index array holds 32-bit entries (int32_t or uint32_t).
 _INDEX_BYTES = 4
-# A native SparseCacheView takes at most this many bytes; a Batch aligns each to this size.
-_SPARSE_CACHE_VIEW_BYTES = 256
 # A Batch row holds two watermarks, history length and capacity.
 _BATCH_WATERMARKS_PER_ROW = 2
-# A Batch starts its cache views at a pointer-aligned offset.
-_BATCH_VIEW_ALIGNMENT = 8
 # Pinned host memory is mapped in whole pages of this many bytes.
 _HOST_PAGE_BYTES = 4096
 # A decode step writes one query token per request, which completes at most one
@@ -359,10 +355,10 @@ def life_cycle_pages(layers: Sequence[LayerConfig], tokens_per_block: int) -> li
 class SparseBatchShape:
     """The native Batch the sparse fetch reads, sized once for every step.
 
-    It holds a page table per life cycle, two watermarks and a cache view per row,
-    in a device mirror, a pinned host staging copy and a device staging copy, and
-    the fetch's work arrays on the device. Every step uploads the host staging copy
-    to the device one, then copies that into the mirror.
+    It holds a page table per life cycle, two watermarks per row and one arena lease
+    per (life cycle, row), in a device mirror, a pinned host staging copy and a device
+    staging copy, and the fetch's work arrays on the device. Every step uploads the host
+    staging copy to the device one, then copies that into the mirror.
 
     Attributes:
         num_life_cycles: Life cycles of the manager; each has a page table.
@@ -386,12 +382,13 @@ class SparseBatchShape:
 
     @property
     def mirror_bytes(self) -> int:
-        """Device bytes of the mirror: the page tables, watermarks and cache views."""
+        """Device bytes of the mirror: the page tables, watermarks and leases."""
         entries = self.max_batch_size * (
-            self.num_life_cycles * self.max_blocks_per_seq + _BATCH_WATERMARKS_PER_ROW
+            self.num_life_cycles * self.max_blocks_per_seq
+            + _BATCH_WATERMARKS_PER_ROW
+            + self.num_life_cycles
         )
-        views = self.num_life_cycles * self.max_batch_size * _SPARSE_CACHE_VIEW_BYTES
-        return pad_up(_INDEX_BYTES * entries, _BATCH_VIEW_ALIGNMENT) + views
+        return _INDEX_BYTES * entries
 
     @property
     def staging_bytes(self) -> int:

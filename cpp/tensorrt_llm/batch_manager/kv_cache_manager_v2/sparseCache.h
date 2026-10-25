@@ -30,8 +30,9 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
 // ---------------------------------------------------------------------------
-// SparseCacheView — the device-resident state of one request's sparse history
-// cache for one life cycle, as the fetch kernel sees it.
+// SparseLeaseIndex and SparseArenaView — the device-resident state of one request's sparse
+// history cache for one life cycle, as the fetch kernel sees it: a slot per row, and the
+// geometry that slot is read within.
 //
 // A reserved slot is a row of buffer-sized cells, and any layer's unit may occupy any cell;
 // a cell holds `unitsPerPage` units when a selection unit is smaller than a buffer. An entry
@@ -42,31 +43,38 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // buffer of a layer selects the same units, so one resident set and one recency order serve
 // them all, and the entry index the resolve produces addresses each buffer's own cell.
 // ---------------------------------------------------------------------------
-struct SparseCacheView
+//! The arena slot a row's member holds, or kNoSparseLease when the row carries none.
+//!
+//! This is the whole of a row's published cache state: everything else a kernel needs is
+//! either arithmetic from this index -- a lease's cells and its metadata both sit at a
+//! fixed stride from the arena's bases, see "Why the cache is a flat array of cells" in
+//! SPARSE_ATTENTION_DESIGN.md -- or a constant of the life cycle, which SparseArenaView
+//! carries once per launch rather than once per row.
+using SparseLeaseIndex = int32_t;
+inline constexpr SparseLeaseIndex kNoSparseLease = -1;
+
+//! One life cycle's arena, as a kernel addresses it. Fixed for the arena's lifetime, so a
+//! launch takes it by value and no row carries a copy.
+struct SparseArenaView
 {
-    //! Resident unit ordinal per entry, kBadBlockOrdinal when the entry is free.
+    //! Lease i's metadata begins at `metadataBase + i * leaseStride`: first its resident
+    //! unit ordinal per entry, kBadBlockOrdinal where the entry is free, then at
+    //! `lruOffset` its entry indices in recency order, most-recently-used first.
     //!
-    //! Dense rather than keyed: a fetch builds a hash over this array in shared memory to
-    //! answer "is this ordinal resident, and where".
-    int32_t* residentOrdinal = nullptr;
-
-    //! Entry indices in recency order, most-recently-used first.
-    int32_t* lruOrder = nullptr;
-
-    //! This request's lease on the arena. A cell address is arithmetic from here -- see
-    //! "Why the cache is a flat array of cells" in SPARSE_ATTENTION_DESIGN.md -- so there is
-    //! no page table to consult. The lease is an index rather than a cell offset because a
-    //! pool's region has its own cells-per-lease, which the copy supplies per launch.
-    int32_t leaseIndex = 0;
+    //! The ordinals are dense rather than keyed: a fetch builds a hash over them in shared
+    //! memory to answer "is this ordinal resident, and where".
+    std::byte* metadataBase = nullptr;
+    uint64_t leaseStride = 0;
+    int32_t lruOffset = 0;
 
     //! [numBuffers] each buffer's index among those sharing its pool: where its cells sit
     //! inside that pool's arena region.
-    int32_t* bufferSlotInPool = nullptr;
+    int32_t const* bufferSlotInPool = nullptr;
 
     //! [numBuffers] the layer each buffer belongs to, i.e. which metadata row carries its
     //! residency and its work list. Non-decreasing: the buffers of a layer are consecutive,
     //! which is what lets a one-layer call name its buffers as a range rather than a set.
-    int32_t* bufferLayer = nullptr;
+    int32_t const* bufferLayer = nullptr;
 
     //! Layers in this life cycle: the metadata's first dimension.
     int32_t numLayers = 0;
@@ -126,9 +134,11 @@ public:
         return mArena == nullptr;
     }
 
-    [[nodiscard]] SparseCacheView const& view() const noexcept
+    //! The arena slot held, or kNoSparseLease once released. This is what a Batch publishes
+    //! for the row; everything else about the lease is arithmetic from it.
+    [[nodiscard]] SparseLeaseIndex index() const noexcept
     {
-        return mView;
+        return mIndex.value_or(kNoSparseLease);
     }
 
     //! Return the cells early. Idempotent; the destructor does the same.
@@ -142,7 +152,6 @@ private:
 
     SparseCellArena* mArena = nullptr;
     std::optional<int> mIndex;
-    SparseCacheView mView;
 };
 
 // ---------------------------------------------------------------------------
@@ -211,11 +220,15 @@ public:
     //! identity permutation.
     [[nodiscard]] std::optional<SparseCacheLease> acquire(CUstream stream);
 
-    //! [numBuffers] the layer each buffer belongs to, as every view of this life cycle sees it.
+    //! [numBuffers] the layer each buffer belongs to, as every lease of this life cycle sees it.
     [[nodiscard]] int32_t const* bufferLayer() const noexcept
     {
         return mSharedLayer;
     }
+
+    //! How a kernel addresses this arena's leases. Constant once constructed, so a launch
+    //! carries one of these rather than one descriptor per row.
+    [[nodiscard]] SparseArenaView view() const noexcept;
 
     [[nodiscard]] SparseCacheInit const& shape() const noexcept
     {

@@ -55,6 +55,16 @@ constexpr int32_t kEmptyKey = -1;
 constexpr int32_t kBadPageIndexValue = kBadPageIndex.value();
 constexpr int32_t kFreeOrdinal = kBadBlockOrdinal.value();
 
+//! A lease's metadata block: its resident ordinals, with its recency order at `lruOffset`.
+//!
+//! Every lease of a life cycle is the same size, so the block is arithmetic from the
+//! arena's base -- the same addressing cells already use, which is why a row publishes an
+//! index rather than the pointers it would imply.
+__device__ inline int32_t* leaseMetadata(SparseArenaView const& arena, int32_t lease)
+{
+    return reinterpret_cast<int32_t*>(arena.metadataBase + static_cast<uint64_t>(lease) * arena.leaseStride);
+}
+
 //! Recency classes, ordered: a hit outranks a unit fetched this step, which outranks an
 //! entry the step did not touch. This is what makes a repeatedly selected unit survive a
 //! one-off selection.
@@ -205,8 +215,8 @@ __device__ int32_t blockExclusiveSum(int32_t* flags, int32_t n)
 __global__ __launch_bounds__(kThreads) void sparsePrepareWriteKernel(SparseResolveArgs args)
 {
     int32_t const row = static_cast<int32_t>(blockIdx.x);
-    SparseCacheView const view = args.views[row];
-    if (view.residentOrdinal == nullptr)
+    int32_t const lease = args.leases[row];
+    if (lease == kNoSparseLease)
     {
         return;
     }
@@ -225,9 +235,10 @@ __global__ __launch_bounds__(kThreads) void sparsePrepareWriteKernel(SparseResol
         return;
     }
 
-    int32_t const entries = view.entriesPerLayer;
-    auto* resident = view.residentOrdinal + static_cast<ptrdiff_t>(args.layerInGroup) * entries;
-    auto* order = view.lruOrder + static_cast<ptrdiff_t>(args.layerInGroup) * entries;
+    int32_t const entries = args.arena.entriesPerLayer;
+    auto* const metadata = leaseMetadata(args.arena, lease);
+    auto* resident = metadata + static_cast<ptrdiff_t>(args.layerInGroup) * entries;
+    auto* order = metadata + args.arena.lruOffset + static_cast<ptrdiff_t>(args.layerInGroup) * entries;
     extern __shared__ int32_t previousOrder[];
     using Reduce = cub::BlockReduce<int32_t, kThreads>;
     __shared__ typename Reduce::TempStorage temp;
@@ -288,14 +299,14 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     extern __shared__ unsigned char smem[];
     int32_t const layer = args.layerInGroup;
     int32_t const row = static_cast<int32_t>(blockIdx.x);
-    SparseCacheView const view = args.views[row];
-    if (view.residentOrdinal == nullptr)
+    int32_t const lease = args.leases[row];
+    if (lease == kNoSparseLease)
     {
         // A free row, or a member that has suspended and given its reservation back. Its
         // outputs keep whatever the caller initialised them to.
         return;
     }
-    int32_t const entries = view.entriesPerLayer;
+    int32_t const entries = args.arena.entriesPerLayer;
     int32_t const width = args.selectionWidth;
     uint32_t const mask = static_cast<uint32_t>(tableSize) - 1U;
 
@@ -323,8 +334,9 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     __shared__ int32_t numResolved;
 
     // The view's own arrays belong to this row's allocation, so only the layer indexes them.
-    int32_t* residentOrdinal = view.residentOrdinal + static_cast<ptrdiff_t>(layer) * entries;
-    int32_t* lruOrder = view.lruOrder + static_cast<ptrdiff_t>(layer) * entries;
+    auto* const metadata = leaseMetadata(args.arena, lease);
+    int32_t* residentOrdinal = metadata + static_cast<ptrdiff_t>(layer) * entries;
+    int32_t* lruOrder = metadata + args.arena.lruOffset + static_cast<ptrdiff_t>(layer) * entries;
     // The batch-wide arrays are indexed by row alone: the call is one layer, and its
     // buffers share the single result.
     auto const selectionBase = static_cast<ptrdiff_t>(row) * width;
@@ -634,7 +646,7 @@ __device__ void copySparseUnits(SparseUnitCopyArgs const& args, SparseCopyDesc c
         // Read per item rather than per warp: the list is dense across rows, so consecutive
         // entries need not share one. A producer's CTA claims a contiguous run, so in
         // practice a warp's items mostly do.
-        SparseCacheView const view = args.views[row];
+        int32_t const lease = args.leases[row];
 
         // A unit ordinal names a unit within a block; a cache entry names a unit within a
         // sub-slot. Both divide by the same units-per-page.
@@ -658,7 +670,7 @@ __device__ void copySparseUnits(SparseUnitCopyArgs const& args, SparseCopyDesc c
         // Direction only chooses which of the two is read.
         auto* cold = reinterpret_cast<char*>(
             desc.hostBase + hostPage * desc.hostPageStride + static_cast<uint64_t>(srcUnit) * desc.layout.unitStride);
-        auto* hot = reinterpret_cast<char*>(desc.deviceBase + static_cast<uint64_t>(view.leaseIndex) * desc.leaseStride
+        auto* hot = reinterpret_cast<char*>(desc.deviceBase + static_cast<uint64_t>(lease) * desc.leaseStride
             + static_cast<uint64_t>(slot / args.unitsPerPage) * desc.cellBytes
             + static_cast<uint64_t>(dstUnit) * desc.layout.unitStride);
         bool const fetching = args.direction == SparseCopyDirection::kFetch;
@@ -724,8 +736,8 @@ __global__ __launch_bounds__(kThreads) void sparseOutIndexKernel(SparseOutIndexA
         + (static_cast<ptrdiff_t>(row) * args.outBuffers + args.outBase + blockIdx.x)
             * static_cast<ptrdiff_t>(args.selectionWidth);
 
-    SparseCacheView const view = args.views[row];
-    bool const reserved = view.residentOrdinal != nullptr;
+    int32_t const lease = args.leases[row];
+    bool const reserved = lease != kNoSparseLease;
     auto const base = static_cast<ptrdiff_t>(row) * args.selectionWidth;
     int32_t const slotStride = args.outSlotStride > 0 ? args.outSlotStride : args.selectionWidth;
     auto const slotBase = static_cast<ptrdiff_t>(row) * slotStride;
@@ -744,7 +756,7 @@ __global__ __launch_bounds__(kThreads) void sparseOutIndexKernel(SparseOutIndexA
             continue;
         }
 
-        int32_t const cell = view.leaseIndex * args.cellsPerLease + view.bufferSlotInPool[buffer] * args.cellsPerBuffer
+        int32_t const cell = lease * args.cellsPerLease + args.arena.bufferSlotInPool[buffer] * args.cellsPerBuffer
             + slot / args.unitsPerPage;
         out[i] = cell * args.unitsPerPage + slot % args.unitsPerPage;
     }
@@ -755,14 +767,14 @@ __global__ __launch_bounds__(kThreads) void sparseOutIndexKernel(SparseOutIndexA
 __global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushListArgs args)
 {
     int32_t const row = static_cast<int32_t>(blockIdx.y);
-    SparseCacheView const view = args.views[row];
-    if (view.residentOrdinal == nullptr)
+    int32_t const lease = args.leases[row];
+    if (lease == kNoSparseLease)
     {
         // A free row, or a member that has suspended: no reservation to write back from.
         return;
     }
     int32_t const layer = static_cast<int32_t>(blockIdx.x);
-    int32_t const entries = view.entriesPerLayer;
+    int32_t const entries = args.arena.entriesPerLayer;
 
     // The row's view is staged with the watermarks and is nobody's output here, so a block
     // can address itself before waiting. The range itself is uploaded by the call that asked
@@ -783,7 +795,7 @@ __global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushLis
     }
 
     __shared__ typename BlockScan::TempStorage temp;
-    int32_t const* residentOrdinal = view.residentOrdinal + static_cast<ptrdiff_t>(layer) * entries;
+    int32_t const* residentOrdinal = leaseMetadata(args.arena, lease) + static_cast<ptrdiff_t>(layer) * entries;
     auto const crossed = [&](int32_t slot)
     {
         int32_t const ord = residentOrdinal[slot];
@@ -863,7 +875,7 @@ void launchSparseOutIndices(SparseOutIndexArgs const& args, CUstream stream)
     {
         throw std::invalid_argument("launchSparseOutIndices: every extent must be positive");
     }
-    if (args.views == nullptr || args.outSlot == nullptr || args.out == nullptr)
+    if (args.leases == nullptr || args.outSlot == nullptr || args.out == nullptr)
     {
         throw std::invalid_argument("launchSparseOutIndices: every device array must be provided");
     }
@@ -891,7 +903,7 @@ void launchSparseFlushList(SparseFlushListArgs const& args, CUstream stream)
     {
         throw std::invalid_argument("launchSparseFlushList: rows and layers must be positive");
     }
-    if (args.views == nullptr || args.fromUnits == nullptr || args.toUnits == nullptr || args.outCount == nullptr)
+    if (args.leases == nullptr || args.fromUnits == nullptr || args.toUnits == nullptr || args.outCount == nullptr)
     {
         throw std::invalid_argument("launchSparseFlushList: every device array must be provided");
     }
@@ -952,7 +964,7 @@ void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream)
         throw std::invalid_argument(
             "launchSparseUnitCopy: rows, buffers, grid CTAs and units-per-page must be positive");
     }
-    if (args.copyDesc == nullptr || args.views == nullptr)
+    if (args.copyDesc == nullptr || args.leases == nullptr)
     {
         throw std::invalid_argument("launchSparseUnitCopy: every device array must be provided");
     }
@@ -1006,7 +1018,7 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
         throw std::invalid_argument("launchSparseResolve: layerInGroup must name a layer of the group");
     }
     bool const selectionArrays = args.selectionWidth == 0 || (args.selected != nullptr && args.outSlot != nullptr);
-    if (args.views == nullptr || !selectionArrays || args.missCount == nullptr || args.historyTokens == nullptr
+    if (args.leases == nullptr || !selectionArrays || args.missCount == nullptr || args.historyTokens == nullptr
         || args.capacityTokens == nullptr || (args.maxInFlightUnits > 0 && args.inFlightSlot == nullptr))
     {
         throw std::invalid_argument("launchSparseResolve: every device array must be provided");

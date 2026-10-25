@@ -201,22 +201,30 @@ std::optional<SparseCacheLease> SparseCellArena::acquire(CUstream stream)
     lease.mArena = this;
     lease.mIndex = index;
 
-    auto& view = lease.mView;
-    view.numLayers = mShape.numLayers;
-    view.numBuffers = mShape.numBuffers;
-    view.entriesPerLayer = mShape.entriesPerLayer;
-    view.leaseIndex = index;
-    view.bufferLayer = mSharedLayer;
-    view.bufferSlotInPool = mSharedSlotInPool;
-    view.residentOrdinal = carve(layout.ordinal);
-    view.lruOrder = carve(layout.lru);
+    auto* const residentOrdinal = carve(layout.ordinal);
+    auto* const lruOrder = carve(layout.lru);
 
-    auto const entries = static_cast<size_t>(view.numEntries());
-    cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(view.residentOrdinal),
+    auto const entries = static_cast<size_t>(mShape.numLayers) * static_cast<size_t>(mShape.entriesPerLayer);
+    cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(residentOrdinal),
         static_cast<unsigned int>(kBadBlockOrdinal.value()), entries, stream));
-    cuCheck(cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(view.lruOrder), reinterpret_cast<CUdeviceptr>(mIdentity),
+    cuCheck(cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(lruOrder), reinterpret_cast<CUdeviceptr>(mIdentity),
         sizeof(int32_t) * entries, stream));
     return lease;
+}
+
+SparseArenaView SparseCellArena::view() const noexcept
+{
+    SparseArenaView out;
+    out.metadataBase = mMetadataBase;
+    out.leaseStride = mMetadataBytes;
+    // Both regions are carved from one lease block, the ordinals first; see leaseLayout().
+    out.lruOffset = static_cast<int32_t>(leaseLayout(mShape).ordinal / sizeof(int32_t));
+    out.bufferSlotInPool = mSharedSlotInPool;
+    out.bufferLayer = mSharedLayer;
+    out.numLayers = mShape.numLayers;
+    out.numBuffers = mShape.numBuffers;
+    out.entriesPerLayer = mShape.entriesPerLayer;
+    return out;
 }
 
 void SparseCellArena::_release(int index) noexcept
@@ -239,7 +247,6 @@ SparseCacheLease::~SparseCacheLease()
 SparseCacheLease::SparseCacheLease(SparseCacheLease&& other) noexcept
     : mArena(other.mArena)
     , mIndex(other.mIndex)
-    , mView(other.mView)
 {
     other.mArena = nullptr;
     other.mIndex = std::nullopt;
@@ -252,7 +259,6 @@ SparseCacheLease& SparseCacheLease::operator=(SparseCacheLease&& other) noexcept
         release();
         mArena = other.mArena;
         mIndex = other.mIndex;
-        mView = other.mView;
         other.mArena = nullptr;
         other.mIndex = std::nullopt;
     }
@@ -266,7 +272,6 @@ void SparseCacheLease::release() noexcept
         mArena->_release(*mIndex);
         mArena = nullptr;
         mIndex = std::nullopt;
-        mView = SparseCacheView{};
     }
 }
 
@@ -277,9 +282,11 @@ std::vector<int32_t> SparseCacheLease::readResidentOrdinals() const
     {
         return {};
     }
-    std::vector<int32_t> out(mView.numEntries());
-    cuCheck(cuMemcpyDtoHAsync(
-        out.data(), reinterpret_cast<CUdeviceptr>(mView.residentOrdinal), sizeof(int32_t) * out.size(), stream));
+    auto const arena = mArena->view();
+    std::vector<int32_t> out(arena.numEntries());
+    cuCheck(cuMemcpyDtoHAsync(out.data(),
+        reinterpret_cast<CUdeviceptr>(arena.metadataBase + static_cast<uint64_t>(*mIndex) * arena.leaseStride),
+        sizeof(int32_t) * out.size(), stream));
     cuCheck(cuStreamSynchronize(stream));
     return out;
 }

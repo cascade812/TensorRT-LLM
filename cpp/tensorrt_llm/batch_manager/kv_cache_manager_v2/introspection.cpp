@@ -140,7 +140,7 @@ std::optional<int> KvCacheIntrospection::sparseCacheBaseCell(KvCache const& kvCa
     // Relative to the pool's own arena region, which is what getSparseCacheBaseAddress
     // reports for a buffer drawing on it.
     auto const& arena = kvCache.mManager->mSparseArenas[id];
-    return kvCache.mSparseCache[id].view().leaseIndex * arena.cellsPerLease(PoolIndex{pool});
+    return kvCache.mSparseCache[id].index() * arena.cellsPerLease(PoolIndex{pool});
 }
 
 std::vector<int32_t> KvCacheIntrospection::batchPageTable(Batch const& batch, int layerGroupId)
@@ -185,16 +185,18 @@ std::vector<int32_t> KvCacheIntrospection::batchSparseViewEntries(Batch const& b
 {
     CUstream const stream = nullptr;
     auto const rows = static_cast<size_t>(batch.maxBatchSize());
-    std::vector<SparseCacheView> views(rows);
+    std::vector<int32_t> leases(rows);
     cuCheck(cuMemcpyDtoHAsync(
-        views.data(), batch.sparseCacheViews(LayerGroupId{layerGroupId}), sizeof(SparseCacheView) * rows, stream));
+        leases.data(), batch.sparseLeases(LayerGroupId{layerGroupId}), sizeof(int32_t) * rows, stream));
     cuCheck(cuStreamSynchronize(stream));
 
+    // Every lease of a life cycle has the same shape, so the arena answers for all of them.
+    auto const entriesPerLayer = batch.mManager->mSparseArenas[LayerGroupId{layerGroupId}].view().entriesPerLayer;
     std::vector<int32_t> out;
     out.reserve(rows);
-    for (auto const& view : views)
+    for (auto const lease : leases)
     {
-        out.push_back(view.residentOrdinal == nullptr ? 0 : view.entriesPerLayer);
+        out.push_back(lease == kNoSparseLease ? 0 : entriesPerLayer);
     }
     return out;
 }
@@ -274,8 +276,6 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
         throw std::invalid_argument("sparseResolve: input sizes must match the declared shape");
     }
 
-    auto resident = deviceCopy(residentOrdinal);
-    auto recency = deviceCopy(lruOrder);
     auto selection = deviceCopy(selected);
     auto outSlot = deviceCopy(std::vector<int32_t>(selectionCount, 0));
     auto missRow = deviceCopy(std::vector<int32_t>(selectionCount, kNoSparseSlot));
@@ -289,26 +289,35 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     auto const inFlightCount = countCount * static_cast<size_t>(std::max(maxInFlightUnits, 0));
     auto inFlight = deviceCopy(std::vector<int32_t>(std::max<size_t>(inFlightCount, 1), kNoSparseSlot));
 
-    // One view per row, each pointing at that row's slice of the two shared allocations.
-    // Mirrors what Batch stages: the handle is per row, the memory stays with the request.
-    std::vector<SparseCacheView> views(static_cast<size_t>(numRows));
+    // One metadata block per lease, its resident ordinals then its recency order, which is
+    // how the arena lays a lease out. The probe takes and returns each array whole, so they
+    // are interleaved on the way in and separated on the way out.
+    auto const leaseInts = 2 * perRowEntries;
+    std::vector<int32_t> metadataHost(leaseInts * static_cast<size_t>(numRows));
     for (int row = 0; row < numRows; ++row)
     {
-        auto& view = views[static_cast<size_t>(row)];
-        if (std::find(inactiveRows.begin(), inactiveRows.end(), row) != inactiveRows.end())
-        {
-            // Left default: a row holding no reservation, which the kernel must skip.
-            continue;
-        }
-        view.residentOrdinal = reinterpret_cast<int32_t*>(resident.get()) + perRowEntries * row;
-        view.lruOrder = reinterpret_cast<int32_t*>(recency.get()) + perRowEntries * row;
-        view.numLayers = numLayers;
-        view.entriesPerLayer = entriesPerLayer;
+        auto const from = perRowEntries * static_cast<size_t>(row);
+        auto const to = leaseInts * static_cast<size_t>(row);
+        std::copy_n(residentOrdinal.begin() + from, perRowEntries, metadataHost.begin() + to);
+        std::copy_n(lruOrder.begin() + from, perRowEntries, metadataHost.begin() + to + perRowEntries);
     }
-    CUdeviceptr viewPtr = 0;
-    cuCheck(cuMemAlloc(&viewPtr, sizeof(SparseCacheView) * views.size()));
-    CudaUniqPtr<> viewOwner{reinterpret_cast<std::byte*>(viewPtr)};
-    cuCheck(cuMemcpyHtoDAsync(viewPtr, views.data(), sizeof(SparseCacheView) * views.size(), stream));
+    auto metadata = deviceCopy(metadataHost);
+
+    // Row r takes lease r, except an inactive row, which holds none for the kernel to skip.
+    std::vector<int32_t> leaseHost(static_cast<size_t>(numRows));
+    for (int row = 0; row < numRows; ++row)
+    {
+        leaseHost[static_cast<size_t>(row)]
+            = std::find(inactiveRows.begin(), inactiveRows.end(), row) != inactiveRows.end() ? kNoSparseLease : row;
+    }
+    auto leases = deviceCopy(leaseHost);
+
+    SparseArenaView arena;
+    arena.metadataBase = metadata.get();
+    arena.leaseStride = sizeof(int32_t) * leaseInts;
+    arena.lruOffset = static_cast<int32_t>(perRowEntries);
+    arena.numLayers = numLayers;
+    arena.entriesPerLayer = entriesPerLayer;
 
     // One launch per layer, as a step does: a layer's selection is not known until the
     // previous layer has run. The arrays are therefore layer-major, so each launch sees a
@@ -319,7 +328,8 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
         auto const countOffset = static_cast<size_t>(layer) * numRows;
 
         SparseResolveArgs args;
-        args.views = reinterpret_cast<SparseCacheView const*>(viewPtr);
+        args.leases = reinterpret_cast<int32_t const*>(leases.get());
+        args.arena = arena;
         args.numRows = numRows;
         args.layerInGroup = layer;
         args.numLayers = numLayers;
@@ -349,8 +359,16 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     cuCheck(cuStreamSynchronize(stream));
 
     SparseResolveProbe result;
-    result.residentOrdinal = readBack(resident, entryCount);
-    result.lruOrder = readBack(recency, entryCount);
+    auto const metadataOut = readBack(metadata, leaseInts * static_cast<size_t>(numRows));
+    result.residentOrdinal.resize(entryCount);
+    result.lruOrder.resize(entryCount);
+    for (int row = 0; row < numRows; ++row)
+    {
+        auto const from = leaseInts * static_cast<size_t>(row);
+        auto const to = perRowEntries * static_cast<size_t>(row);
+        std::copy_n(metadataOut.begin() + from, perRowEntries, result.residentOrdinal.begin() + to);
+        std::copy_n(metadataOut.begin() + from + perRowEntries, perRowEntries, result.lruOrder.begin() + to);
+    }
     result.outSlot = readBack(outSlot, selectionCount);
     result.missRow = readBack(missRow, selectionCount);
     result.missOrdinal = readBack(missOrdinal, selectionCount);
@@ -412,23 +430,20 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     auto totalBuf = deviceCopy(totals);
     auto bufferLayerBuf = deviceCopy(bufferLayer);
 
-    // The kernel reads the lease and the per-buffer maps through a view, so the hook
-    // assembles one standing in for a single request's cache state.
-    SparseCacheView view;
-    // Non-null only to mark the row live; the copy itself never reads the metadata arrays.
-    view.residentOrdinal = reinterpret_cast<int32_t*>(table.get());
-    // The probe drives one pool, so a lease of one cell and a buffer-slot identity reproduce
-    // the address the production path computes from a lease index and a pool slot.
-    view.leaseIndex = baseCell;
-    view.bufferLayer = reinterpret_cast<int32_t*>(bufferLayerBuf.get());
+    // The kernel reads the lease and the per-buffer maps, so the hook assembles the arena a
+    // single request's cells would be addressed within. The copy reads no metadata block, so
+    // the arena names none.
     std::vector<int32_t> slotInPool(bufferLayer.size());
     std::iota(slotInPool.begin(), slotInPool.end(), 0);
     auto slotInPoolBuf = deviceCopy(slotInPool);
-    view.bufferSlotInPool = reinterpret_cast<int32_t*>(slotInPoolBuf.get());
-    CUdeviceptr viewPtr = 0;
-    cuCheck(cuMemAlloc(&viewPtr, sizeof(SparseCacheView)));
-    CudaUniqPtr<> viewOwner{reinterpret_cast<std::byte*>(viewPtr)};
-    cuCheck(cuMemcpyHtoDAsync(viewPtr, &view, sizeof(SparseCacheView), stream));
+
+    // The probe drives one pool, so a lease of one cell and a buffer-slot identity reproduce
+    // the address the production path computes from a lease index and a pool slot.
+    auto leases = deviceCopy(std::vector<int32_t>(1, baseCell));
+    SparseArenaView arena;
+    arena.bufferSlotInPool = reinterpret_cast<int32_t const*>(slotInPoolBuf.get());
+    arena.bufferLayer = reinterpret_cast<int32_t const*>(bufferLayerBuf.get());
+    arena.numBuffers = static_cast<int32_t>(bufferLayer.size());
 
     // One descriptor per buffer, as the real path builds them: the hook drives the
     // addressing, so every buffer shares a pool and differs only by its slot in it.
@@ -456,7 +471,8 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     cuCheck(cuMemcpyHtoDAsync(descPtr, descs.data(), sizeof(SparseCopyDesc) * descs.size(), stream));
 
     SparseUnitCopyArgs args;
-    args.views = reinterpret_cast<SparseCacheView const*>(viewPtr);
+    args.leases = reinterpret_cast<int32_t const*>(leases.get());
+    args.arena = arena;
     args.numRows = 1;
     args.copyDesc = reinterpret_cast<SparseCopyDesc const*>(descPtr);
     args.bufferBase = 0;
@@ -495,7 +511,6 @@ KvCacheIntrospection::SparseFlushList KvCacheIntrospection::sparseFlushList(std:
     }
     auto const listCount = static_cast<size_t>(numLayers) * maxFlushUnits;
 
-    auto resident = deviceCopy(residentOrdinal);
     auto from = deviceCopy(std::vector<int32_t>(1, fromUnits));
     auto to = deviceCopy(std::vector<int32_t>(1, toUnits));
     auto outRow = deviceCopy(std::vector<int32_t>(listCount, kNoSparseSlot));
@@ -504,18 +519,24 @@ KvCacheIntrospection::SparseFlushList KvCacheIntrospection::sparseFlushList(std:
     auto outTotal = deviceCopy(std::vector<int32_t>(static_cast<size_t>(numLayers), 0));
     auto outCount = deviceCopy(std::vector<int32_t>(static_cast<size_t>(numLayers), 0));
 
-    // The scan spans the batch, so the hook stands one row in for a single request.
-    SparseCacheView view;
-    view.residentOrdinal = reinterpret_cast<int32_t*>(resident.get());
-    view.numLayers = numLayers;
-    view.entriesPerLayer = entriesPerLayer;
-    CUdeviceptr viewPtr = 0;
-    cuCheck(cuMemAlloc(&viewPtr, sizeof(SparseCacheView)));
-    CudaUniqPtr<> viewOwner{reinterpret_cast<std::byte*>(viewPtr)};
-    cuCheck(cuMemcpyHtoDAsync(viewPtr, &view, sizeof(SparseCacheView), stream));
+    // The scan spans the batch, so the hook stands one row in for a single request, holding
+    // one lease laid out as the arena lays one: its resident ordinals, then its recency
+    // order, which the scan does not read.
+    std::vector<int32_t> metadataHost(2 * entryCount, 0);
+    std::copy(residentOrdinal.begin(), residentOrdinal.end(), metadataHost.begin());
+    auto metadata = deviceCopy(metadataHost);
+    auto leases = deviceCopy(std::vector<int32_t>(1, 0));
+
+    SparseArenaView arena;
+    arena.metadataBase = metadata.get();
+    arena.leaseStride = sizeof(int32_t) * 2 * entryCount;
+    arena.lruOffset = static_cast<int32_t>(entryCount);
+    arena.numLayers = numLayers;
+    arena.entriesPerLayer = entriesPerLayer;
 
     SparseFlushListArgs args;
-    args.views = reinterpret_cast<SparseCacheView const*>(viewPtr);
+    args.leases = reinterpret_cast<int32_t const*>(leases.get());
+    args.arena = arena;
     args.numRows = 1;
     args.numLayers = numLayers;
     args.fromUnits = reinterpret_cast<int32_t const*>(from.get());

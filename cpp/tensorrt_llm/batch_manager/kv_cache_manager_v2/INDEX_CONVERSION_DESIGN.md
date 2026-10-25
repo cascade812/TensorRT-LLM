@@ -1,6 +1,8 @@
 # Index conversion in Batch
 
-Status: design, not implemented.
+Status: implemented, except where noted. The conversion, the index modes, the table specs
+and the scratch substitution all live in `Batch`; what remains is retiring the raw mirror,
+under "Buffers" below.
 
 A `Batch` publishes page indices as the cache stores them -- slot ids, level-relative,
 with `kBadPageIndex` preserved. Attention kernels need something else: a plain table of
@@ -158,15 +160,27 @@ so a caller that does not care is not obliged to.
 
 | | holds | read by |
 |---|---|---|
-| host staging | raw, host | the upload |
-| `mDeviceStaging` | raw `[lc][row][block]` | the conversion |
-| `mDevice` | the converted tables | the captured kernels |
+| `mStaging` | raw `[lc][row][block]`, the row state, the per-row leases, the scratch slot tables; pinned host | the upload |
+| `mDeviceStaging` | the same block, device side | the conversion |
+| `mIndexTableMemory` | the converted tables | the captured kernels |
+| `mDevice` | the row state and the leases, and a copy of the raw indices | the captured kernels |
 
-`mDevice` stays one device allocation; what changes is that it no longer mirrors the
-staging's layout. It is carved into tables whose geometry comes from the mode and the merge
-classes, so `indexTableAddress()` hands out offsets into it and a merged set's per-layer
-tables stay contiguous. With sparse life cycles converted too, nothing captured wants the
-raw form, leaving `mDeviceStaging` as the only raw copy on the device.
+The converted tables are their own allocation, carved by a geometry that comes from the mode
+and the merge classes, so `indexTableAddress()` hands out offsets into it and a merged set's
+per-layer tables stay contiguous.
+
+Buffers share an allocation only where one transfer can carry the whole of it, since what
+that buys is a driver call off the step's critical path. The staged block is one
+host-to-device copy and `mDevice` one device-to-device copy, so each is worth packing; the
+converted tables are produced by the conversion kernel rather than copied, so packing them
+with either would save no call and cost the offset arithmetic.
+
+`mDevice` still carries a copy of the raw page indices, which this design would retire. With
+sparse life cycles converted too, nothing captured reads the raw form: the region's only
+reader is `gpuCoalescedPageTable()`, reached solely from `KvCacheIntrospection`. Retiring it
+leaves `mDevice` holding the row state and the leases -- the two things a captured kernel
+reads that are not converted indices -- and `mDeviceStaging` as the only raw copy on the
+device.
 
 Batch's own device footprint rises: the converted tables carry the buffer dimension, and
 under PER_LAYER the layer dimension, where the raw mirror carried neither. The system total
@@ -178,9 +192,8 @@ and two raw buffers stop existing -- Batch's raw mirror and the runtime's
 
 The copy reaches a cold page as `hostBase + converted * pageStride`, where `pageStride` is
 one buffer and `hostBase` is the base of the index table the buffer was declared in. The
-per-buffer offset the copy used to add is folded into the converted value, so
-`pageBufferOffset` is gone from `SparseCacheView`, the arena's shared metadata and the cache
-shape. The pool's slot size plays no part: what a converted index counts is whole buffers.
+per-buffer offset is folded into the converted value, so neither a row's published state,
+the arena's shared metadata nor the cache shape carries one. The pool's slot size plays no part: what a converted index counts is whole buffers.
 The GPU-side cache stops needing to know that a page coalesces several buffers, which was
 never its concern -- it caches a buffer, not a page.
 
