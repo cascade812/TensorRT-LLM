@@ -872,11 +872,11 @@ private:
     bool mEnableSwaScratchReuse = false;
     TypedVec<LifeCycleId, ScratchSlots> mScratchSlots;
 
-    // This request's lease on its sparse cache cells, by life cycle, together with the
-    // device-resident residency, recency and write-back scratch describing them. Taken
-    // when the cache joins a Batch, returned on removal, suspend() and close(). Empty
-    // unless a sparse buffer of that life cycle has its fetch path configured.
-    TypedVec<LifeCycleId, SparseCacheLease> mSparseCache;
+    // This request's slot in the sparse cache arenas, which addresses its cells and the
+    // device-resident residency, recency and write-back scratch describing them in every
+    // life cycle at once. Taken when the cache joins a Batch, returned on removal,
+    // suspend() and close(). Empty unless some life cycle has its fetch path configured.
+    SparseCacheLease mSparseLease;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

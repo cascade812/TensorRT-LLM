@@ -588,6 +588,13 @@ private:
     //! one per layer and pool. A caller that wants only some buffers clips each run to them.
     [[nodiscard]] std::vector<SparseCopyRun> _sparseCopyTemplates(LifeCycleId lifeCycle) const;
 
+    //! The arena slots, as one free list. A request takes one slot and it serves every
+    //! sparse life cycle, so the arenas hold cells and metadata but no allocation state.
+    [[nodiscard]] SparseSlotPool& _sparseSlots() noexcept
+    {
+        return mSparseSlots;
+    }
+
     //! Multiprocessors of the device this manager runs on, for sizing a copy's grid.
     [[nodiscard]] int32_t _smCount() const noexcept
     {
@@ -597,6 +604,8 @@ private:
     //! Behind a driver call, and the sparse copy wants it per launch, so it is read once at
     //! construction.
     int32_t mSmCount = 0;
+
+    SparseSlotPool mSparseSlots;
 
     //! This life cycle's arena of GPU cells, from which a request takes its lease at
     //! resume(). Empty when the life cycle has no sparse fetch path configured.

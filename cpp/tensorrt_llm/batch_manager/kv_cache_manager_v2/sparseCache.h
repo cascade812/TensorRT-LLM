@@ -110,13 +110,15 @@ struct SparseCacheInit
 };
 
 // ---------------------------------------------------------------------------
-// SparseCacheLease — one request's cells and the metadata describing them.
+// SparseCacheLease — one request's slot in every sparse arena, and so its cells and the
+// metadata describing them.
 //
 // Taken when the cache joins a Batch, returned on removal, suspend() and close(). Move-only
-// and RAII: the arena's free list is restored by the destructor, so a request dropped on any
+// and RAII: the pool's free list is restored by the destructor, so a request dropped on any
 // path -- including a poisoned teardown -- cannot leak its cells.
 // ---------------------------------------------------------------------------
 class SparseCellArena;
+class SparseSlotPool;
 
 class SparseCacheLease
 {
@@ -131,27 +133,57 @@ public:
 
     [[nodiscard]] bool empty() const noexcept
     {
-        return mArena == nullptr;
+        return mPool == nullptr;
     }
 
-    //! The arena slot held, or kNoSparseLease once released. This is what a Batch publishes
-    //! for the row; everything else about the lease is arithmetic from it.
+    //! The slot held, or kNoSparseLease once released. This is what a Batch publishes for
+    //! the row, and it addresses the request's cells and metadata in every arena.
     [[nodiscard]] SparseLeaseIndex index() const noexcept
     {
         return mIndex.value_or(kNoSparseLease);
     }
 
-    //! Return the cells early. Idempotent; the destructor does the same.
+    //! Return the slot early. Idempotent; the destructor does the same.
     void release() noexcept;
 
-    //! Copy the resident ordinals back to the host. Test and debug use only; synchronises.
-    [[nodiscard]] std::vector<int32_t> readResidentOrdinals() const;
+private:
+    friend class SparseSlotPool;
+
+    SparseSlotPool* mPool = nullptr;
+    std::optional<int> mIndex;
+};
+
+// ---------------------------------------------------------------------------
+// SparseSlotPool — the arena slots of a manager, as one free list.
+//
+// One slot serves a request in every sparse life cycle at once: the arenas are sized from
+// the same `constraints`, so a slot that exists in one exists in all, and a request is
+// seated in all of them or none. Holding the list here rather than per arena is what makes
+// that an invariant instead of a coincidence of equal acquisition order.
+// ---------------------------------------------------------------------------
+class SparseSlotPool
+{
+public:
+    SparseSlotPool() = default;
+
+    explicit SparseSlotPool(int numSlots);
+
+    //! Take a slot, or nullopt when every one is held. A caller sized from `constraints`
+    //! cannot see nullopt, since a free row implies a free slot.
+    [[nodiscard]] std::optional<SparseCacheLease> acquire();
+
+    [[nodiscard]] int numSlots() const noexcept
+    {
+        return mNumSlots;
+    }
 
 private:
-    friend class SparseCellArena;
+    friend class SparseCacheLease;
 
-    SparseCellArena* mArena = nullptr;
-    std::optional<int> mIndex;
+    void _release(int index) noexcept;
+
+    int mNumSlots = 0;
+    std::vector<int> mFree;
 };
 
 // ---------------------------------------------------------------------------
@@ -213,12 +245,15 @@ public:
         return mNumBytes;
     }
 
-    //! Take a lease, enqueuing its metadata reset on `stream`. nullopt when the arena is
-    //! full, which a resume reports as a failed reservation rather than throwing.
-    //!
-    //! Entries start free: every ordinal is kBadBlockOrdinal and the recency order is the
-    //! identity permutation.
-    [[nodiscard]] std::optional<SparseCacheLease> acquire(CUstream stream);
+    //! Clear `slot`'s metadata on `stream`, which is what taking it means here: every
+    //! ordinal becomes kBadBlockOrdinal and the recency order the identity permutation.
+    //! The slot itself comes from the manager's SparseSlotPool, since one serves every
+    //! life cycle.
+    void initialiseLease(SparseLeaseIndex slot, CUstream stream);
+
+    //! Copy a slot's resident ordinals back to the host. Test and debug use only;
+    //! synchronises.
+    [[nodiscard]] std::vector<int32_t> readResidentOrdinals(SparseLeaseIndex slot) const;
 
     //! [numBuffers] the layer each buffer belongs to, as every lease of this life cycle sees it.
     [[nodiscard]] int32_t const* bufferLayer() const noexcept
@@ -236,12 +271,10 @@ public:
     }
 
 private:
-    friend class SparseCacheLease;
-
-    void _release(int index) noexcept;
-
     CudaUniqPtr<> mMemory;
     SparseCacheInit mShape;
+    //! Slots this arena was sized for, which every SparseSlotPool index must fall inside.
+    int mMaxLeases = 0;
     size_t mMetadataBytes = 0;
     size_t mNumBytes = 0;
     TypedVec<PoolIndex, CUdeviceptr> mPoolBase;
@@ -251,8 +284,6 @@ private:
     int32_t* mSharedLayer = nullptr;
     int32_t* mSharedSlotInPool = nullptr;
     int32_t* mIdentity = nullptr;
-
-    std::vector<int> mFree;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

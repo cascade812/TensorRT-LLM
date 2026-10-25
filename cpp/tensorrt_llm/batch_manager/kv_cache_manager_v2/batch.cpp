@@ -1083,8 +1083,7 @@ size_t Batch::_capacityOffset() const noexcept
 
 size_t Batch::_totalElements() const noexcept
 {
-    return _leasesOffset()
-        + static_cast<size_t>(mManager->numLifeCycles().value()) * static_cast<size_t>(mMaxBatchSize);
+    return _leasesOffset() + static_cast<size_t>(mMaxBatchSize);
 }
 
 size_t Batch::_leasesOffset() const noexcept
@@ -1122,14 +1121,9 @@ void Batch::_stageRowState()
         history[row] = kvCache == nullptr ? 0 : kvCache->historyLength();
         capacity[row] = kvCache == nullptr ? 0 : kvCache->capacity();
 
-        for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
-        {
-            auto& slot = leases[static_cast<size_t>(lc.value()) * mRows.size() + row];
-            // A free row, or a member holding no reservation for this group, publishes no
-            // lease, which the kernels read as "nothing to resolve here".
-            slot = kvCache == nullptr || lc >= kvCache->mSparseCache.size() ? kNoSparseLease
-                                                                            : kvCache->mSparseCache[lc].index();
-        }
+        // A free row, or a member holding no reservation, publishes no lease, which the
+        // kernels read as "nothing to resolve here". One slot serves every life cycle.
+        leases[row] = kvCache == nullptr ? kNoSparseLease : kvCache->mSparseLease.index();
     }
 }
 
@@ -1227,18 +1221,17 @@ int Batch::addKvCache(KvCache& kvCache, std::optional<int> requestedRow)
     // exactly when the GPU cache is needed. After the stream change, because acquiring one
     // clears its residency on that stream. Sized from the same `constraints` the rows come
     // from, so a free row always has a free lease and this cannot fail.
-    for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
+    if (mManager->hasSparseCache() && kvCache.mSparseLease.empty())
     {
-        auto& arena = mManager->_sparseArena(lc);
-        if (arena.empty() || !kvCache.mSparseCache[lc].empty())
-        {
-            continue;
-        }
-        auto lease = arena.acquire(cudaStream());
+        auto lease = mManager->_sparseSlots().acquire();
         TLLM_CHECK_WITH_INFO(lease.has_value(),
-            "Batch::addKvCache: the sparse cache arena is full, which cannot happen while it is sized from the "
-            "same `constraints` the Batch takes its rows from");
-        kvCache.mSparseCache[lc] = std::move(*lease);
+            "Batch::addKvCache: the sparse cache arenas are full, which cannot happen while they are sized from "
+            "the same `constraints` the Batch takes its rows from");
+        kvCache.mSparseLease = std::move(*lease);
+        for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
+        {
+            mManager->_sparseArena(lc).initialiseLease(kvCache.mSparseLease.index(), cudaStream());
+        }
     }
 
     // Owning from here: the member cannot be destroyed under the Batch, so a caller may
@@ -1278,7 +1271,7 @@ std::shared_ptr<KvCache> Batch::removeKvCache(KvCache& kvCache)
     // a member that has written back everything it means to keep looks like. The leases
     // released below discard the GPU cache, and the next occupant seeds its own watermark
     // from its own history, so anything still pending here has no later chance to be noticed.
-    if (std::ranges::any_of(kvCache.mSparseCache, [](SparseCacheLease const& lease) { return !lease.empty(); }))
+    if (!kvCache.mSparseLease.empty())
     {
         TLLM_CHECK_WITH_INFO(kvCache.historyLength() == mFlushedHistory[static_cast<size_t>(row)],
             "A sparse KvCache leaving row %d has history %d against %d written back; call "
@@ -1305,12 +1298,9 @@ std::shared_ptr<KvCache> Batch::removeKvCache(KvCache& kvCache)
         auto* staged = _stagingRow(lc, row);
         std::fill(staged, staged + mMaxBlocksPerSeq, kBadPageIndex.value());
     }
-    // Leaving returns the lease, which discards whatever the GPU cache held;
-    // flushSparseUnits() has written back anything worth keeping.
-    for (auto& lease : kvCache.mSparseCache)
-    {
-        lease.release();
-    }
+    // Leaving returns the slot, which discards whatever the GPU cache held in every life
+    // cycle; flushSparseUnits() has written back anything worth keeping.
+    kvCache.mSparseLease.release();
     _seedRowWatermarks(row, 0, 0);
     mRows[static_cast<size_t>(row)] = nullptr;
     return leaving;
@@ -1554,13 +1544,9 @@ GpuCoalescedPageTable Batch::gpuCoalescedPageTable(LifeCycleId lifeCycleId) cons
     return view;
 }
 
-CUdeviceptr Batch::sparseLeases(LifeCycleId lifeCycleId) const
+CUdeviceptr Batch::sparseLeases() const
 {
-    if (lifeCycleId.value() < 0 || lifeCycleId >= mManager->numLifeCycles())
-    {
-        throw std::out_of_range("Batch::sparseLeases: unknown layer group");
-    }
-    return _mirrorAt(_leasesOffset() + static_cast<size_t>(lifeCycleId.value()) * static_cast<size_t>(mMaxBatchSize));
+    return _mirrorAt(_leasesOffset());
 }
 
 WatermarkView Batch::watermarks() const
@@ -1644,7 +1630,7 @@ void Batch::prepareSparseWriteIndices(
     }
 
     int const unitsPerPage = mManager->sparseCacheUnitsPerPage(lcId);
-    auto const leases = reinterpret_cast<int32_t const*>(sparseLeases(lgId));
+    auto const leases = reinterpret_cast<int32_t const*>(sparseLeases());
     auto const arena = mManager->_sparseArena(lgId).view();
     auto const marks = watermarks();
     auto const numRows = maxBatchSize();
@@ -1726,7 +1712,7 @@ void Batch::prepareSparseWriteIndices(
 void Batch::writeBackSparseUnits(LifeCycleId lifeCycle, CUstream stream)
 {
     LayerGroupId const lgId{lifeCycle.value()};
-    auto const leases = reinterpret_cast<int32_t const*>(sparseLeases(lgId));
+    auto const leases = reinterpret_cast<int32_t const*>(sparseLeases());
     auto const arena = mManager->_sparseArena(lgId).view();
     auto const numRows = maxBatchSize();
 
@@ -1842,7 +1828,7 @@ void Batch::fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const
 
     int const unitsPerPage = mManager->sparseCacheUnitsPerPage(lcId);
     LayerGroupId const lgId{lcId.value()};
-    auto const leases = reinterpret_cast<int32_t const*>(sparseLeases(lgId));
+    auto const leases = reinterpret_cast<int32_t const*>(sparseLeases());
     auto const arena = mManager->_sparseArena(lgId).view();
     auto const marks = watermarks();
     auto const table = gpuCoalescedPageTable(lgId);

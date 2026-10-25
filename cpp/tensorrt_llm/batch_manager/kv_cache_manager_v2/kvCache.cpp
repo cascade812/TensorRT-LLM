@@ -118,7 +118,6 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
 
     mEnableSwaScratchReuse = manager.isSwaScratchReuseEnabled();
     mScratchSlots.resize(manager.storage().numLifeCycles());
-    mSparseCache.resize(manager.storage().numLifeCycles());
 
     TLLM_CHECK_WITH_INFO(!(manager.textOnly() && textOnly == std::optional<bool>{false}),
         "text_only=false is not allowed when the manager is configured text_only=true");
@@ -1522,9 +1521,9 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     if (newHist > mHistoryLength)
     {
         bool crosses = false;
-        for (LifeCycleId lc{0}; lc < mSparseCache.size() && !crosses; ++lc)
+        for (LifeCycleId lc{0}; !mSparseLease.empty() && lc < mManager->numLifeCycles() && !crosses; ++lc)
         {
-            if (mSparseCache[lc].empty())
+            if (mManager->sparseCacheMaxUnits(lc) == 0)
             {
                 continue;
             }
@@ -3629,8 +3628,7 @@ void KvCache::_freeReservedGpuSlots()
     {
         lcSlots.unlockAndClear();
     }
-    for (auto& lease : mSparseCache)
-        lease.release();
+    mSparseLease.release();
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

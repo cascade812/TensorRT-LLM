@@ -372,6 +372,10 @@ void KvCacheManager::_buildSparseArenas()
         // base is simply where the next pool's region starts.
         mSparseArenas[lcId] = SparseCellArena(shape, maxLeases);
     }
+
+    // One list for every arena: a request is seated in all of them or none, and they are
+    // sized alike, so a slot that exists in one exists in all.
+    mSparseSlots = SparseSlotPool(maxLeases);
 }
 
 std::vector<SparseCopyRun> KvCacheManager::_sparseCopyTemplates(LifeCycleId lifeCycle) const

@@ -591,17 +591,19 @@ private:
     //! caller's.
     [[nodiscard]] GpuCoalescedPageTable gpuCoalescedPageTable(LayerGroupId layerGroupId) const;
 
-    //! Per-row sparse cache state for one layer group, as the fetch kernel sees it.
+    //! Per-row sparse cache state, as the fetch kernel sees it.
     //!
-    //! A device int32 array indexed by row, holding the arena slot each row's member leased.
+    //! A device int32 array indexed by row, holding the arena slot each row's member took.
     //! A free row, or a member whose cache is not reserved, reads as kNoSparseLease, which
     //! the kernel skips.
     //!
-    //! An index rather than the pointers it implies: a lease's cells and its metadata are
-    //! both arithmetic from the arena's bases, which a launch carries once in SparseArenaView
-    //! rather than once per row. The slot changes whenever a member resumes or suspends,
-    //! which is why it is restaged on every publish alongside the watermarks.
-    [[nodiscard]] CUdeviceptr sparseLeases(LayerGroupId layerGroupId) const;
+    //! One array rather than one per layer group: a member is seated in every sparse life
+    //! cycle or none, and the arenas are sized alike, so a slot addresses the request in
+    //! all of them. An index rather than the pointers it implies, because a lease's cells
+    //! and its metadata are both arithmetic from the bases a launch carries once in
+    //! SparseArenaView. The slot changes whenever a member resumes or suspends, which is
+    //! why it is restaged on every publish alongside the watermarks.
+    [[nodiscard]] CUdeviceptr sparseLeases() const;
 
     //! Scratch for one layer group's fetch. Null pointers when the group carries no sparse
     //! cache, which is what makes "nothing to fetch here" cheap to detect.

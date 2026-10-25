@@ -355,10 +355,10 @@ def life_cycle_pages(layers: Sequence[LayerConfig], tokens_per_block: int) -> li
 class SparseBatchShape:
     """The native Batch the sparse fetch reads, sized once for every step.
 
-    It holds a page table per life cycle, two watermarks per row and one arena lease
-    per (life cycle, row), in a device mirror, a pinned host staging copy and a device
-    staging copy, and the fetch's work arrays on the device. Every step uploads the host
-    staging copy to the device one, then copies that into the mirror.
+    It holds a page table per life cycle, and two watermarks and one arena slot per row,
+    in a device mirror, a pinned host staging copy and a device staging copy, and the
+    fetch's work arrays on the device. Every step uploads the host staging copy to the
+    device one, then copies the mirror's part of it across.
 
     Attributes:
         num_life_cycles: Life cycles of the manager; each has a page table.
@@ -384,9 +384,7 @@ class SparseBatchShape:
     def block_bytes(self) -> int:
         """Device bytes of the staged block: the page tables, watermarks and leases."""
         entries = self.max_batch_size * (
-            self.num_life_cycles * self.max_blocks_per_seq
-            + _BATCH_WATERMARKS_PER_ROW
-            + self.num_life_cycles
+            self.num_life_cycles * self.max_blocks_per_seq + _BATCH_WATERMARKS_PER_ROW + 1
         )
         return _INDEX_BYTES * entries
 
@@ -397,9 +395,7 @@ class SparseBatchShape:
         The page tables leading the block are read from its device staging copy by the
         index conversion, so they are not carried on.
         """
-        return (
-            _INDEX_BYTES * self.max_batch_size * (_BATCH_WATERMARKS_PER_ROW + self.num_life_cycles)
-        )
+        return _INDEX_BYTES * self.max_batch_size * (_BATCH_WATERMARKS_PER_ROW + 1)
 
     @property
     def staging_bytes(self) -> int:

@@ -123,24 +123,25 @@ TypedVec<PoolGroupIndex, SlotCount> KvCacheIntrospection::computeSlotsForBatch(K
 std::vector<int32_t> KvCacheIntrospection::sparseCacheResidentOrdinals(KvCache const& kvCache, int lcId)
 {
     LifeCycleId const id{lcId};
-    if (id >= kvCache.mSparseCache.size())
+    if (id >= kvCache.mManager->numLifeCycles())
     {
         return {};
     }
-    return kvCache.mSparseCache[id].readResidentOrdinals();
+    return kvCache.mManager->mSparseArenas[id].readResidentOrdinals(kvCache.mSparseLease.index());
 }
 
 std::optional<int> KvCacheIntrospection::sparseCacheBaseCell(KvCache const& kvCache, int lcId, int pool)
 {
     LifeCycleId const id{lcId};
-    if (id >= kvCache.mSparseCache.size() || kvCache.mSparseCache[id].empty())
+    if (id >= kvCache.mManager->numLifeCycles() || kvCache.mSparseLease.empty()
+        || kvCache.mManager->mSparseArenas[id].empty())
     {
         return std::nullopt;
     }
     // Relative to the pool's own arena region, which is what getSparseCacheBaseAddress
     // reports for a buffer drawing on it.
     auto const& arena = kvCache.mManager->mSparseArenas[id];
-    return kvCache.mSparseCache[id].index() * arena.cellsPerLease(PoolIndex{pool});
+    return kvCache.mSparseLease.index() * arena.cellsPerLease(PoolIndex{pool});
 }
 
 std::vector<int32_t> KvCacheIntrospection::batchPageTable(Batch const& batch, int layerGroupId)
@@ -186,8 +187,7 @@ std::vector<int32_t> KvCacheIntrospection::batchSparseEntriesPerRow(Batch const&
     CUstream const stream = nullptr;
     auto const rows = static_cast<size_t>(batch.maxBatchSize());
     std::vector<int32_t> leases(rows);
-    cuCheck(cuMemcpyDtoHAsync(
-        leases.data(), batch.sparseLeases(LayerGroupId{layerGroupId}), sizeof(int32_t) * rows, stream));
+    cuCheck(cuMemcpyDtoHAsync(leases.data(), batch.sparseLeases(), sizeof(int32_t) * rows, stream));
     cuCheck(cuStreamSynchronize(stream));
 
     // Every lease of a life cycle has the same shape, so the arena answers for all of them.
@@ -217,7 +217,7 @@ std::vector<int32_t> KvCacheIntrospection::sparseFlushCounts(KvCache const& kvCa
 {
     CUstream const stream = nullptr;
     LifeCycleId const id{lcId};
-    if (id >= kvCache.mSparseCache.size() || kvCache.mBatch == nullptr)
+    if (id >= kvCache.mManager->numLifeCycles() || kvCache.mBatch == nullptr)
     {
         return {};
     }

@@ -338,14 +338,14 @@ def test_pages_a_decoding_request_holds(
 
 @pytest.mark.cpu_only
 def test_batch_matches_native_layout() -> None:
-    # Three int32 page tables of 8,196 pages, two watermarks per row, and one arena
-    # lease per row and life cycle.
-    assert V4_FLASH_BATCH.block_bytes == 4 * 256 * (3 * 8196 + 2 + 3)
-    assert V4_FLASH_BATCH.block_bytes == 25_183_232
+    # Three int32 page tables of 8,196 pages, two watermarks per row, and one arena slot
+    # per row, which serves every life cycle.
+    assert V4_FLASH_BATCH.block_bytes == 4 * 256 * (3 * 8196 + 2 + 1)
+    assert V4_FLASH_BATCH.block_bytes == 25_181_184
     # The mirror carries only the block's tail: what a captured kernel reads.
-    assert V4_FLASH_BATCH.mirror_bytes == 4 * 256 * (2 + 3) == 5_120
+    assert V4_FLASH_BATCH.mirror_bytes == 4 * 256 * (2 + 1) == 3_072
     # The staging copy is mapped in whole 4 KiB pages.
-    assert V4_FLASH_BATCH.staging_bytes == 25_186_304
+    assert V4_FLASH_BATCH.staging_bytes == 25_182_208
     # Per row: a slot per selected unit, a miss count and the unit in flight. Then the
     # two compacted work lists -- a row, an ordinal and a slot per entry, plus a total
     # per list -- one for the fetch, sized for every row missing its whole selection,
@@ -356,7 +356,7 @@ def test_batch_matches_native_layout() -> None:
     assert V4_FLASH_BATCH.fetch_scratch_bytes == 2_107_404
     # The device holds the staged block a publish fills ahead of the step, the mirror of
     # its tail that a captured kernel reads, and the work arrays.
-    assert V4_FLASH_BATCH.device_bytes == 25_183_232 + 5_120 + 2_107_404 == 27_295_756
+    assert V4_FLASH_BATCH.device_bytes == 25_181_184 + 3_072 + 2_107_404 == 27_291_660
 
 
 @pytest.mark.cpu_only
