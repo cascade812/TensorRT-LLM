@@ -139,6 +139,11 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     _computeSparseCacheShape();
     _buildSparseArenas();
 
+    // The storage above has a device context up, which this needs.
+    CUdevice device{};
+    cuCheck(cuCtxGetDevice(&device));
+    mSmCount = sparseCopyMultiprocessors(device);
+
     mTargetRatioListHot = _currentHotRatio();
     mTargetRatioListCold = _currentColdRatios();
     _resetIterationPeakNumBlocks();
@@ -367,19 +372,6 @@ void KvCacheManager::_buildSparseArenas()
         // base is simply where the next pool's region starts.
         mSparseArenas[lcId] = SparseCellArena(shape, maxLeases);
     }
-}
-
-int32_t KvCacheManager::_sparseCopyGridCtas(int32_t workCapacity) const
-{
-    // The SM count is behind a driver call, so it is cached; the grid it feeds is two
-    // arithmetic steps, so it is not.
-    if (mSmCount == 0)
-    {
-        CUdevice device{};
-        cuCheck(cuCtxGetDevice(&device));
-        mSmCount = sparseCopyMultiprocessors(device);
-    }
-    return sparseCopyGridCtas(workCapacity, mSmCount);
 }
 
 std::vector<SparseCopyRun> KvCacheManager::_sparseCopyTemplates(LifeCycleId lifeCycle) const

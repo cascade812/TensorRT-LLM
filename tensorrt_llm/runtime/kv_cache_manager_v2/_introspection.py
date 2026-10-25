@@ -325,13 +325,13 @@ def batch_gpu_coalesced_page_table(batch: Any, layer_group_id: int) -> Any:
     return _cpp().batch_gpu_coalesced_page_table(batch, layer_group_id)
 
 
-def batch_sparse_view_entries(batch: Any, layer_group_id: int) -> list[int]:
-    """Entries per buffer of each row's published sparse cache view.
+def batch_sparse_entries_per_row(batch: Any, layer_group_id: int) -> list[int]:
+    """Metadata entries per layer of the lease each row holds.
 
-    Zero where no view is staged, so this is non-zero exactly where a member holds a
+    Zero where the row holds none, so this is non-zero exactly where a member holds a
     reservation for that layer group. Synchronises.
     """
-    return list(_cpp().batch_sparse_view_entries(batch, layer_group_id))
+    return list(_cpp().batch_sparse_entries_per_row(batch, layer_group_id))
 
 
 def batch_watermarks(batch: Any) -> tuple[list[int], list[int]]:

@@ -4657,13 +4657,13 @@ class TestBatch(unittest.TestCase):
                 )
                 # Before anyone resumes, no reservation exists, so no view does either.
                 batch.publish()
-                self.assertEqual(_introspection.batch_sparse_view_entries(batch, lg_id), [0, 0])
+                self.assertEqual(_introspection.batch_sparse_entries_per_row(batch, lg_id), [0, 0])
 
                 cache = manager.create_kv_cache()
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
                 batch.publish()
-                entries = _introspection.batch_sparse_view_entries(batch, lg_id)
+                entries = _introspection.batch_sparse_entries_per_row(batch, lg_id)
                 self.assertEqual(entries[0], manager.get_sparse_cache_max_units(0))
                 self.assertEqual(entries[1], 0, "the free row stays absent")
 
@@ -4675,7 +4675,7 @@ class TestBatch(unittest.TestCase):
                 batch.remove_kv_cache(cache)
                 cache.suspend()
                 batch.publish()
-                self.assertEqual(_introspection.batch_sparse_view_entries(batch, lg_id), [0, 0])
+                self.assertEqual(_introspection.batch_sparse_entries_per_row(batch, lg_id), [0, 0])
         finally:
             if cache is not None:
                 if batch is not None and batch.row_of(cache) is not None:

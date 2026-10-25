@@ -101,9 +101,9 @@ public:
     //! table, which is what a consumer actually reads, is Batch::coalescedPageTable().
     static GpuCoalescedPageTable batchGpuCoalescedPageTable(Batch const& batch, int layerGroupId);
 
-    // entriesPerLayer of each row's published sparse cache view, zero where
-    // no view is staged. Non-zero exactly where a member holds a reservation. Synchronises.
-    static std::vector<int32_t> batchSparseViewEntries(Batch const& batch, int layerGroupId);
+    // entriesPerLayer of the lease each row holds, zero where it holds none. Non-zero
+    // exactly where a member holds a reservation for that layer group. Synchronises.
+    static std::vector<int32_t> batchSparseEntriesPerRow(Batch const& batch, int layerGroupId);
 
     // A Batch's published per-row watermarks as (history_length, capacity).
     // Synchronises.

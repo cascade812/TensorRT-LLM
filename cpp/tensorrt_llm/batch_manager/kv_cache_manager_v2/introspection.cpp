@@ -181,7 +181,7 @@ GpuCoalescedPageTable KvCacheIntrospection::batchGpuCoalescedPageTable(Batch con
     return batch.gpuCoalescedPageTable(LayerGroupId{layerGroupId});
 }
 
-std::vector<int32_t> KvCacheIntrospection::batchSparseViewEntries(Batch const& batch, int layerGroupId)
+std::vector<int32_t> KvCacheIntrospection::batchSparseEntriesPerRow(Batch const& batch, int layerGroupId)
 {
     CUstream const stream = nullptr;
     auto const rows = static_cast<size_t>(batch.maxBatchSize());
@@ -332,8 +332,6 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
         args.arena = arena;
         args.numRows = numRows;
         args.layerInGroup = layer;
-        args.numLayers = numLayers;
-        args.entriesPerLayer = entriesPerLayer;
         args.selected = reinterpret_cast<int32_t const*>(selection.get()) + selectionOffset;
         args.selectionWidth = selectionWidth;
         // The hook works in units, so one token is one unit.
@@ -386,6 +384,14 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     std::vector<int32_t> const& missSlot, std::vector<int32_t> const& missCount, int selectionWidth,
     std::vector<int32_t> const& bufferLayer, bool writeBack, int gridCtas)
 {
+    // The row's lease is what says whether it holds a reservation, so a negative one asks
+    // the kernel to skip the very copy this probe exists to run.
+    if (baseCell < 0)
+    {
+        throw std::invalid_argument(
+            "KvCacheIntrospection::sparseUnitCopy: baseCell names an arena cell and "
+            "cannot be negative");
+    }
     CUstream const stream = nullptr;
     CUdeviceptr hostPtr = 0;
     cuCheck(cuMemAlloc(&hostPtr, hostPool.size()));
@@ -538,7 +544,6 @@ KvCacheIntrospection::SparseFlushList KvCacheIntrospection::sparseFlushList(std:
     args.leases = reinterpret_cast<int32_t const*>(leases.get());
     args.arena = arena;
     args.numRows = 1;
-    args.numLayers = numLayers;
     args.fromUnits = reinterpret_cast<int32_t const*>(from.get());
     args.toUnits = reinterpret_cast<int32_t const*>(to.get());
     args.work.row = reinterpret_cast<int32_t*>(outRow.get());

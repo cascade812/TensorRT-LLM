@@ -789,7 +789,7 @@ __global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushLis
         // sized for the widest row.
         if (threadIdx.x == 0)
         {
-            args.outCount[static_cast<ptrdiff_t>(row) * args.numLayers + layer] = 0;
+            args.outCount[static_cast<ptrdiff_t>(row) * args.arena.numLayers + layer] = 0;
         }
         return;
     }
@@ -830,7 +830,7 @@ __global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushLis
             // can move together. Running past it means the budget the Batch was given is not
             // the one the caller honoured.
             KVCM2_SPARSE_REQUIRE(base + claimed <= args.work.capacity);
-            args.outCount[static_cast<ptrdiff_t>(row) * args.numLayers + layer] = claimed;
+            args.outCount[static_cast<ptrdiff_t>(row) * args.arena.numLayers + layer] = claimed;
         }
     }
     __syncthreads();
@@ -899,7 +899,7 @@ void launchSparseOutIndices(SparseOutIndexArgs const& args, CUstream stream)
 
 void launchSparseFlushList(SparseFlushListArgs const& args, CUstream stream)
 {
-    if (args.numRows <= 0 || args.numLayers <= 0)
+    if (args.numRows <= 0 || args.arena.numLayers <= 0)
     {
         throw std::invalid_argument("launchSparseFlushList: rows and layers must be positive");
     }
@@ -908,11 +908,11 @@ void launchSparseFlushList(SparseFlushListArgs const& args, CUstream stream)
         throw std::invalid_argument("launchSparseFlushList: every device array must be provided");
     }
     checkWorkList(args.work, "launchSparseFlushList");
-    if (args.work.numLists != args.numLayers)
+    if (args.work.numLists != args.arena.numLayers)
     {
         throw std::invalid_argument("launchSparseFlushList: a write-back needs one work list per layer");
     }
-    dim3 const grid(static_cast<unsigned>(args.numLayers), static_cast<unsigned>(args.numRows));
+    dim3 const grid(static_cast<unsigned>(args.arena.numLayers), static_cast<unsigned>(args.numRows));
     tensorrt_llm::common::launchWithPdlWhenEnabled(
         "sparseFlushList", sparseFlushListKernel, grid, kThreads, 0, reinterpret_cast<cudaStream_t>(stream), args);
 }
@@ -1003,7 +1003,7 @@ size_t sparseResolveSharedBytes(int32_t entriesPerLayer, int32_t selectionWidth,
 
 void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
 {
-    if (args.numLayers <= 0 || args.entriesPerLayer <= 0 || args.selectionWidth < 0 || args.numRows <= 0)
+    if (args.arena.numLayers <= 0 || args.arena.entriesPerLayer <= 0 || args.selectionWidth < 0 || args.numRows <= 0)
     {
         throw std::invalid_argument("launchSparseResolve: rows, layers and entries must be positive");
     }
@@ -1013,7 +1013,7 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
     {
         throw std::invalid_argument("launchSparseResolve: a resolve with no selection must have an in-flight span");
     }
-    if (args.layerInGroup < 0 || args.layerInGroup >= args.numLayers)
+    if (args.layerInGroup < 0 || args.layerInGroup >= args.arena.numLayers)
     {
         throw std::invalid_argument("launchSparseResolve: layerInGroup must name a layer of the group");
     }
@@ -1041,9 +1041,9 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
     }
 
     if (args.selectionWidth == 0 && args.maxInFlightUnits == 1
-        && sizeof(int32_t) * static_cast<size_t>(args.entriesPerLayer) <= 32U * 1024U)
+        && sizeof(int32_t) * static_cast<size_t>(args.arena.entriesPerLayer) <= 32U * 1024U)
     {
-        size_t const shared = sizeof(int32_t) * static_cast<size_t>(args.entriesPerLayer);
+        size_t const shared = sizeof(int32_t) * static_cast<size_t>(args.arena.entriesPerLayer);
         tensorrt_llm::common::launchWithPdlWhenEnabled("sparsePrepareWrite", sparsePrepareWriteKernel,
             dim3(static_cast<unsigned>(args.numRows)), dim3(kThreads), shared, reinterpret_cast<cudaStream_t>(stream),
             args);
@@ -1052,7 +1052,8 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
 
     // entriesPerLayer belongs to the layer group, so one size and one grid serve every row.
     int32_t const tableSize = nextPow2(2 * (args.maxInFlightUnits + args.selectionWidth));
-    size_t const shared = sparseResolveSharedBytes(args.entriesPerLayer, args.selectionWidth, args.maxInFlightUnits);
+    size_t const shared
+        = sparseResolveSharedBytes(args.arena.entriesPerLayer, args.selectionWidth, args.maxInFlightUnits);
 
     CUdevice device = 0;
     cuCheck(cuCtxGetDevice(&device));

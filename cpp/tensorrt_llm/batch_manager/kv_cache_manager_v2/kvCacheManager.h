@@ -440,9 +440,6 @@ public:
     //! fail -- but their shape follows from the pool layout, so a caller need not re-derive it.
     [[nodiscard]] std::vector<IndexTableSpec> sparseIndexTableSpecs() const;
 
-    //! Multiprocessors of the device this manager runs on, read once on first use.
-    mutable int32_t mSmCount = 0;
-
     //! Base of the sparse cache arena region backing this buffer, for a consumer reading
     //! units the fetch resolved. Throws when the buffer has no sparse fetch path.
     //!
@@ -591,8 +588,15 @@ private:
     //! one per layer and pool. A caller that wants only some buffers clips each run to them.
     [[nodiscard]] std::vector<SparseCopyRun> _sparseCopyTemplates(LifeCycleId lifeCycle) const;
 
-    //! CTAs a copy over a list of `workCapacity` entries should launch.
-    [[nodiscard]] int32_t _sparseCopyGridCtas(int32_t workCapacity) const;
+    //! Multiprocessors of the device this manager runs on, for sizing a copy's grid.
+    [[nodiscard]] int32_t _smCount() const noexcept
+    {
+        return mSmCount;
+    }
+
+    //! Behind a driver call, and the sparse copy wants it per launch, so it is read once at
+    //! construction.
+    int32_t mSmCount = 0;
 
     //! This life cycle's arena of GPU cells, from which a request takes its lease at
     //! resume(). Empty when the life cycle has no sparse fetch path configured.

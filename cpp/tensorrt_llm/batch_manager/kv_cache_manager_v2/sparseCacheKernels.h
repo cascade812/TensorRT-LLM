@@ -118,10 +118,6 @@ struct SparseResolveArgs
     //! Which of the life cycle's layers this call resolves: the metadata row every sparse
     //! buffer of that layer shares.
     int32_t layerInGroup;
-    //! Shape shared by every row's view. Passed separately because the host needs them to
-    //! size shared memory and the grid before any view can be read.
-    int32_t numLayers;
-    int32_t entriesPerLayer;
 
     //! [numRows][selectionWidth] unit ordinals, negative where the selection is padded.
     //! Ordinals must be unique within a row; duplicates would be resolved as separate
@@ -432,9 +428,6 @@ struct SparseFlushListArgs
     //! The life cycle's arena, which every row's lease is addressed within.
     SparseArenaView arena;
     int32_t numRows = 0;
-    //! Layers of this life cycle. The grid needs it on the host, and every row of one life
-    //! cycle has the same count.
-    int32_t numLayers = 0;
 
     //! [numRows] each: the unit ordinals that row's watermark moved across, as [from, to).
     //! Device resident for the same reason the resolve's watermarks are.

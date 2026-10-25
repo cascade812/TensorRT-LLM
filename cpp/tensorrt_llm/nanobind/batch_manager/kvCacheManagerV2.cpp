@@ -2446,8 +2446,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         "between wait_published() and the next publish(): before the first the upload filling "
         "it may not have landed, and once the second is enqueued the upload stream is free to "
         "overwrite it.");
-    mIntrospection.def("batch_sparse_view_entries", &kv::KvCacheIntrospection::batchSparseViewEntries, nb::arg("batch"),
-        nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def("batch_sparse_entries_per_row", &kv::KvCacheIntrospection::batchSparseEntriesPerRow,
+        nb::arg("batch"), nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "batch_watermarks",
         [](kv::Batch const& batch)

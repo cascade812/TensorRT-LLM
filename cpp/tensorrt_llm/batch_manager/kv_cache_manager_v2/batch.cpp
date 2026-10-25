@@ -1662,8 +1662,6 @@ void Batch::prepareSparseWriteIndices(
     resolve.arena = arena;
     resolve.numRows = numRows;
     resolve.layerInGroup = span.layerInGroup;
-    resolve.numLayers = mManager->_sparseCacheLayerCount(lcId);
-    resolve.entriesPerLayer = mManager->_sparseCacheSubSlotsPerBuffer(lcId) * unitsPerPage;
     resolve.selectionWidth = 0;
     resolve.historyTokens = reinterpret_cast<int32_t const*>(marks.historyLength);
     resolve.capacityTokens = reinterpret_cast<int32_t const*>(marks.capacity);
@@ -1739,7 +1737,6 @@ void Batch::writeBackSparseUnits(LifeCycleId lifeCycle, CUstream stream)
     listArgs.leases = leases;
     listArgs.arena = arena;
     listArgs.numRows = numRows;
-    listArgs.numLayers = scratch.numLayers;
     listArgs.fromUnits = flushFromUnits(lifeCycle);
     listArgs.toUnits = flushToUnits(lifeCycle);
     listArgs.work = scratch.flushWork;
@@ -1761,7 +1758,7 @@ void Batch::writeBackSparseUnits(LifeCycleId lifeCycle, CUstream stream)
     // unlike a fetch, which resolves one layer across the whole batch.
     copy.work = scratch.flushWork;
     copy.bufferLayer = mManager->_sparseArena(lifeCycle).bufferLayer();
-    copy.gridCtas = mManager->_sparseCopyGridCtas(scratch.flushWork.capacity);
+    copy.gridCtas = sparseCopyGridCtas(scratch.flushWork.capacity, mManager->_smCount());
     launchSparseUnitCopy(copy, stream);
 }
 
@@ -1856,8 +1853,6 @@ void Batch::fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const
     resolve.arena = arena;
     resolve.numRows = numRows;
     resolve.layerInGroup = layerInGroup;
-    resolve.numLayers = mManager->_sparseCacheLayerCount(lcId);
-    resolve.entriesPerLayer = mManager->_sparseCacheSubSlotsPerBuffer(lcId) * unitsPerPage;
     resolve.selected = selected;
     resolve.selectionWidth = selectionWidth;
     resolve.historyTokens = reinterpret_cast<int32_t const*>(marks.historyLength);
@@ -1893,7 +1888,7 @@ void Batch::fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const
     copy.unitsPerPage = unitsPerPage;
     copy.work = layerWork;
     copy.bufferLayer = mManager->_sparseArena(lcId).bufferLayer();
-    copy.gridCtas = mManager->_sparseCopyGridCtas(scratch.fetchWork.capacity);
+    copy.gridCtas = sparseCopyGridCtas(scratch.fetchWork.capacity, mManager->_smCount());
     launchSparseUnitCopy(copy, stream);
 
     // The index table the attention kernel reads is derived from the resolve's slots alone:
