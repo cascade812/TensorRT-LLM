@@ -92,11 +92,19 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, std::vector<IndexTableSpe
                     : PageIndexMode::PER_LAYER);
     }
 
+    // After the modes, which decide where a life cycle puts its base, and before the staging
+    // block, whose tail is sized by how many scratch slots the tables say a row can hold.
+    _buildIndexTables(indexTables);
+    _checkSparseRunsAreAddressable();
+    auto tables = _layoutIndexTables();
+    auto const scratchElements = tables.value().value_or(0);
+    mUploadBytes = _totalBytes() + sizeof(int32_t) * scratchElements;
+
     // Page tables and watermarks are published together, so a kernel cannot read one step's
     // table beside another step's lengths -- an out-of-range read rather than a stale
     // answer.
     auto const elements = _totalElements();
-    mStaging = StaticHostMem(_totalBytes());
+    mStaging = StaticHostMem(mUploadBytes);
     auto* staging = reinterpret_cast<int32_t*>(mStaging.address());
     // A row that no member occupies must still read as "no such block" rather than as slot
     // zero, since the fetch has no other way to tell them apart.
@@ -109,18 +117,34 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, std::vector<IndexTableSpe
     auto const numViews = static_cast<size_t>(mManager->numLifeCycles().value()) * static_cast<size_t>(mMaxBatchSize);
     std::fill(views, views + numViews, SparseCacheView{});
 
+    // The scratch slot metadata is the block's tail, so one transfer per step carries it
+    // along with the page tables rather than needing a second.
+    mScratchStaging = reinterpret_cast<int32_t*>(reinterpret_cast<std::byte*>(mStaging.address()) + _totalBytes());
+    if (scratchElements > 0)
+    {
+        // A zero range leaves every block on the plain path, which is what a member holding
+        // no scratch looks like. The slots behind the ranges hold the sentinel instead,
+        // since zero there would name slot zero.
+        auto const ranges
+            = 2 * static_cast<size_t>(mManager->numLifeCycles().value()) * static_cast<size_t>(mMaxBatchSize);
+        std::fill(mScratchStaging, mScratchStaging + ranges, 0);
+        std::fill(mScratchStaging + ranges, mScratchStaging + scratchElements, kBadPageIndex.value());
+    }
+
     // The staging mirrors the device block exactly, so publishing it is one linear copy.
     // It doubles what a Batch costs in device memory, which is the price of letting the
-    // host-to-device crossing overlap the previous step.
+    // host-to-device crossing overlap the previous step. Only the part a captured graph
+    // reads is carried on to mDevice; the scratch tail is read from the staging itself.
     mDevice = allocateDeviceMemory(_totalBytes());
-    mDeviceStaging = allocateDeviceMemory(_totalBytes());
-    auto const device = reinterpret_cast<CUdeviceptr>(mDevice.get());
-    auto const deviceStaging = reinterpret_cast<CUdeviceptr>(mDeviceStaging.get());
+    mDeviceStaging = allocateDeviceMemory(mUploadBytes);
+    auto* const deviceStaging = reinterpret_cast<std::byte*>(mDeviceStaging.get());
+    cuCheck(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(mDevice.get()), staging, _totalBytes(), cudaStream()));
+    cuCheck(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(deviceStaging), staging, mUploadBytes, cudaStream()));
 
-    for (auto const base : {device, deviceStaging})
-    {
-        cuCheck(cuMemcpyHtoDAsync(base, staging, _totalBytes(), cudaStream()));
-    }
+    // Hands the layout its slice of the block above and lets it build the descriptors,
+    // which name both that block's head and its scratch tail.
+    tables.send(reinterpret_cast<int32_t*>(deviceStaging + _totalBytes()));
+    TLLM_CHECK_WITH_INFO(tables.done(), "The index table layout asked for memory twice");
 
     {
         // Each generator yields what it needs and then fills the slice it is handed, so
@@ -147,11 +171,6 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, std::vector<IndexTableSpe
             TLLM_CHECK_WITH_INFO(layout.done(), "A layout generator asked for memory twice");
         }
     }
-
-    // After the modes: a request's offsets depend on where its life cycle puts the base.
-    _buildIndexTables(indexTables);
-    _checkSparseRunsAreAddressable();
-    _allocateIndexTables();
 
     // Last: a descriptor names where in the index tables a buffer's converted indices sit.
     _allocateCopyDesc();
@@ -722,11 +741,11 @@ void Batch::_checkSparseRunsAreAddressable() const
     }
 }
 
-void Batch::_allocateIndexTables()
+Batch::LayoutGenerator Batch::_layoutIndexTables()
 {
     if (mIndexTables.empty())
     {
-        return;
+        co_return;
     }
 
     // Scratch-capable life cycles sort last so that one launch covers the plain tables and
@@ -765,28 +784,15 @@ void Batch::_allocateIndexTables()
     }
 
     // With no slot any member can reach there is nothing to substitute, so every table takes
-    // the plain path and the scratch kernel never runs over staging that was not allocated.
+    // the plain path and the scratch kernel never runs over a tail that is not there.
     if (mMaxScratchSlots == 0)
     {
         mNumPlainTables = static_cast<int>(mIndexTables.size());
     }
 
-    if (mMaxScratchSlots > 0)
-    {
-        auto const elements = _scratchElements();
-        mScratchStaging = StaticHostMem(sizeof(int32_t) * elements);
-        auto* host = reinterpret_cast<int32_t*>(mScratchStaging.address());
-        // A zero range leaves every block on the plain path, which is what a member holding
-        // no scratch looks like. The slots behind the ranges hold the sentinel instead,
-        // since zero there would name slot zero.
-        auto const ranges
-            = 2 * static_cast<size_t>(mManager->numLifeCycles().value()) * static_cast<size_t>(mMaxBatchSize);
-        std::fill(host, host + ranges, 0);
-        std::fill(host + ranges, host + elements, kBadPageIndex.value());
-        mScratchDevice = allocateDeviceMemory<int32_t>(elements);
-        cuCheck(cuMemcpyHtoDAsync(
-            reinterpret_cast<CUdeviceptr>(mScratchDevice.get()), host, sizeof(int32_t) * elements, cudaStream()));
-    }
+    // Everything above only sized the scratch tail; everything below names addresses within
+    // the block the caller allocates from it.
+    mScratchDevice = co_yield _scratchElements();
 
     auto const rowBlocks = static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(mMaxBlocksPerSeq);
     size_t elements = 0;
@@ -836,7 +842,7 @@ void Batch::_allocateIndexTables()
         {
             auto const row = static_cast<size_t>(mMaxBatchSize);
             auto const lc = static_cast<size_t>(table.lifeCycle.value());
-            auto const begs = reinterpret_cast<CUdeviceptr>(mScratchDevice.get());
+            auto const begs = reinterpret_cast<CUdeviceptr>(mScratchDevice);
             auto const groups = static_cast<size_t>(mManager->numLifeCycles().value());
             desc.scratchBegs = reinterpret_cast<int32_t const*>(begs + sizeof(int32_t) * lc * row);
             desc.scratchEnds = reinterpret_cast<int32_t const*>(begs + sizeof(int32_t) * (groups * row + lc * row));
@@ -913,6 +919,11 @@ Batch::SparseIndexRun Batch::sparseIndexRun(LayerId layerId, DataRole const& rol
 
 size_t Batch::_scratchElements() const noexcept
 {
+    // No table takes the substituting path, so nothing would read a range or a slot.
+    if (mMaxScratchSlots == 0)
+    {
+        return 0;
+    }
     auto const rows = static_cast<size_t>(mMaxBatchSize);
     auto const groups = static_cast<size_t>(mManager->numLifeCycles().value());
     // [begs][ends][slots], each indexed by life cycle then row.
@@ -921,13 +932,13 @@ size_t Batch::_scratchElements() const noexcept
 
 void Batch::_stageScratch()
 {
-    if (mScratchStaging.empty())
+    if (mMaxScratchSlots == 0)
     {
         return;
     }
     auto const rows = static_cast<size_t>(mMaxBatchSize);
     auto const groups = static_cast<size_t>(mManager->numLifeCycles().value());
-    auto* const begs = reinterpret_cast<int32_t*>(mScratchStaging.address());
+    auto* const begs = mScratchStaging;
     auto* const ends = begs + groups * rows;
 
     // Only the ranges: a member's slot ids reach its row as they change, through the
@@ -1137,8 +1148,7 @@ int32_t* Batch::_scratchSlotRow(LifeCycleId lifeCycleId, int row) const
     auto const rows = static_cast<size_t>(mMaxBatchSize);
     auto const groups = static_cast<size_t>(mManager->numLifeCycles().value());
     auto const flat = static_cast<size_t>(lifeCycleId.value()) * rows + static_cast<size_t>(row);
-    auto* base = reinterpret_cast<int32_t*>(mScratchStaging.address());
-    return base + 2 * groups * rows + flat * static_cast<size_t>(mMaxScratchSlots);
+    return mScratchStaging + 2 * groups * rows + flat * static_cast<size_t>(mMaxScratchSlots);
 }
 
 int Batch::addKvCache(KvCache& kvCache, std::optional<int> requestedRow)
@@ -1484,15 +1494,10 @@ void Batch::publish()
         mStagingRead.close();
     }
 
-    // One transfer for the whole table rather than one per changed row: a single driver
-    // call on the upload stream overlaps compute, where per-row copies would cost a launch
-    // apiece.
-    cuCheck(cuMemcpyHtoDAsync(staging, reinterpret_cast<void*>(mStaging.address()), _totalBytes(), upload));
-    if (!mScratchStaging.empty())
-    {
-        cuCheck(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(mScratchDevice.get()),
-            reinterpret_cast<void*>(mScratchStaging.address()), sizeof(int32_t) * _scratchElements(), upload));
-    }
+    // One transfer for the whole block rather than one per changed row, or one per region:
+    // a single driver call on the upload stream overlaps compute, where the alternatives
+    // cost a launch apiece on the step's critical path.
+    cuCheck(cuMemcpyHtoDAsync(staging, reinterpret_cast<void*>(mStaging.address()), mUploadBytes, upload));
     mPublished = mUploadStream.recordEvent();
 
     // The staging now holds this step's tables, so carrying them across is all that is

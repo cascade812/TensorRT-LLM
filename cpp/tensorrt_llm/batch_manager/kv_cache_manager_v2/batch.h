@@ -429,9 +429,17 @@ public:
     //!
     //! `stream` defaults to the Batch's own, which is the only correct choice while the
     //! layers are fetched in order: a layer's selection comes from the one before it. Name
-    //! a stream only to run ahead of that -- a model that fetches several layers early can
-    //! do so on its own -- and then order it against the Batch's stream yourself, because
-    //! the resolve's scratch and counters are Batch state the step clears on that stream.
+    //! a stream to run ahead of that -- a model that fetches several layers early can do so
+    //! on its own -- or to be captured, since a captured fetch must name the capture stream.
+    //!
+    //! Naming one moves the ordering to the caller, once per step rather than once per call:
+    //! `stream` must wait on the Batch's stream after the publish() that prepared the step,
+    //! and the Batch's stream must wait on `stream` before any call that begins the next one.
+    //! Fetches within a step need no join between them, which is what naming a stream buys.
+    //! Capturing them and replaying the graph on the Batch's stream satisfies both.
+    //!
+    //! Both halves are load-bearing: the resolve reads Batch state the publish wrote, and
+    //! writes a row's residency back into state the next step rewrites on the Batch's stream.
     void fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
         int32_t* out, std::optional<CUstream> stream = std::nullopt);
 
@@ -564,6 +572,10 @@ private:
 
     //! Write back every row's crossed units for one life cycle, from the ranges the Batch
     //! staged. One scan over (layer, row), then one copy per pool covering the whole batch.
+    //!
+    //! `stream` carries the same obligations as fetchSparsePages' when it is not the
+    //! Batch's own; unlike there it has no default, so a caller naming the Batch's stream
+    //! is opting into the simple case rather than out of it.
     void writeBackSparseUnits(LifeCycleId lifeCycle, CUstream stream);
 
     //! One layer group's page table on the device, which the index conversion reads.
@@ -763,8 +775,10 @@ private:
     //! cannot be addressed produces wrong page addresses at step time rather than an error.
     void _checkSparseRunsAreAddressable() const;
 
-    //! Allocate the tables and the device-side descriptors the conversion reads.
-    void _allocateIndexTables();
+    //! Sorts the tables, settles how many scratch slots a row may hold, and yields what
+    //! that costs; resumes with the uploaded block's scratch tail and builds the tables
+    //! and the device-side descriptors the conversion reads.
+    LayoutGenerator _layoutIndexTables();
 
     //! Stage each member's scratch block range, for the life cycles that can hold scratch.
     void _stageScratch();
@@ -773,9 +787,12 @@ private:
     [[nodiscard]] size_t _scratchElements() const noexcept;
 
     //! Host and device sides of the scratch metadata, laid out [begs][ends][slots].
-    //! Empty when no table's life cycle can hold scratch.
-    StaticHostMem mScratchStaging;
-    CudaUniqPtr<int32_t> mScratchDevice;
+    //!
+    //! Both point into the tail of the uploaded block rather than owning anything, which
+    //! is what lets one transfer carry them along with the page tables. Addressable only
+    //! when mMaxScratchSlots is positive; the tail is empty otherwise.
+    int32_t* mScratchStaging = nullptr;
+    int32_t* mScratchDevice = nullptr;
     //! Slot ids a request may hold for one life cycle, which bounds the staging.
     int mMaxScratchSlots = 0;
     //! Tables whose life cycle can hold scratch sort last, so one launch covers each kind.
@@ -791,8 +808,12 @@ private:
     int mMaxTableEntries = 0;
 
     //! Pinned so the members' index writes land here with no extra copy, and so the
-    //! publish is a single asynchronous transfer per layer group.
+    //! publish is a single asynchronous transfer. Holds the page tables, the row state and
+    //! the views, then the scratch metadata.
     StaticHostMem mStaging;
+
+    //! Bytes of that block, and so of each step's transfer.
+    size_t mUploadBytes = 0;
 
     //! What the fetch reads. Its address is baked into a captured graph, so it is written
     //! only on the caller's stream, after the replay that read the previous publish.
