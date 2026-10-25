@@ -280,9 +280,8 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
                 ++dense;
             }
         }
-        // Without a dense pool the group has no device bytes per slot and so no slot
-        // count to derive. Only the GPU tier needs this: sparsity exists at the hot level
-        // alone, so a cold level's groups size entirely from their own quota.
+        // Only the GPU tier needs this: sparsity exists at the hot level alone, so a cold
+        // level's groups size entirely from their own quota.
         TLLM_CHECK_WITH_INFO(dense > 0,
             "A pool group must hold at least one non-sparse pool; a wholly sparse group has no device "
             "bytes from which to size its slots");
@@ -346,17 +345,11 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     mLevels.reserve(config.cacheTiers.size());
 
-    // A sparse buffer's hot pages are host memory: its history is too large for device
-    // memory and is read through the sparse cache rather than directly. Which pools those
-    // are is declared per pool by SlotDesc, so a life cycle may hold both kinds and the
-    // GPU tier host-backs exactly the sparse ones.
-    //
-    // Their bytes are excluded from the quota rather than sized from it: a slot spans every
-    // pool of its group, so a sparse pool's row count follows from the group's device-backed
-    // pools, which the quota does size.
+    // A sparse pool's hot pages are host memory. Its bytes are excluded from the GPU quota
+    // rather than sized from it: a slot spans every pool of its group, so a sparse pool's
+    // row count follows from the group's device-backed pools, which the quota does size.
     mHostSparsePoolQuota = config.hostSparsePoolQuota;
-    // Derived from the descriptors here because the level's storage does not exist yet; every
-    // path afterwards asks the pool groups themselves, which carry the same sparsity.
+    // From the descriptors: the level's storage does not exist yet.
     auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mHotMinSlots,
         gpuGranularity, _secondaryBudget(sparsePools, hostMemSizeGranularity(), config.hostSparsePoolQuota));
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
@@ -467,9 +460,6 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
             continue;
         }
         size_t const granularity = tierCommitUnit(tierConfig, gpuGranularity);
-        // No second budget, for the reason the build loop below gives: a cold group is a
-        // single pool whose quota pays for everything the codec packs into it, so no pool
-        // of it is charged elsewhere and the floor here covers them all.
         if (size_t const minQuota = minQuotaForLevel(coldSlotSizeLists, granularity, coldMinSlots);
             *maxQuota < minQuota)
         {
@@ -671,8 +661,8 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
 
     CacheLevel const coldLevel = srcIsHot ? dstLevel : srcLevel;
     PoolGroupIndex const coldPgIdx = srcIsHot ? dstPgIdx : srcPgIdx;
-    // The level's tier, not poolMedium(): only a GPU-tier pool is ever host-backed, and a
-    // cold level has none, so the two agree here and this asks about the level's own medium.
+    // Only a GPU-tier pool is ever host-backed, so for a cold level cacheTier() and
+    // poolMedium() agree.
     CacheTier const coldTier = cacheTier(coldLevel);
     size_t const coldPageBytes = slotSize(coldLevel, coldPgIdx).at(PoolIndex{0});
     PageIndexLocation const pageIndexLocation = mPageIndexLocations.at(batchingLayerGroupId);
@@ -2165,8 +2155,6 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(Cac
     return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots, secondBudget);
 }
 
-//! The sparse host budget as the allocator takes it, or nullopt when unbounded.
-//!
 //! Host-backed pools round to HostMem::sizeGranularity(), not to the device granularity, so the
 //! budget is counted in that grain: charging them in device grains would over-count every
 //! pool of every group by up to one device grain.
@@ -2225,7 +2213,6 @@ HostMemBackingOptions StorageManager::tierBackingOptions(CacheTierConfig const& 
 
 TypedVec<PoolGroupIndex, SlotCount> StorageManager::_minSlotsFor(CacheLevel level) const
 {
-    // Constraints are hot-level feasibility floors; other levels need only the structural one.
     return level == kHotLevel ? mHotMinSlots : TypedVec<PoolGroupIndex, SlotCount>(numPoolGroups(level), SlotCount{1});
 }
 
@@ -2270,8 +2257,6 @@ TypedVec<PoolGroupIndex, float> StorageManager::constrainPoolGroupRatio(
     TypedVec<PoolGroupIndex, float> const& ratio) const
 {
     auto& gpuStorage = *mLevels[kHotLevel].storage;
-    // The same budgets the allocator will actually use, or the ratio this derives would
-    // describe a layout the next rebalance cannot produce.
     auto slotCountList = slotCountsForLevel(kHotLevel, gpuStorage.roundedNumBytes(gpuStorage.cacheTier()), ratio);
     // All-bytes, each medium in its own grain -- the same measure ratioList() reports, so
     // the target this derives and the layout a rebalance then achieves are comparable. They

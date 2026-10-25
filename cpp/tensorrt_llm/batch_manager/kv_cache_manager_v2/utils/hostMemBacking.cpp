@@ -57,8 +57,7 @@ size_t commitAlignment()
 size_t hostMemSizeGranularity() noexcept
 {
     // A page is the only hard bound; 2 MiB is the floor because that is the huge page the
-    // backing asks for, and a size quantized below it would straddle one for no gain. The
-    // max is there so a platform with larger pages would still work.
+    // backing asks for, and a size quantized below it would straddle one for no gain.
     static size_t const unit = std::max(size_t{2} << 20, commitAlignment());
     return unit;
 }
@@ -68,7 +67,7 @@ namespace
 
 //! Bytes one step populates. Large enough that the call overhead disappears against the
 //! faulting, small enough that a caller publishing progress between steps releases an
-//! early waiter early. An implementation detail of the fill: nothing outside sees it.
+//! early waiter early.
 constexpr size_t kCommitChunkSize = 32ULL << 20;
 
 //! Bytes one registration covers, before the register unit rounds it down. Near the commit
@@ -187,8 +186,7 @@ void bindRangeToGpuNumaNode(MemAddress addr, size_t size, bool allowRemoteFallba
 HostMemBacking::HostMemBacking(size_t vmSize, HostMemBackingOptions const& options)
     : mUnit(hostMemSizeGranularity())
     , mRegUnit(std::max<size_t>(options.registerUnit, 1))
-    // Whole register units, so no bound falls inside one. Where a register unit is
-    // larger than the target, one of them is the smallest chunk there can be.
+    // Whole register units, so no bound falls inside one.
     , mRegChunk(std::max(kRegisterChunkTarget / mRegUnit * mRegUnit, mRegUnit))
     , mAllowRemoteNumaFallback(options.allowRemoteNumaFallback)
 {
@@ -196,13 +194,11 @@ HostMemBacking::HostMemBacking(size_t vmSize, HostMemBackingOptions const& optio
     {
         return;
     }
-    // The caller rounds. Doing it here would hand back a reservation larger than the one
-    // asked for, which the caller would then not know it could resize into.
+    // The caller rounds: a reservation silently made larger is one the caller does not
+    // know it can resize into.
     TLLM_CHECK_WITH_INFO(
         vmSize % mUnit == 0, "HostMemBacking reservation %zu is not a multiple of the granularity %zu", vmSize, mUnit);
 
-    // Captured here rather than in a step: this runs on the thread that owns the
-    // context, while the fill worker only sets the device.
     cuCheck(cuCtxGetCurrent(reinterpret_cast<CUcontext*>(&mContext)));
     TLLM_CHECK_WITH_INFO(mContext != nullptr, "HostMemBacking needs a current CUDA context");
 
@@ -314,13 +310,10 @@ void HostMemBacking::registerUpTo(size_t end, bool allowPartialChunk)
     while (mRegisteredEnd < target)
     {
         // Rounding up from one past the start stops at the next chunk boundary, so
-        // no registration ever spans one. That is what lets the start of the
-        // registration covering a byte be derived from the boundary below it.
+        // no registration ever spans one.
         size_t const chunkEnd = std::min(roundUp(mRegisteredEnd + 1, mRegChunk), target);
         if (!allowPartialChunk && chunkEnd % mRegChunk != 0)
         {
-            // Leaving it to the next step, which will register it as part of a
-            // whole chunk rather than pinning it on its own.
             return;
         }
         CUresult const registered = cuMemHostRegister(reinterpret_cast<void*>(mAddr + mRegisteredEnd),

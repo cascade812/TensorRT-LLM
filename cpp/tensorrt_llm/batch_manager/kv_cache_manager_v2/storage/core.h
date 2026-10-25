@@ -219,10 +219,9 @@ inline size_t hotPoolSizeGranularity(CacheTier medium, size_t deviceGranularity)
 //! Unit a tier of the given size allocates and releases physical memory in,
 //! and therefore the quantum its pool sizes are rounded to.
 //!
-//! For GPU and host it scales with the tier: 2 MiB for small tiers, rising to
-//! 32 MiB, beyond which larger units measure no faster. A resize can give
-//! memory back only in whole units, so this trades that precision against the
-//! per-allocation cost.
+//! For GPU it scales with the tier: 2 MiB for small tiers, rising to 32 MiB, beyond
+//! which larger units measure no faster. A resize can give memory back only in whole
+//! units, so this trades that precision against the per-allocation cost.
 //!
 //! This is the policy. What a given StorageManager actually uses for a tier can
 //! differ -- see StorageManager::tierCommitUnit -- because every GPU level
@@ -274,8 +273,7 @@ public:
     //! Block until the backing for every slot up to `slot` exists.
     //!
     //! Only a progressively filled pool has anything to wait for; the rest are backed when
-    //! they are built, so this does nothing for them. The owning group calls it once per
-    //! slot it hands out, which is the single point every later use passes through.
+    //! they are built, so this does nothing for them.
     virtual void waitSlotUsable(SlotId) const {}
 
     virtual void destroy() = 0;
@@ -329,9 +327,7 @@ public:
     //!
     //! The backing memory is committed on a worker thread, so a slot may exist
     //! before it is backed. Closing that gap is the owning pool group's job: it
-    //! calls waitSlotUsable() before returning a slot from allocate(), which is
-    //! the single point every later use of that slot passes through. Readers of
-    //! slotAddress() must not wait again -- see HostMem's constructor.
+    //! calls waitSlotUsable() before returning a slot from allocate().
     HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, HostMemBackingOptions const& options);
 
     SlotCount numSlots() const noexcept override;
@@ -353,7 +349,7 @@ public:
     }
 
     //! Blocks until `slot` is backed by physical memory, rethrowing the fill worker's
-    //! exception if the fill failed. This is the pool that has a fill to wait on.
+    //! exception if the fill failed.
     void waitSlotUsable(SlotId slot) const override;
 
 private:
@@ -377,8 +373,6 @@ public:
     void resize(SlotCount newNumSlots) override;
     Address slotAddress(SlotId slot) const override;
 
-    //! A fixed quantum: a disk pool's file grows by whatever is asked of it, so this is
-    //! a sizing convention rather than an allocator's unit.
     [[nodiscard]] size_t sizeGranularity() const noexcept override
     {
         return kDiskPoolSizeGranularity;
@@ -421,13 +415,9 @@ public:
     //! poolMedium().
     [[nodiscard]] virtual CacheTier cacheTier() const noexcept = 0;
 
-    //! What one pool's pages actually are, which is what anything naming the medium of an
-    //! address needs: a copy implementation, an allocator, a rounding grain, a page
-    //! descriptor.
-    //!
-    //! Read from the pool, so it is cacheTier() for every pool of every group except a
+    //! What one pool's pages actually are. This is cacheTier() for every pool except a
     //! host-backed pool of a GPU-tier group, where the group's tier would name device
-    //! memory for a host address. Ask per pool, not per group.
+    //! memory for a host address.
     [[nodiscard]] CacheTier poolMedium(PoolIndex poolIdx) const
     {
         return mPools.at(poolIdx)->medium();
@@ -459,9 +449,8 @@ public:
     //!
     //! The wait is the whole of a group's fill synchronization, and this is the single
     //! point every later use of a slot passes through. Nothing downstream -- not
-    //! slotAddress(), not a device mapping read from it -- needs to wait again, and a
-    //! wait added there would only pay for a check that cannot fail. A pool with no fill
-    //! to wait on answers at once, so a device-only group pays nothing but the call.
+    //! slotAddress(), not a device mapping read from it -- waits again. A pool with no
+    //! fill to wait on answers at once.
     Slot allocate();
     std::vector<Slot> allocateMultiple(SlotCount numSlots);
     void release(Slot slot);
@@ -478,9 +467,7 @@ public:
     //! granularity -- but pools sharing a medium do not: the grain follows the medium's
     //! allocator, not the pool's slot size, which registration bounds absorb instead.
     //!
-    //! Per medium rather than per pool so that this and hotPoolSizeGranularity(), which
-    //! predicts the same number before any pool exists, are the same shape and can be held
-    //! to the same answer. Returns 0 if no pool of `medium` is here to ask.
+    //! Returns 0 if no pool of `medium` is here to ask.
     [[nodiscard]] size_t poolSizeGranularity(CacheTier medium) const
     {
         auto ofMedium = std::views::iota(0, mPools.size().value())
@@ -513,12 +500,10 @@ public:
 
     //! Bytes this group would hold at `slots`, each pool rounded to its own allocator's
     //! grain. An absent `medium` counts every pool; a named one counts only its own.
-    //! Stated at each call rather than defaulted: the two are different questions.
     //!
     //! One slot count for every pool, though pools can report different counts: each
-    //! rounds its own allocation up to its own grain, so the excess is under one grain and
-    //! rounding returns the allocation whichever count is used. That is what lets the
-    //! current-state total below share this.
+    //! rounds its own allocation up to its own grain, so the excess is under one grain
+    //! and rounding returns the allocation whichever count is used.
     [[nodiscard]] size_t roundedBytesWith(SlotCount slots, std::optional<CacheTier> medium) const
     {
         size_t total = 0;
@@ -542,8 +527,6 @@ public:
     //! roundedNumBytes(HOST_MEM) on a GPU-tier group is what it holds in host pages besides.
     [[nodiscard]] size_t roundedNumBytes(CacheTier medium) const
     {
-        // The group's count stands in for every pool's own: resizePools() hands them all the
-        // same one, and each pool's allocation is that count rounded to its own grain.
         return roundedBytesWith(numSlots(), medium);
     }
 
@@ -551,8 +534,7 @@ protected:
     // Mirrors Python _get_num_slots_from_pools: min(p.num_slots for p in pools).
     [[nodiscard]] SlotCount getNumSlotsFromPools() const noexcept;
 
-    //! Block until every pool backs the range ending just past `slot`. A pool with no
-    //! fill to wait on returns at once.
+    //! Block until every pool backs the range ending just past `slot`.
     void _waitSlotUsable(SlotId slot) const;
 
     SlotAllocator mSlotAllocator;
@@ -574,9 +556,9 @@ public:
     //! The group still reports GPU_MEM. Migration never reads the hot side's tier -- the
     //! codec path keeps only the cold side's -- and host memory is device-accessible, so a
     //! mixed group needs no second tier.
+    //!
     //! `hostOptions` backs the sparse pools. One object for the whole level, so every
-    //! host-backed pool of every group commits in one unit -- which is what lets
-    //! poolSizeGranularity(medium) speak of a grain per medium at all.
+    //! host-backed pool commits in the same unit.
     GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
         PooledPhysMemAllocator& physMemAllocator, TypedVec<PoolIndex, bool> sparsity = {},
         HostMemBackingOptions const& hostOptions = {});
@@ -627,8 +609,8 @@ public:
 //! A slot spans every pool of its group, so one slot count drives the bytes taken in every
 //! pool -- but the pools of the GPU tier are of two media, each with its own total and its
 //! own allocation grain. This names the second one. `pools[pg]` lists exactly the pools
-//! `quota` pays for; the primary selector passed beside it lists exactly the pools the
-//! primary quota pays for. The two are complements: no pool is named by both, and together
+//! `quota` pays for; the rest are what the primary quota pays for, derived by
+//! poolsPaidByQuota(). The two are complements: no pool is named by both, and together
 //! they are all of the group's pools.
 //!
 //! `pools[pg]` may be empty, which is how "this group costs the second medium nothing" is
@@ -869,15 +851,14 @@ public:
     //! Divide `quota` between pool groups by `ratioList`, honouring `minSlots` as a floor,
     //! and `secondBudget` as a second medium's total over a disjoint set of the same pools.
     //!
-    //! `slotSizeLists` holds every pool's size; `pools[pg]` names the ones `quota` pays for
-    //! and `secondBudget->pools[pg]` the ones its own quota pays for. A slot spans all of
-    //! them, so one count per group settles both media at once.
+    //! `slotSizeLists` holds every pool's size; the pools `quota` pays for are those
+    //! `secondBudget->pools[pg]` does not name. A slot spans all of them, so one count per
+    //! group settles both media at once.
     //!
     //! Both budgets and the floors are kept exactly; the ratio is the only soft bound. The
     //! floors come off the top rather than out of anyone's share, so no division of the rest
     //! can break one, and a group bound by either budget releases what it does not use of
-    //! the other -- which is the whole reason this is one pass rather than a quota followed
-    //! by a clamp. A group named by neither budget for a medium costs that medium nothing.
+    //! the other. A group named by neither budget for a medium costs that medium nothing.
     //!
     //! The two budgets can only conflict at the floors, and that condition names neither the
     //! ratio nor `quota`. It is therefore a property of the configuration: it is rejected the
@@ -918,10 +899,7 @@ protected:
 class GpuCacheLevelStorage : public CacheLevelStorage
 {
 public:
-    //! Sparse pools are allocated from host memory, which each SlotDesc declares per pool.
-    //! Their pages are too large for device memory and are read through the sparse cache
-    //! rather than directly, so they live on the hot level as ordinary pages that merely
-    //! happen to be host-resident.
+    //! Each SlotDesc declares per pool which pools are sparse, and so host-allocated.
     GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
         TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator,
         HostMemBackingOptions const& hostOptions = {});
@@ -938,8 +916,6 @@ private:
 class HostCacheLevelStorage : public CacheLevelStorage
 {
 public:
-    //! `commitUnit` is the granularity memory is allocated and released in; it
-    //! is also what pool sizes are quantized to.
     HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
         TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::optional<size_t> maxQuota = std::nullopt,
         HostMemBackingOptions const& options = {});
@@ -974,7 +950,6 @@ public:
         return CacheTier::DISK;
     }
 
-    //! Disk has no allocation unit to match, so this is a rounding quantum alone.
     std::string const& directory() const noexcept
     {
         return mDirectory;
@@ -985,8 +960,6 @@ private:
 };
 
 // Factory: create appropriate CacheLevelStorage for a given tier config.
-//! `commitUnit` is the tier's allocation granularity, decided once from its
-//! quota and fixed for the tier's lifetime.
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
     PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr, HostMemBackingOptions const& options = {});

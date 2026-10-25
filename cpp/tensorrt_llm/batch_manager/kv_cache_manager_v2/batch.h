@@ -753,8 +753,7 @@ private:
     //! Allocate the tables and the device-side descriptors the conversion reads.
     void _allocateIndexTables();
 
-    //! Collect each member's scratch slots for the life cycles that can hold them.
-    //! Staged separately from the main block, which the watermarks and views share.
+    //! Stage each member's scratch block range, for the life cycles that can hold scratch.
     void _stageScratch();
 
     //! Elements of the scratch staging.

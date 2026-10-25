@@ -32,9 +32,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 //! A granularity, not an address alignment: the reservation's base comes from mmap and is
 //! only page-aligned, so this constrains sizes and offsets within it rather than addresses.
 //!
-//! One value for the process, settled from the page size on first use. Nothing configures
-//! it: madvise and mprotect take any page-aligned range, so a larger tier has no reason to
-//! want a larger one, and the chunks the fill actually works in are its own business.
+//! One value for the process, settled from the page size on first use.
 [[nodiscard]] size_t hostMemSizeGranularity() noexcept;
 
 struct HostMemBackingOptions
@@ -80,12 +78,8 @@ struct HostMemBackingOptions
 //! only be dropped whole. Each chunk stays far below the 2 GiB-per-call pinning
 //! limit on Linux 6.11.
 //!
-//! The target is set once and reached over many steps, rather than each step
-//! naming its own range, because a step that knows more are coming can stop on
-//! a chunk boundary and leave the remainder to its successor. Registering what
-//! a step happened to populate instead would fragment the range into one
-//! registration per step, each one a chunk plus whatever the previous step's
-//! rounding left over.
+//! A step stops on a chunk boundary and leaves the remainder to its successor,
+//! so the range carries one registration per chunk rather than one per step.
 class HostMemBacking
 {
 public:
@@ -123,18 +117,15 @@ public:
     //! Declares how much of the reservation should end up committed. Must be a
     //! multiple of commitGranularity() and no larger than the reservation.
     //!
-    //! Takes no memory by itself; resizeStep() does the work. The previous
-    //! target must have been reached: a caller that wants a different one is
-    //! responsible for finishing or abandoning the fill in flight, which is
-    //! what it has to do anyway to stop a worker touching the range.
+    //! Takes no memory by itself; resizeStep() does the work. The previous target
+    //! must have been reached: the caller finishes or abandons an in-flight fill first.
     void setTargetSize(size_t size);
 
     //! Moves committedSize() one chunk towards the target and returns
     //! registeredSize().
     //!
-    //! A single step, so a caller filling a large tier can publish progress
-    //! between them. It is a no-op once committedSize() == targetSize(), which
-    //! is how a loop over it terminates.
+    //! A no-op once committedSize() == targetSize(), which is how a loop over it
+    //! terminates.
     //!
     //! Throws HostOOMError when the system cannot back the chunk; that is the
     //! expected failure and callers are required to handle it. The step then
@@ -217,7 +208,6 @@ private:
     bool mAllowRemoteNumaFallback = true;
     MemAddress mAddr = 0;
 
-    //! Bytes of address space held.
     size_t mSize = 0;
 
     size_t mTarget = 0;
@@ -240,9 +230,7 @@ private:
     //! End of the registered prefix, always a whole number of register units.
     size_t mRegisteredEnd = 0;
 
-    //! Captured on construction, which runs on the thread that owns the context.
-    //! cuMemHostRegister needs a current context and the fill worker only sets
-    //! the device, which leaves it without one.
+    //! The context cuMemHostRegister runs under; the fill worker only sets the device.
     void* mContext = nullptr;
 };
 

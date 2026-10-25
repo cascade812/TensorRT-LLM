@@ -31,8 +31,7 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
-//! Defined in batch.h, which this header does not pull in: Batch itself arrives as a
-//! forward declaration from kvCache.h, and one hook returns this by value.
+//! Defined in batch.h, which this header does not pull in.
 struct GpuCoalescedPageTable;
 
 //! Where a host-tier allocation's pages ended up, and under which policy.
@@ -65,36 +64,36 @@ public:
     static std::optional<bool> committedPageIsLinked(KvCache const& kvCache, int ordinal, int lcId);
     static bool allTreePagesDroppable(KvCacheManager& manager);
 
-    // White-box hooks: the device-resident state of a request's sparse history cache for
+    // The device-resident state of a request's sparse history cache for
     // one life cycle. Synchronises and copies back, so it is test-only. Empty when the
     // life cycle has no cache reserved.
     static std::vector<int32_t> sparseCacheResidentOrdinals(KvCache const& kvCache, int lcId);
 
-    // White-box hook: the first cell of this request's lease on the life cycle's arena;
+    // The first cell of this request's lease on the life cycle's arena;
     // nullopt when it holds none. A lease is one contiguous run, so its first cell
     // identifies it.
     static std::optional<int> sparseCacheBaseCell(KvCache const& kvCache, int lcId, int pool);
 
-    // White-box hook: units the last write-back moved per buffer, -1 where none has run.
+    // Units the last write-back moved per buffer, -1 where none has run.
     static std::vector<int32_t> sparseFlushCounts(KvCache const& kvCache, int lcId);
 
-    // White-box hook: a Batch's published device page table for one layer group, row-major
+    // A Batch's published device page table for one layer group, row-major
     // [max_batch][max_blocks_per_seq]. Synchronises.
     static std::vector<int32_t> batchPageTable(Batch const& batch, int layerGroupId);
 
-    //! White-box hook: (table, entry) serving one buffer. A consumer names a table by the
+    //! (table, entry) serving one buffer. A consumer names a table by the
     //! spec it asked for and slices it at the buffer's position in that spec; this is the
     //! same answer reached from the buffer, which is what the tests compare.
     static std::pair<int, int> batchIndexTableSlot(Batch const& batch, int layerId, DataRole const& role);
 
-    //! White-box hook: what a converted index for one buffer is added to.
+    //! What a converted index for one buffer is added to.
     static MemAddress batchIndexTableBase(Batch const& batch, int layerId, DataRole const& role);
 
     //! One converted index table, row-major [max_batch][entries][blocks_per_seq].
     //! Reads the device copy, so it shows what the last publish() converted. Synchronises.
     static std::vector<int32_t> batchIndexTable(Batch const& batch, int tableId);
 
-    //! White-box hook: one layer group's coalesced page table on the device.
+    //! One layer group's coalesced page table on the device.
     //!
     //! The view, not a copy: unlike the hooks around it this neither synchronises nor
     //! reads back. Its callers check the DLPack device-array contract and that the device
@@ -102,15 +101,15 @@ public:
     //! table, which is what a consumer actually reads, is Batch::coalescedPageTable().
     static GpuCoalescedPageTable batchGpuCoalescedPageTable(Batch const& batch, int layerGroupId);
 
-    // White-box hook: entriesPerLayer of each row's published sparse cache view, zero where
+    // entriesPerLayer of each row's published sparse cache view, zero where
     // no view is staged. Non-zero exactly where a member holds a reservation. Synchronises.
     static std::vector<int32_t> batchSparseViewEntries(Batch const& batch, int layerGroupId);
 
-    // White-box hook: a Batch's published per-row watermarks as (history_length, capacity).
+    // A Batch's published per-row watermarks as (history_length, capacity).
     // Synchronises.
     static std::pair<std::vector<int32_t>, std::vector<int32_t>> batchWatermarks(Batch const& batch);
 
-    // White-box hook: run the sparse resolve kernel over caller-supplied state, so the
+    // Run the sparse resolve kernel over caller-supplied state, so the
     // probe index, victim choice and recency rebuild can be exercised without a request.
     // Synchronises. Inputs are [layer][entry] and [layer][selectionWidth] row-major.
     struct SparseResolveProbe
@@ -133,7 +132,7 @@ public:
         int selectionWidth, std::vector<int32_t> const& historyUnits, std::vector<int32_t> const& capacityUnits,
         int maxInFlightUnits, std::vector<int32_t> const& inactiveRows);
 
-    // White-box hook: run the sparse unit copy over caller-supplied pools, so the address
+    // Run the sparse unit copy over caller-supplied pools, so the address
     // arithmetic can be checked against a known byte pattern. Returns the destination pool
     // after the copy. Synchronises.
     static std::vector<uint8_t> sparseUnitCopy(std::vector<uint8_t> const& hostPool, uint64_t hostPageStride,
@@ -143,7 +142,7 @@ public:
         std::vector<int32_t> const& missSlot, std::vector<int32_t> const& missCount, int selectionWidth,
         std::vector<int32_t> const& bufferLayer, bool writeBack, int gridCtas);
 
-    // White-box hook: the entries holding units a watermark move has just passed.
+    // The entries holding units a watermark move has just passed.
     // Synchronises.
     struct SparseFlushList
     {

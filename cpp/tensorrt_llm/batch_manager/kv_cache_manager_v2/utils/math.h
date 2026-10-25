@@ -82,9 +82,9 @@ template <typename T>
 // Extract an attribute from the first element and assert (debug) all elements agree.
 // Mirrors Python's get_uniform_attribute(_utils.py:202).
 //
-// Takes the range by forwarding reference rather than by const reference so that an
-// adapted view may be passed: a filter_view's begin() is not const-qualified, so a
-// const reference to one cannot be iterated.
+// Takes the range by forwarding reference so an adapted view may be passed: a
+// filter_view's begin() is not const-qualified, so a const reference to one cannot
+// be iterated.
 template <typename Range, typename Func>
 [[nodiscard]] auto getUniformAttribute(Range&& range, Func&& func) -> decltype(func(*std::ranges::begin(range)))
 {

@@ -45,7 +45,7 @@ struct IndexTableDesc
     //!
     //! A scratch block's slot does not come from the page table at all: it comes from the
     //! request's own scratch slots, indexed by how far into the scratch range the block
-    //! sits. Null `scratchBegs` means the plain path applies to every block.
+    //! sits.
     int32_t const* scratchBegs = nullptr;  //!< [numRows]
     int32_t const* scratchEnds = nullptr;  //!< [numRows]
     int32_t const* scratchSlots = nullptr; //!< [numRows][scratchSlotStride]
@@ -56,26 +56,23 @@ struct IndexTableDesc
 
 //! Convert raw slot ids into kernel page indices for every table at once.
 //!
-//! One launch rather than one per table: a PER_LAYER mode gives a table per layer, and the
-//! per-launch driver cost would then dominate what is a few arithmetic operations per
-//! entry.
+//! One launch covers every table: under PER_LAYER there is a table per layer, and per-launch
+//! driver cost would dominate the few arithmetic operations per entry.
 //!
 //! `entry = slot * scale + offset`, with kBadPageIndex passed through unchanged -- a sparse
 //! table numbers pure-history and input-token entries in different levels' pools, so only
 //! the sentinel separates an absent block from slot zero.
 //!
 //! @param descs        device array of numTables descriptors
-//! @param maxBuffers    widest table's numBuffers; narrower tables return immediately,
-//!                     which costs less than giving each its own launch
+//! @param maxBuffers    widest table's numBuffers; narrower tables return immediately
 //! @param rawRowStride  elements between consecutive rows of a raw table
 void launchIndexConversion(IndexTableDesc const* descs, int32_t numTables, int32_t maxBuffers, int32_t numRows,
     int32_t blocksPerRow, int32_t rawRowStride, CUstream stream);
 
 //! The same, for tables whose life cycle substitutes scratch slots.
 //!
-//! Separate rather than a branch in the kernel above: a scratch block takes its slot from
-//! the request instead of the page table, and wraps the layer's offset within the slot
-//! rather than adding it, so the two paths share only their shape.
+//! A scratch block takes its slot from the request instead of the page table, and wraps the
+//! layer's offset within the slot rather than adding it.
 //!
 //! Scratch is a PER_LAYER-only concern. Under SHARED every layer of a life cycle reads one
 //! table, which substitution would break.

@@ -40,17 +40,14 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 //
 // The metadata is laid out [layer][entry]. It is per LAYER, not per buffer: every sparse
 // buffer of a layer selects the same units, so one resident set and one recency order serve
-// them all, and the entry index the resolve produces addresses each buffer's own cell. That
-// makes the agreement between a layer's buffers structural rather than a consequence of
-// their running identical logic on identical input.
+// them all, and the entry index the resolve produces addresses each buffer's own cell.
 // ---------------------------------------------------------------------------
 struct SparseCacheView
 {
     //! Resident unit ordinal per entry, kBadBlockOrdinal when the entry is free.
     //!
-    //! Dense rather than keyed: answering "is this ordinal resident, and where" is done by
-    //! building a hash over this array in shared memory at the top of each fetch, so the
-    //! persistent form stays proportional to cache capacity rather than to context length.
+    //! Dense rather than keyed: a fetch builds a hash over this array in shared memory to
+    //! answer "is this ordinal resident, and where".
     int32_t* residentOrdinal = nullptr;
 
     //! Entry indices in recency order, most-recently-used first.
@@ -67,10 +64,8 @@ struct SparseCacheView
     int32_t* bufferSlotInPool = nullptr;
 
     //! [numBuffers] the layer each buffer belongs to, i.e. which metadata row carries its
-    //! residency and its work list. The copy walks buffers but reads a list produced per
-    //! layer, so it needs the map to join the two. Non-decreasing, because the buffers of a
-    //! layer are consecutive, which is what lets a one-layer call name its buffers as a
-    //! range rather than a set.
+    //! residency and its work list. Non-decreasing: the buffers of a layer are consecutive,
+    //! which is what lets a one-layer call name its buffers as a range rather than a set.
     int32_t* bufferLayer = nullptr;
 
     //! Layers in this life cycle: the metadata's first dimension.
@@ -109,9 +104,9 @@ struct SparseCacheInit
 // ---------------------------------------------------------------------------
 // SparseCacheLease — one request's cells and the metadata describing them.
 //
-// Taken at resume() and returned at suspend() or close(). Move-only and RAII: the arena's
-// free list is restored by the destructor, so a request dropped on any path -- including a
-// poisoned teardown -- cannot leak its cells.
+// Taken when the cache joins a Batch, returned on removal, suspend() and close(). Move-only
+// and RAII: the arena's free list is restored by the destructor, so a request dropped on any
+// path -- including a poisoned teardown -- cannot leak its cells.
 // ---------------------------------------------------------------------------
 class SparseCellArena;
 
@@ -153,14 +148,13 @@ private:
 // ---------------------------------------------------------------------------
 // SparseCellArena — one life cycle's GPU cells, and the metadata that describes them.
 //
-// A dedicated allocation rather than storage slots. That is what lets the life cycle's hot
-// pool group be host memory without the cache following it there, and it frees the cache
-// from the allocator's coalesced-slot granularity: every request of a life cycle needs
-// exactly the same number of cells, so this is a fixed-size-block free list.
+// A dedicated allocation rather than storage slots, so the life cycle's hot pool group can
+// be host memory without the cache following it there. Every request of a life cycle needs
+// the same number of cells, so this is a fixed-size-block free list.
 //
 // One block holds the cells of every lease followed by their metadata. Cells come first so
 // that a cell index is relative to the arena's base, which is what the fetch reports and
-// what get_mem_pool_base_address returns for a sparse buffer.
+// what get_sparse_cache_base_address returns for a sparse buffer.
 // ---------------------------------------------------------------------------
 class SparseCellArena
 {
@@ -186,8 +180,7 @@ public:
         return mMemory == nullptr;
     }
 
-    //! Base of one pool's cell region. Indices the fetch emits for a buffer are relative to
-    //! its pool's base, which is what get_sparse_cache_base_address reports for that buffer.
+    //! Base of one pool's cell region: the base the fetch's indices for a buffer are relative to.
     [[nodiscard]] CUdeviceptr base(PoolIndex pool) const
     {
         return mPoolBase.at(pool);
@@ -205,8 +198,7 @@ public:
     }
 
     //! Device bytes this arena holds: every pool's cell region, the state its leases share,
-    //! and one metadata block per lease. The whole allocation, so a caller reserving the
-    //! arena's bytes against a budget can check its own figure against this one.
+    //! and one metadata block per lease -- the whole allocation.
     [[nodiscard]] size_t numBytes() const noexcept
     {
         return mNumBytes;
@@ -219,16 +211,12 @@ public:
     //! identity permutation.
     [[nodiscard]] std::optional<SparseCacheLease> acquire(CUstream stream);
 
-    //! [numBuffers] the layer each buffer belongs to, as every view of this life cycle sees
-    //! it. Reachable without a view because the copy has to pick a layer's work list before
-    //! it knows which row an entry names.
+    //! [numBuffers] the layer each buffer belongs to, as every view of this life cycle sees it.
     [[nodiscard]] int32_t const* bufferLayer() const noexcept
     {
         return mSharedLayer;
     }
 
-    //! The shape this arena was built from, for a caller folding its per-buffer constants
-    //! into a descriptor rather than reading them through a view at every work item.
     [[nodiscard]] SparseCacheInit const& shape() const noexcept
     {
         return mShape;
@@ -246,7 +234,7 @@ private:
     TypedVec<PoolIndex, CUdeviceptr> mPoolBase;
     std::byte* mMetadataBase = nullptr;
 
-    //! Shared by every lease of the life cycle, so a resume copies neither.
+    //! Shared by every lease of the life cycle, so a resume copies none of them.
     int32_t* mSharedLayer = nullptr;
     int32_t* mSharedSlotInPool = nullptr;
     int32_t* mIdentity = nullptr;

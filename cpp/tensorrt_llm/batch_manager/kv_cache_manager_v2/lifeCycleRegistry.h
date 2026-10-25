@@ -197,8 +197,7 @@ public:
     // Look up the id for a LifeCycle (throws if not found).
     LifeCycleId getId(LifeCycle const& lc) const;
 
-    // Number of unique life cycles. Inline: this is a loop bound in the hot paths, so a
-    // caller should get the vector's size rather than a call it cannot see through.
+    // Number of unique life cycles.
     LifeCycleId size() const noexcept
     {
         check();

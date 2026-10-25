@@ -88,9 +88,7 @@ struct PageIndexConverter
 };
 
 //! What one life cycle's sparse fetch path is shaped like, as _computeSparseCacheShape
-//! derives it from the configuration. One record rather than a column per field: every
-//! field is filled in the same pass for the same life cycle and read together per step, so
-//! splitting them only invites the columns to disagree about their length.
+//! derives it from the configuration.
 struct SparseCacheShape
 {
     //! Cells a request caches per buffer, counting history and everything in flight.
@@ -206,28 +204,16 @@ public:
 
     //! Whether this buffer was declared sparse, i.e. whether its pages are host memory
     //! read through the sparse GPU cache rather than device memory read directly.
-    //!
-    //! Answered as "are this buffer's pages host memory", which is the same fact: a
-    //! GPU-tier pool is host-backed exactly when it was built for sparse buffers, and
-    //! buffers coalesce only with others of matching size *and* sparsity, so a pool is
-    //! uniformly one or the other.
     [[nodiscard]] bool isSparse(LayerId layerId, DataRole role) const;
 
-    //! Host bytes held on behalf of sparse buffers, across every pool group.
-    //!
-    //! The hot level alone: sparsity is a property of a GPU-tier pool. These bytes are not
-    //! drawn from that tier's quota -- they are a different medium -- so they appear in no
-    //! other total a caller can read. Reported so a deployment can count what it pins.
-    //! Bytes `level` holds in pools whose pages are `medium`. A device level's own tier
-    //! and its sparse backing medium are accounted separately, the quota paying only for
-    //! the former, so a caller counting what it pins asks for each in turn.
+    //! Bytes `level` holds in pools whose pages are `medium`. A device level's own tier and
+    //! its sparse backing medium are accounted separately, the quota paying only for the
+    //! former, so a caller counting what it pins asks for each in turn.
     [[nodiscard]] size_t getNumBytes(CacheLevel level, CacheTier medium) const;
 
-    //! The medium a sparse buffer's pages are, or nullopt when no life cycle is sparse.
-    //!
-    //! The hot level's second medium: host memory that the GPU reads through a device
-    //! mapping, which is what sparse loading pulls into the per-request GPU cache. Pass it
-    //! to getNumBytes(kHotLevel, ...) to count what sparse buffers are holding.
+    //! The medium a sparse buffer's pages are -- host memory the GPU reads through a device
+    //! mapping -- or nullopt when no life cycle is sparse. Pass it to
+    //! getNumBytes(kHotLevel, ...) to count what sparse buffers hold.
     [[nodiscard]] std::optional<CacheTier> sparseBackingMedium() const;
 
     // Scale factor: base_page_index * scale → kernel page index.
@@ -270,15 +256,14 @@ public:
     //! The most scratch slots one request can need, over every life cycle and buffer,
     //! given the widest page table a row will get. Zero where nothing can hold scratch.
     //!
-    //! Sizes scratch staging. A caller that stages scratch slots itself asks this rather
-    //! than deriving it: which blocks can be stale turns on the window, the sinks and the
-    //! rewind margin, and a second copy of that reasoning is a second thing to keep right.
+    //! Sizes scratch staging; a caller that stages slots itself asks rather than re-deriving
+    //! which blocks can be stale.
     [[nodiscard]] int maxScratchSlots(int maxBlocksPerSeq) const;
 
     //! Whether managed KV caches support the given page index mode for one life cycle,
     //! which is the granularity a Batch decides at. True means every request supports it;
     //! nullopt means it depends on the individual KvCache, which must then be asked. Never
-    //! false, so an engaged optional means support -- which some callers rely on.
+    //! false, so an engaged optional means support.
     //!
     //! Only scratch-slot substitution can make one layer's converted indices differ from
     //! another's in the same life cycle, so SHARED is definitive for a life cycle that can
@@ -425,9 +410,6 @@ public:
     //! Whether any life cycle has a configured sparse fetch path. A property of the
     //! configuration, so it is the same for every cache this manager holds, and it decides
     //! whether max_input_length is required.
-    //!
-    //! Derived rather than stored: there are a handful of life cycles, so the scan costs
-    //! less than a second copy of the same fact could drift.
     [[nodiscard]] bool hasSparseCache() const noexcept
     {
         return std::ranges::any_of(mSparseCacheShape, [](SparseCacheShape const& shape) { return shape.maxUnits > 0; });
@@ -453,11 +435,9 @@ public:
 
     //! The index table specs every sparse life cycle needs, one per (layer, pool) run.
     //!
-    //! A Batch still has to be given these: it refuses a sparse buffer it was told nothing
-    //! about, because a fetch with no converted indices would read the wrong pages rather
-    //! than fail. But their shape is not a choice -- a copy walks one run per launch from
-    //! one base pointer, so the run is the request -- and this is that shape, so a caller
-    //! need not re-derive the pool layout to restate it.
+    //! A Batch must still be given these -- it refuses a sparse buffer it was told nothing
+    //! about, since a fetch with no converted indices would read the wrong pages rather than
+    //! fail -- but their shape follows from the pool layout, so a caller need not re-derive it.
     [[nodiscard]] std::vector<IndexTableSpec> sparseIndexTableSpecs() const;
 
     //! Multiprocessors of the device this manager runs on, read once on first use.
@@ -473,7 +453,7 @@ public:
     //! Distinct from getMemPoolBaseAddress, which names the buffer's *pages* for every
     //! buffer alike -- that is what the transceiver and the KV transfer path address, and it
     //! keeps one meaning whether or not a buffer is sparse. The arena is a second allocation
-    //! holding the only GPU-resident copy a kernel can read, so it gets its own accessor.
+    //! holding the only GPU-resident copy a kernel can read.
     [[nodiscard]] MemAddress getSparseCacheBaseAddress(LayerId layerId, DataRole const& role) const;
 
     LifeCycleRegistry const& lifeCycles() const noexcept
@@ -481,8 +461,7 @@ public:
         return mLifeCycles;
     }
 
-    //! How many life cycles the manager was built with. Structural: the registry is filled
-    //! at construction and never grows, so this is fixed for the manager's lifetime.
+    //! Life cycles the manager was built with; the registry never grows after construction.
     LifeCycleId numLifeCycles() const noexcept
     {
         return mLifeCycles.size();
@@ -568,8 +547,6 @@ public:
     friend class Batch;
 
 private:
-    // Sparse layout the Batch reads to drive a step. Private: a Batch is the only
-    // caller, and it is a friend above.
     //! Units a step selects per buffer of this life cycle. The cache must hold a whole
     //! selection on top of everything in flight, so this is what the in-flight headroom is
     //! measured against.
@@ -608,8 +585,7 @@ private:
     //! the unit layout and the cell geometry. A caller fills in whose cache it is copying
     //! into and which work list to read.
     //!
-    //! One entry per maximal run of consecutive buffers sharing a hot pool, because a pool
-    //! fixes a cell's size, the slot stride it is read from and the unit layout. Buffers are
+    //! One entry per maximal run of consecutive buffers sharing a hot pool. Buffers are
     //! ordered (layer, pool), so a life cycle whose sparse buffers are alike yields a single
     //! run, and the quantised shape -- data and block scales in pools of their own -- yields
     //! one per layer and pool. A caller that wants only some buffers clips each run to them.
@@ -630,8 +606,7 @@ private:
     }
 
     //! Storage attributes of one buffer: its pool, its offset within that pool's slot, its
-    //! expanded size and its expansion. Forwarded because StorageManager keeps the table
-    //! private and this manager is its friend.
+    //! expanded size and its expansion.
     [[nodiscard]] BufferAttr const& _bufferAttr(LayerId layerId, DataRole const& role) const
     {
         return mStorage->getBufferAttr(layerId, role);
@@ -660,9 +635,8 @@ private:
     //! given the widest page table a batch will give a row and, where the caller knows it,
     //! the most tokens one step may ingest.
     //!
-    //! Sizes scratch staging, so it answers for the worst request rather than any
-    //! particular one. Blocks still in the window or held as sinks are never stale and so
-    //! never scratch, which is what makes this smaller than the page table.
+    //! Blocks still in the window or held as sinks are never stale and so never scratch,
+    //! which is what makes this smaller than the page table.
     //!
     //! `maxTotalInputTokens` usually bounds it far harder. Scratch is the blocks a step
     //! *adds* that are *already* stale at capacity, so a step ingesting T tokens can make
@@ -677,9 +651,6 @@ private:
 
     //! Slots one buffer's worst request needs, which is its scratch blocks converted at
     //! that buffer's own sub-pages-per-block and slot width. Zero where it can hold none.
-    //!
-    //! Callers differ in which buffers they ask about -- a Batch only its tables', the
-    //! manager every one -- so they share this rather than the loop around it.
     [[nodiscard]] int _scratchSlotsFor(
         BufferId const& buffer, int maxBlocksPerSeq, std::optional<int> maxTotalInputTokens = std::nullopt) const;
 

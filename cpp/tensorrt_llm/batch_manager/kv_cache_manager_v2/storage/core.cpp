@@ -374,20 +374,15 @@ Address GpuSlotPool::slotAddress(SlotId slot) const
 // HostSlotPool
 // ---------------------------------------------------------------------------
 
-//! The unit this pool's memory is registered and released in.
-//!
 HostSlotPool::HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, HostMemBackingOptions const& options)
     : SlotPoolBase(slotSize)
     , mCommitUnit(hostMemSizeGranularity())
-    // Two things this hands the backing. registerUnit = slotSize, because every
-    // copy here is a whole slot and the driver rejects one that crosses a
-    // registration: the backing keeps its registration bounds on slot multiples,
-    // which is what leaves the commit unit free of the slot size.
+    // registerUnit = slotSize: every copy here is a whole slot and the driver rejects
+    // one that crosses a registration, so the backing keeps its registration bounds on
+    // slot multiples -- which leaves the commit unit free of the slot size.
     //
-    // And waitForFill=false, deliberately: the owning pool group blocks per
-    // allocation on only the range it hands out, so serving can start before the
-    // whole tier is committed. Flipping it would serialize startup on the whole
-    // tier and buy nothing the group's wait does not give.
+    // waitForFill = false: the owning pool group blocks per allocation on only the range
+    // it hands out, so serving can start before the whole tier is committed.
     , mHostMem(std::max(vmSize, alignedSize(numSlots)), alignedSize(numSlots),
           HostMemBackingOptions{.registerUnit = slotSize, .allowRemoteNumaFallback = options.allowRemoteNumaFallback},
           /*waitForFill=*/false)
@@ -624,8 +619,6 @@ GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const
     HostMemBackingOptions const& hostOptions)
     : PoolGroupBase(numSlots)
 {
-    // Only the pool class built here records which pools are host-backed; everything later
-    // asks the pool, through PoolGroupBase::poolMedium.
     if (sparsity.empty())
     {
         sparsity = TypedVec<PoolIndex, bool>(slotSizeList.size(), false);
@@ -643,9 +636,8 @@ GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const
     TLLM_CHECK_WITH_INFO(!slotSizeList.empty(), "GpuPoolGroup: slotSizeList must not be empty");
     // Every pool reserves address space for the most slots this group could ever hold: the
     // count all of device memory would buy. A slot is one row spanning every pool, and only
-    // the device-backed pools draw on that memory, so they alone set the count -- which is
-    // why StorageManager requires one here. No quota can exceed device memory, so this
-    // reservation is a bound the allocator cannot reach rather than one it might.
+    // the device-backed pools draw on that memory, so they alone set the count. No quota can
+    // exceed device memory, so this reservation is a bound the allocator cannot reach.
     size_t deviceSlotBytes = 0;
     for (PoolIndex p{0}; p < slotSizeList.size(); ++p)
     {
@@ -660,7 +652,6 @@ GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const
     for (PoolIndex p{0}; p < slotSizeList.size(); ++p)
     {
         size_t const sz = slotSizeList.at(p);
-        // Each in the grain of its own medium: a host-backed pool commits in host units.
         size_t const grain = sparsity[p] ? hostMemSizeGranularity() : physMemSize;
         size_t vmSize = std::max(roundUp(maxSlots * sz, grain), roundUp(slotCountToSizeT(numSlots) * sz, grain));
         if (sparsity[p])
@@ -670,10 +661,6 @@ GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const
             // not device, but it is as hard a bound: HostMem keeps a fixed base and rejects
             // a resize past it. Sizing it from maxSlots is what keeps it unreachable, since
             // the row count those slots imply is the most the device quota can buy.
-            //
-            // Device-mapped does not mean these pages need extra synchronization. The fill
-            // completes before allocate() returns the slot, so by the time any descriptor
-            // names one of these pages the memory behind it is already there.
             mPools.push_back(std::make_unique<HostSlotPool>(sz, numSlots, vmSize, hostOptions));
             continue;
         }
@@ -855,8 +842,7 @@ std::pair<SlotCount, size_t> CacheLevelStorage::grainsToSlots(size_t pgGrains,
     // With nothing to divide the grains between there is no slot count to find, and the
     // search below would run past SlotCount's range looking for one.
     TLLM_CHECK_WITH_INFO(!which.empty(), "grainsToSlots needs at least one pool to size against");
-    // Indexed by the real pool index, so only the named entries are ever read; the rest
-    // stay zero and cost one word each.
+    // Indexed by real pool index; entries outside `which` stay zero and are never read.
     TypedVec<PoolIndex, size_t> minPoolGrains(slotSizeList.size(), 0);
     size_t minTotal = 0;
     for (PoolIndex poolIdx : which)
@@ -872,8 +858,7 @@ std::pair<SlotCount, size_t> CacheLevelStorage::grainsToSlots(size_t pgGrains,
     size_t remainingPgGrains = pgGrains;
 
     // Sort the named pools by slot size ascending. Ties may fall either way: every term
-    // below is a function of the sizes alone, so an order that differs only among equal
-    // sizes produces the same result.
+    // below is a function of the sizes alone.
     std::vector<PoolIndex> poolOrder = which;
     std::sort(poolOrder.begin(), poolOrder.end(),
         [&](PoolIndex a, PoolIndex b) { return slotSizeList[a] < slotSizeList[b]; });
@@ -988,10 +973,6 @@ namespace
 //! Bytes one pool group holds at `slots`, each pool rounded to its own grain. This is the
 //! quantity the pool ratio speaks in: what the group actually occupies, device and host
 //! together.
-//!
-//! `grains` carries the medium's answer per pool, which is why nothing here asks which
-//! budget pays for which pool: a grain follows the medium, and the budgets follow the
-//! grains rather than the other way about.
 size_t allBytesForSlots(
     TypedVec<PoolIndex, size_t> const& sizes, TypedVec<PoolIndex, size_t> const& grains, SlotCount slots)
 {
@@ -1007,8 +988,7 @@ size_t allBytesForSlots(
 //! The most slots whose all-bytes cost fits `budget`.
 //!
 //! Bracketed, not galloped: `A(n) >= n * S` with `S` the summed slot size, so no count above
-//! `budget / S` can fit and bisection has an upper end without searching for one. Every pool
-//! of the group is in view, so there is no empty-selector case to guard.
+//! `budget / S` can fit and bisection has an upper end without searching for one.
 SlotCount maxSlotsForAllBytes(
     TypedVec<PoolIndex, size_t> const& sizes, TypedVec<PoolIndex, size_t> const& grains, size_t budget)
 {
@@ -1045,10 +1025,9 @@ SlotCount maxSlotsForAllBytes(
 //! self-consistent: growing to it costs nothing in any medium, so it never disturbs a
 //! budget.
 //!
-//! Every pool is in view, including ones the second budget pays for and whether or not that
-//! budget has a quota. A host-backed pool nobody is bounding is still real memory: dropping
-//! it here would let a count grow to whatever the device grain absorbs and allocate host rows
-//! for all of it, which is the opposite of what the quota exists to do.
+//! Every pool is in view, including ones the second budget pays for, bounded or not. An
+//! unbounded host-backed pool is still real memory: skipping it would let a count grow to
+//! whatever the device grain absorbs and allocate host rows for all of it.
 SlotCount freeRun(TypedVec<PoolIndex, size_t> const& sizes, TypedVec<PoolIndex, size_t> const& grains, SlotCount slots)
 {
     auto const n = slotCountToSizeT(slots);
@@ -1078,8 +1057,6 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
     size_t const grain2 = hasSecond ? secondBudget->granularity : granularity;
     TLLM_CHECK_WITH_INFO(!hasSecond || grain2 > 0, "A second budget needs a positive granularity");
 
-    // The quota pays for whatever the second budget does not name, so the two partition the
-    // group's pools by construction rather than by agreement between callers.
     auto const pools = poolsPaidByQuota(slotSizeLists, secondBudget);
     static std::vector<PoolIndex> const kNoPools;
     auto secondPools = [&](PoolGroupIndex pgIdx) -> std::vector<PoolIndex> const&
@@ -1110,7 +1087,6 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
     { return grainsForSlots(slots, slotSizeLists[pgIdx], pools[pgIdx], granularity); };
     auto secondGrains = [&](PoolGroupIndex pgIdx, SlotCount slots)
     { return grainsForSlots(slots, slotSizeLists[pgIdx], secondPools(pgIdx), grain2); };
-    // What the ratio speaks in: every pool, each in the grain of its own medium.
     auto allBytes = [&](PoolGroupIndex pgIdx, SlotCount slots)
     { return allBytesForSlots(slotSizeLists[pgIdx], grains[pgIdx], slots); };
 
@@ -1131,9 +1107,6 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
     }
     if (bounded)
     {
-        // The only way the two hard bounds can conflict, and it names neither the ratio nor
-        // the quota -- so it is a property of the configuration, caught the first time this
-        // runs and unable to begin failing at a later rebalance.
         TLLM_CHECK_WITH_INFO(floorSecond <= budget2Grains,
             "Second memory budget of %zu bytes cannot hold the %zu the batches in `constraints` need. Raise the "
             "budget or lower the constraints.",
@@ -1296,8 +1269,6 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
         SlotCount bestSlots{0};
         for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
         {
-            // Strictly greater than the current count, so every accepted step is progress and
-            // the loop cannot spin.
             auto const next = freeRun(slotSizeLists[pgIdx], grains[pgIdx], slotCntList[pgIdx] + 1);
             TLLM_CHECK_DEBUG(next > slotCntList[pgIdx]);
             auto const dq = quotaGrains(pgIdx, next) - quotaGrains(pgIdx, slotCntList[pgIdx]);

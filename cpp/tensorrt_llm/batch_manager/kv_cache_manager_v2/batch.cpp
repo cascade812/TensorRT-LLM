@@ -109,9 +109,8 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, std::vector<IndexTableSpe
     std::fill(views, views + numViews, SparseCacheView{});
 
     // The staging mirrors the device block exactly, so publishing it is one linear copy.
-    // It also doubles what a Batch costs in device memory, which is the price of letting
-    // the host-to-device crossing overlap the previous step; a caller that already holds a
-    // buffer of this shape could lend it instead.
+    // It doubles what a Batch costs in device memory, which is the price of letting the
+    // host-to-device crossing overlap the previous step.
     mDevice = allocateDeviceMemory(_totalBytes());
     mDeviceStaging = allocateDeviceMemory(_totalBytes());
     auto const device = reinterpret_cast<CUdeviceptr>(mDevice.get());
@@ -241,8 +240,7 @@ void Batch::_allocateStepScratch()
 {
     mScratch = TypedVec<LifeCycleId, SparseStepScratch>(mManager->numLifeCycles(), SparseStepScratch{});
 
-    // Sized up front from configuration, so no step has to allocate. Laid out as one block
-    // because a per-group allocation would be a dozen tiny ones serving the same lifetime.
+    // Sized up front from configuration, so no step has to allocate.
     auto const rows = static_cast<size_t>(mMaxBatchSize);
     size_t total = 0;
     for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
@@ -265,11 +263,8 @@ void Batch::_allocateStepScratch()
         scratch.flushWork.capacity = _flushCapacity(lcId);
         scratch.flushWork.numLists = scratch.numLayers;
         // A counter per layer even though the fetch's list is one: the list is reused from
-        // layer to layer, because a layer's copy has consumed it before the next layer's
-        // resolve overwrites it, but the counter has to read zero when that resolve starts.
-        // Giving each layer its own lets the whole step's counters be cleared in one go,
-        // rather than one clear per layer standing between every resolve and whatever ran
-        // before it. Per-layer *lists* would cost the layer count times the list.
+        // layer to layer, but the counter has to read zero when a resolve starts, and
+        // per-layer counters let the whole step's be cleared in one go.
         mCounterElements += 2 * layers;
         auto const fetchEntries = 3 * static_cast<size_t>(scratch.fetchWork.capacity);
         auto const flushEntries = layers * 3 * static_cast<size_t>(scratch.flushWork.capacity);
@@ -334,7 +329,7 @@ void Batch::_allocateStepScratch()
         auto const layers = static_cast<size_t>(scratch.numLayers);
         scratch.flushCount = carve(rows * layers);
         // -1 so that "no write-back has run" stays distinguishable from "one ran and found
-        // nothing to move", which is what lets a test tell the two apart.
+        // nothing to move".
         cuCheck(cuMemsetD32Async(
             reinterpret_cast<CUdeviceptr>(scratch.flushCount), 0xFFFFFFFFU, rows * layers, cudaStream()));
     }
@@ -453,8 +448,7 @@ void Batch::_buildIndexTables(std::vector<IndexTableSpec> const& specs)
             auto const& attr = mManager->_bufferAttr(buffer.layerId, buffer.role);
             // The reference converter emits `expansion` entries per block. Nothing in the
             // tree sets tokensPerBlockOverride, and every attention backend refuses an
-            // expansion of anything but one, so this follows them rather than building a
-            // path no caller can reach.
+            // expansion of anything but one.
             TLLM_CHECK_WITH_INFO(attr.expansion == 1,
                 "Index conversion does not implement page index expansion, so a buffer with a tokens-per-block "
                 "override cannot have converted index tables");
@@ -725,28 +719,18 @@ void Batch::_allocateIndexTables()
     mNumPlainTables = static_cast<int>(std::count_if(
         mIndexTables.begin(), mIndexTables.end(), [&](IndexTable const& table) { return !mayHoldScratch(table); }));
 
-    // The most slots a request could need for one life cycle, which is the stride every
-    // (row, life cycle) of the scratch staging gets. Over this batch's own tables rather
-    // than every buffer the manager has: a batch that declared none stages nothing, which
-    // is what leaving this zero says.
-    //
-    // Not floored at one. Zero is a real answer -- a step that cannot outrun the window
-    // adds no block that is already stale -- and staging for it would allocate a slot no
-    // request can reach, while giving a wrong bound the slack to go unnoticed.
+    // The most slots a request could need for one life cycle, over this batch's own tables:
+    // the stride every (row, life cycle) of the scratch staging gets. Zero where no member's
+    // step can outrun the window, and so adds no already-stale block.
     for (size_t index = static_cast<size_t>(mNumPlainTables); index < mIndexTables.size(); ++index)
     {
         auto const& first = mIndexTables[index].served.front().buffers.front();
-        // The step bound only where the caller gave one: unset, mMaxTotalInputTokens
-        // stands in for a decode step, which would under-count a batch that then prefills.
         auto const slots = mManager->_scratchSlotsFor(first, mMaxBlocksPerSeq, mMaxTotalInputTokens);
         mMaxScratchSlots = std::max(mMaxScratchSlots, slots);
     }
 
-    // Scratch capability is the manager's answer for the life cycle, while the bound above
-    // is this batch's; a batch naming SHARED over an undecided life cycle has the first
-    // without the second. With no slot any member can reach there is nothing to substitute,
-    // so those tables take the plain path -- which is also what keeps the scratch kernel
-    // from running over staging that the bound just decided not to allocate.
+    // With no slot any member can reach there is nothing to substitute, so every table takes
+    // the plain path and the scratch kernel never runs over staging that was not allocated.
     if (mMaxScratchSlots == 0)
     {
         mNumPlainTables = static_cast<int>(mIndexTables.size());
@@ -757,9 +741,9 @@ void Batch::_allocateIndexTables()
         auto const elements = _scratchElements();
         mScratchStaging = std::make_unique<StaticHostMem>(sizeof(int32_t) * elements);
         auto* host = reinterpret_cast<int32_t*>(mScratchStaging->address());
-        // An empty range leaves every block on the plain path, which is what a member
-        // holding no scratch should look like. The slots behind the ranges hold the
-        // sentinel instead: zero there would name slot zero.
+        // A zero range leaves every block on the plain path, which is what a member holding
+        // no scratch looks like. The slots behind the ranges hold the sentinel instead,
+        // since zero there would name slot zero.
         auto const ranges
             = 2 * static_cast<size_t>(mManager->numLifeCycles().value()) * static_cast<size_t>(mMaxBatchSize);
         std::fill(host, host + ranges, 0);
@@ -930,10 +914,6 @@ void Batch::_stageScratch()
             {
                 continue;
             }
-            // Tests the bound the sizing was derived from against a range an actual request
-            // reached, so a mistake in that derivation is caught where it was made rather
-            // than only when some request's conversion happens to need the slot the
-            // arithmetic lost.
             TLLM_CHECK_DEBUG_WITH_INFO(range.end.value() - range.beg.value()
                     <= mManager->_maxScratchBlocks(lcId, mMaxBlocksPerSeq, mMaxTotalInputTokens),
                 "A request's scratch range outruns the blocks the batch was sized for");
@@ -1004,8 +984,7 @@ MemAddress Batch::_specBase(IndexTableSpec const& spec) const
 
 PoolSpec Batch::poolSpecFor(IndexTableSpec const& spec) const
 {
-    // Membership first: a spec the Batch never built has no base, and saying so beats
-    // handing back the pool of whichever buffer happens to be named.
+    // Membership first: a spec the Batch never built has no base.
     static_cast<void>(indexTableOf(spec));
 
     auto const& first = spec.buffers.front();
@@ -1136,7 +1115,7 @@ int Batch::addKvCache(KvCache& kvCache, std::optional<int> requestedRow)
     if (kvCache.beamWidth() != BeamIndex{1})
     {
         // Only beam 0 is mirrored below, so a wider request would publish one beam's pages
-        // and have every beam read them. Refusing beats a wrong answer nothing would notice.
+        // and have every beam read them.
         throw LogicError("Batch does not support beam search yet; a member must have beam width 1");
     }
     if (!kvCache.isActive())
@@ -1170,10 +1149,9 @@ int Batch::addKvCache(KvCache& kvCache, std::optional<int> requestedRow)
         }
     }
 
-    // Point every layer group's index table at this row. The bind copies the current
-    // indices in and keeps writing there, so the row needs no refresh of its own
-    // afterwards -- and keeps doing so until the member leaves, which is why a step that
-    // only advances its members has nothing to rebind.
+    // The bind copies the current indices in and keeps writing there until the member
+    // leaves, so the row needs no refresh of its own and a step that only advances its
+    // members has nothing to rebind.
     for (LifeCycleId lc{0}; lc < mManager->numLifeCycles(); ++lc)
     {
         // Beam 0 only; addKvCache rejects anything wider.
@@ -1187,8 +1165,7 @@ int Batch::addKvCache(KvCache& kvCache, std::optional<int> requestedRow)
     _seedRowWatermarks(row, kvCache.historyLength(), kvCache.capacity());
     // A seating member brings no in-flight units: its lease is fresh, so everything its
     // history names already lives in the pages behind it. Seeding from the history is what
-    // lets the row be reused -- the departing member leaves this equal to its own history,
-    // and without this the next occupant would inherit that number.
+    // lets the row be reused, since the departing member leaves this equal to its own.
     mFlushedHistory[static_cast<size_t>(row)] = kvCache.historyLength();
 
     // Joining is a stream change, so it carries the same cross-stream sync a direct move
@@ -1278,9 +1255,8 @@ std::shared_ptr<KvCache> Batch::removeKvCache(KvCache& kvCache)
         auto* staged = _stagingRow(lc, row);
         std::fill(staged, staged + mMaxBlocksPerSeq, kBadPageIndex.value());
     }
-    // Leaving returns the lease, which discards whatever the GPU cache held: a lease comes
-    // back with every entry free. Anything worth keeping is written back by
-    // flushSparseUnits() before this.
+    // Leaving returns the lease, which discards whatever the GPU cache held;
+    // flushSparseUnits() has written back anything worth keeping.
     for (auto& lease : kvCache.mSparseCache)
     {
         lease.release();
@@ -1410,11 +1386,9 @@ std::vector<uint8_t> Batch::resize(
 
 void Batch::publish()
 {
-    // A step's work-list counters start here, all of them at once. Per layer and per
-    // direction they are independent, so one clear at the head of a step is enough -- and
-    // clearing them here rather than before each producer keeps a non-kernel node from
-    // standing between every resolve and whatever ran before it, which is what a launch
-    // dependency cannot reach across.
+    // A step's work-list counters start here, all of them at once: per layer and per
+    // direction they are independent, and one clear at the head of a step keeps a
+    // non-kernel node out from between every resolve and whatever ran before it.
     //
     // On the Batch's stream, like the staging below it. A fetch issued on another stream
     // therefore has to be ordered after this call -- but it already did, because it reads
@@ -1443,10 +1417,8 @@ void Batch::publish()
     // phases were mixed after it was fixed. A named SHARED makes this the check that holds
     // the caller to the claim: it is what lets a decode-only batch take the smaller table
     // on a life cycle the manager cannot clear for requests in general.
-    // Life cycle outermost so the members are reached only for one the manager left
-    // undecided about the mode this batch gave it. PER_LAYER it always allows, and a
-    // SHARED it answers `true` for no request can hold scratch in, so either way every
-    // member would pass and the rows need not be walked.
+    // Life cycle outermost: the rows are walked only for one the manager left undecided,
+    // since every other answer passes for every member.
     for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
     {
         if (mManager->supportsIndexMode(mIndexModes[lcId], lcId) == std::optional<bool>(true))
@@ -1477,11 +1449,9 @@ void Batch::publish()
         mStagingRead.close();
     }
 
-    // One transfer for the whole table, rather than one per row whose locks moved. The
-    // table is large but the copy is a single driver call on the upload stream, overlapping
-    // compute; per-row transfers would trade that for a launch apiece, and the driver cost
-    // of those dominates the bytes they save. Correctness does not depend on the choice --
-    // a narrower refresh would be slower to decide, never wrong.
+    // One transfer for the whole table rather than one per changed row: a single driver
+    // call on the upload stream overlaps compute, where per-row copies would cost a launch
+    // apiece.
     cuCheck(cuMemcpyHtoDAsync(staging, reinterpret_cast<void*>(mStaging->address()), _totalBytes(), upload));
     if (mScratchStaging)
     {
@@ -1598,8 +1568,7 @@ int Batch::numKvCaches() const noexcept
 
 bool Batch::isContiguous() const noexcept
 {
-    // Nothing occupied past the first free row is the same thing as a prefix, and says so
-    // without counting first.
+    // Nothing occupied past the first free row is the same thing as a prefix.
     auto const firstFree = std::find(mRows.begin(), mRows.end(), nullptr);
     return std::none_of(firstFree, mRows.end(), [](std::shared_ptr<KvCache> const& row) { return row != nullptr; });
 }
@@ -1663,8 +1632,7 @@ void Batch::prepareSparseWriteIndices(
     // span, so a row with nothing in flight needs no separate signal.
     //
     // Shared the same way the fetch shares, and for the same reason: buffers whose arena
-    // indices coincide are resolved once. The two paths have to agree, or a caller would
-    // need one rule for reading the fetch's output and another for this one.
+    // indices coincide are resolved once.
     auto const slots = sparseOutSlots(buffers);
     std::vector<bool> written(static_cast<size_t>(span.numBuffers), false);
     for (auto const& copy : mManager->_sparseCopyTemplates(lcId))
@@ -1844,8 +1812,6 @@ void Batch::fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const
     resolve.outSlot = scratch.outSlot;
     resolve.inFlightSlot = scratch.inFlightSlot;
     resolve.maxInFlightUnits = scratch.maxInFlightUnits;
-    // The list is one, reused from layer to layer; the counter is this layer's own, so a
-    // step can clear every layer's at once instead of one clear before each resolve.
     auto layerWork = scratch.fetchWork;
     layerWork.total += layerInGroup;
     resolve.work = layerWork;

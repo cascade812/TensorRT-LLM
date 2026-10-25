@@ -77,12 +77,10 @@ inline SharedPtr<Page> const& blockPageGetPage(BlockPage const& bp) noexcept
 // ScratchSlots — one life cycle's scratch slot locks, and their page-index mirror.
 //
 // The mirror is positional: entry `i` holds the page index of the `i`th lock, which is
-// what the conversion kernel reads when a block falls inside the scratch range. Only this
-// class can change the vector's length, so the two cannot drift; a lock cannot maintain
-// the mirror itself, since it knows neither its position nor which container holds it --
-// excess slots live in a second vector under the same owner and life cycle.
+// what the conversion kernel reads when a block falls inside the scratch range. Every
+// length change goes through this class, so the two stay in step.
 //
-// Entries past the live count read kBadPageIndex. Zero would be slot zero.
+// Entries past the live count read kBadPageIndex; zero would name slot zero.
 // ---------------------------------------------------------------------------
 class ScratchSlots
 {
@@ -96,8 +94,8 @@ public:
 
     [[nodiscard]] ScratchSlotLock popBack();
 
-    //! Unlock every slot and drop them. Paired because a bare clear would leave the mirror
-    //! naming pages that have gone back to the pool.
+    //! Unlock every slot, drop them, and return the mirror to the sentinel, so it names no
+    //! page that has gone back to the pool.
     void unlockAndClear();
 
     void reserve(size_t n)
@@ -109,8 +107,7 @@ public:
     //! A null `buf` reverts to the internal vector, carrying the current contents back.
     void setBuf(int32_t* buf, int len);
 
-    //! Page indices of the live slots, in order. Under TLLM_DEBUG_MODE every entry is
-    //! checked against the slot id of the lock it mirrors.
+    //! Page indices of the live slots, in order.
     [[nodiscard]] Span<int const> indices() const;
 
     [[nodiscard]] size_t size() const noexcept
@@ -144,7 +141,6 @@ public:
     }
 
 private:
-    //! Write the last slot's page index at its own position.
     void _mirrorBack();
     //! Fill [from, to) of the mirror with the sentinel; unset `to` means its end.
     void _mirrorSentinel(size_t from, std::optional<size_t> to = std::nullopt);
@@ -304,8 +300,7 @@ public:
 
     // Suspend: detach from CUDA stream, unlock pages → PageHolder.
     //
-    // Refused while the cache belongs to a Batch, for the same reason as resume(): the page
-    // unlocks write kBadPageIndex through the bound Span, which is the Batch's staged row.
+    // Refused while the cache belongs to a Batch, for the reason resume() is.
     //
     // Returns the sparse cache arena lease, which **discards whatever the GPU cache held**.
     // A lease comes back with every entry free, so a unit whose only copy was in a cell can
@@ -401,10 +396,6 @@ public:
     }
 
     // Row this cache occupies in its Batch; nullopt when it belongs to none.
-    //
-    // Also the answer to who owns its page index buffers: a member's are the Batch's rows,
-    // so setBasePageIndexBuf refuses while it is seated -- including for the Batch, which
-    // ends the membership before handing the indices back.
     std::optional<int> batchRow() const noexcept
     {
         return mBatchRow;
@@ -541,9 +532,8 @@ public:
 
     CUstream cudaStream() const;
 
-    // A member runs on its Batch's stream. Letting it move would leave the Batch's
-    // transfers and the member's own work ordered against different streams, which is
-    // exactly what a Batch exists to prevent.
+    // A member runs on its Batch's stream; moving it would order the Batch's transfers and
+    // the member's own work against different streams.
     void setCudaStream(CUstream stream)
     {
         if (mBatch != nullptr)
@@ -615,10 +605,8 @@ public:
 
     // ---- SWA scratch slot management ------------------------------------------
 
-    // Return scratch metadata for a layer group, or nullopt if no scratch blocks.
     // Block ordinal range this life cycle serves from scratch slots; empty when none of it
-    // does. Pulled per step rather than mirrored: it is two integers, and keeping it pulled
-    // is what stops a range and its slots from being updated at different moments.
+    // does. Read it alongside getScratchSlots(), which names the slots it covers.
     HalfOpenRange<BlockOrdinal> getSwaScratchRange(LayerGroupId lgId) const;
 
     // Page indices of this life cycle's scratch slots, in slot order.
@@ -629,7 +617,8 @@ public:
     // arrange that future scratch slot changes write there too. Pass buf=nullptr / len=0
     // to revert to internal storage.
     //
-    // Refused while this cache belongs to a Batch, for the reason setBasePageIndexBuf is.
+    // Refused while this cache belongs to a Batch, which binds the buffer itself; see
+    // setBasePageIndexBuf.
     void setScratchSlotBuf(LayerGroupId lgId, int32_t* buf, int len);
 
     // True if any lifecycle has scratch slots allocated.
@@ -651,8 +640,8 @@ public:
     // requires the already-committed tokens to be digest-free (verified by a scan).
     void setTextOnly(bool textOnly);
 
-    // Whether the given page index mode is supported for one life cycle, which is where
-    // the scratch slots actually live: SHARED requires that this life cycle hold none.
+    // Whether the mode is supported for one life cycle: SHARED requires that it hold no
+    // scratch slots.
     bool supportsIndexMode(PageIndexMode mode, LifeCycleId lcId) const;
 
     // ---- Internal callbacks (called by SharedPageLock) ----------------------
@@ -809,7 +798,6 @@ private:
     // Recover previously taken excess scratch slots back into mScratchSlots.
     void _recoverExcessScratchSlots(TypedVec<LifeCycleId, std::vector<ScratchSlotLock>>& excess);
 
-    // Release all scratch slots back to storage.
     // Release every GPU slot this request reserves: SWA scratch and sparse history cache.
     void _freeReservedGpuSlots();
 
@@ -885,13 +873,9 @@ private:
     TypedVec<LifeCycleId, ScratchSlots> mScratchSlots;
 
     // This request's lease on its sparse cache cells, by life cycle, together with the
-    // device-resident residency, recency and write-back scratch describing them. Taken at
-    // resume(), returned at suspend() and close(). Empty unless a sparse buffer of that
-    // life cycle has its fetch path configured.
-    //
-    // One member rather than two: the cells and the metadata that describes them have the
-    // same lifetime by construction, and with a flat arena the lease is a base index rather
-    // than a list of scattered slots.
+    // device-resident residency, recency and write-back scratch describing them. Taken
+    // when the cache joins a Batch, returned on removal, suspend() and close(). Empty
+    // unless a sparse buffer of that life cycle has its fetch path configured.
     TypedVec<LifeCycleId, SparseCacheLease> mSparseCache;
 };
 

@@ -90,13 +90,12 @@ struct BufferId
 
 //! Buffers a consumer must address from one table, under one base pointer.
 //!
-//! This states a kernel's requirement, not a preference: some attention ops take a single
-//! block table covering K and V rather than one each. Order defines the table's buffer
-//! dimension, so a kernel reads buffer `i` of this spec at entry `i`.
+//! Some attention ops take a single block table covering K and V rather than one each.
+//! Order defines the table's buffer dimension: a kernel reads buffer `i` at entry `i`.
 //!
-//! Every buffer must share a life cycle and a page-index scale, since no one table can
-//! serve buffers whose converted indices differ. A spec that spans either is refused
-//! when the Batch is constructed.
+//! All buffers must share a life cycle and a page-index scale; one table cannot serve
+//! buffers whose converted indices differ. A spec spanning either is refused when the
+//! Batch is constructed.
 struct IndexTableSpec
 {
     std::vector<BufferId> buffers;
@@ -122,13 +121,10 @@ struct CoalescedBuffer
     size_t singleBufferSize = 0;
     std::vector<BufferId> bufferIds;
 
-    //! Whether this pool's buffers take their history through the sparse GPU cache.
+    //! Whether this pool's pages live in the sparse GPU cache: host memory, device-mapped,
+    //! and not charged to the GPU tier's quota.
     //!
-    //! A property of the pool rather than of the life cycle: one layer may hold both a
-    //! sparse buffer and a dense one -- an indexer and the data it selects over belong to
-    //! the same attention computation -- and they differ only in where their pages live.
-    //! A sparse pool's pages are host memory, device-mapped, and are not charged to the
-    //! GPU tier's quota.
+    //! Per pool, not per life cycle -- one layer may hold both a sparse buffer and a dense one.
     bool isSparse = false;
 
     [[nodiscard]] size_t size() const noexcept
@@ -151,7 +147,6 @@ struct SlotDescVariant
     LifeCycleId lifeCycleId{0};
     TypedVec<PoolIndex, CoalescedBuffer> coalescedBuffers; // sorted size desc
 
-    //! Whether one pool of this group is sparse.
     [[nodiscard]] bool isSparse(PoolIndex poolIdx) const
     {
         return coalescedBuffers.at(poolIdx).isSparse;
@@ -257,8 +252,7 @@ struct StorageConfig
     TypedVec<CacheLevel, CacheTierConfig> cacheTiers;
     TypedVec<PoolGroupIndex, SlotDesc> slotDescList;
 
-    //! Host bytes the GPU tier's host-backed pools may take, or unset for unbounded. A
-    //! sizing input like the tier quotas, and carried here for the same reason.
+    //! Host bytes the GPU tier's host-backed pools may take, or unset for unbounded.
     std::optional<size_t> hostSparsePoolQuota;
 
     // Expansion factor per buffer (for heterogeneous tokens_per_block).

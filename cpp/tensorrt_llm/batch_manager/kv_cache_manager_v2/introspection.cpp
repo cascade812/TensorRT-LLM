@@ -233,7 +233,6 @@ std::vector<int32_t> KvCacheIntrospection::sparseFlushCounts(KvCache const& kvCa
 namespace
 {
 
-//! Device buffer holding a copy of `values`, for the resolve probe below.
 CudaUniqPtr<> deviceCopy(std::vector<int32_t> const& values)
 {
     CUstream const stream = nullptr;
@@ -381,9 +380,9 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     cuCheck(cuMemcpyHtoDAsync(devicePtr, deviceArena.data(), deviceArena.size(), stream));
 
     auto table = deviceCopy(pageTable);
-    // The caller still describes work as [list][selectionWidth] with a count per list,
-    // which is the shape a test can write by hand. Compact it here, because that is what
-    // the kernel consumes: a dense run per list, with the row carried by the entry.
+    // The caller describes work as [list][selectionWidth] with a count per list, which is
+    // the shape a test can write by hand. Compact it here, because that is what the kernel
+    // consumes: a dense run per list, with the row carried by the entry.
     auto const numLists = bufferLayer.empty() ? 1 : bufferLayer.back() + 1;
     auto const perList = static_cast<size_t>(std::max(selectionWidth, 1));
     std::vector<int32_t> flatRow;

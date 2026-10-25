@@ -155,14 +155,13 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     int tokensPerBlock = config.tokensPerBlock;
 
     // Map: lifeCycleId → (bufferSize → list of BufferId).
-    // Outer map key is LifeCycleId; inner map key is expanded buffer size.
+    // Outer map key is LifeCycleId; inner map key is (expanded buffer size, sparsity).
     // NOTE: Python uses insertion-ordered dict/defaultdict here. The std::map
     // grouping below intentionally remains sorted, which can make observable
     // pool-group indices/layout order differ from Python. Later lookups use
     // StorageConfig mappings, so this is not expected to affect correctness.
-    // Keyed on sparsity as well as size: a pool is uniformly sparse or uniformly dense, so
-    // one layer may contribute to both, and the GPU tier can host-back exactly the sparse
-    // pools without the life cycle having to be wholly one or the other.
+    // Keyed on sparsity as well as size: a pool is uniformly sparse or uniformly dense,
+    // so one layer's buffers may land in both.
     std::map<LifeCycleId, std::map<std::pair<size_t, bool>, std::vector<BufferId>>> bufferGroups;
     std::unordered_map<BufferId, int, BufferIdHash> expansionMap;
 
@@ -209,17 +208,15 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         std::ranges::sort(var.coalescedBuffers,
             [](CoalescedBuffer const& a, CoalescedBuffer const& b)
             {
-                // Size descending, then sparsity, so two pools of equal size keep a stable
-                // and reproducible order rather than depending on map iteration.
+                // Tie-break on sparsity: the sort is not stable, so equal-size pools
+                // need a total order.
                 return a.size() != b.size() ? a.size() > b.size() : a.isSparse < b.isSparse;
             });
         slotGroups.push_back(std::move(var));
     }
 
-    // Distinct reuse policies need separate GPU pools and eviction queues, and life cycles
-    // share a pool group only when their pools match position-wise on both size and
-    // sparsity -- which is what keeps a pool uniformly host-backed or device-backed once
-    // several life cycles share it.
+    // Distinct reuse policies need separate GPU pools and eviction queues. Keying on
+    // per-pool sparsity too keeps a shared pool uniformly host-backed or device-backed.
     struct PoolGroupKey
     {
         AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;

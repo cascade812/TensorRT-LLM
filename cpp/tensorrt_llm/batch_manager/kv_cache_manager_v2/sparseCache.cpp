@@ -42,9 +42,8 @@ size_t alignedBytes(size_t bytes) noexcept
 namespace
 {
 
-//! Per-lease metadata, in carve order. Arrays shared by every lease of a life cycle --
-//! the buffer maps and the recency template -- live on the arena instead, so a resume
-//! enqueues only the resets that differ per request.
+//! Per-lease metadata, in carve order. Arrays shared by every lease of a life cycle live
+//! on the arena instead.
 struct LeaseLayout
 {
     size_t ordinal = 0;
@@ -122,7 +121,7 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
     mMetadataBytes = layout.total();
 
     // One region per pool, each aligned so that a buffer's cell indices stay relative to its own
-    // pool's base -- which is what get_sparse_cache_base_address reports for that buffer.
+    // pool's base.
     std::vector<size_t> regionOffset;
     size_t cellBytes = 0;
     for (auto const& [bytes, buffers] : mShape.pools)
@@ -158,8 +157,7 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
     cuCheck(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(mSharedSlotInPool), mShape.bufferSlotInPool.data(),
         sizeof(int32_t) * mShape.bufferSlotInPool.size(), stream));
 
-    // The recency order every lease starts from: a per-layer identity permutation. Built once
-    // here so a resume is a device-to-device copy rather than a host transfer.
+    // The recency order every lease starts from: a per-layer identity permutation.
     std::vector<int32_t> identity(entries);
     for (int32_t layer = 0; layer < mShape.numLayers; ++layer)
     {
@@ -214,7 +212,6 @@ std::optional<SparseCacheLease> SparseCellArena::acquire(CUstream stream)
     view.lruOrder = carve(layout.lru);
 
     auto const entries = static_cast<size_t>(view.numEntries());
-    // Every entry starts free.
     cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(view.residentOrdinal),
         static_cast<unsigned int>(kBadBlockOrdinal.value()), entries, stream));
     cuCheck(cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(view.lruOrder), reinterpret_cast<CUdeviceptr>(mIdentity),

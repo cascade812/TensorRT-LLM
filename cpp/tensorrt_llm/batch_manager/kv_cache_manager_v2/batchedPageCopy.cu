@@ -1001,9 +1001,6 @@ void copyFlushRangesToDevice(CUdeviceptr dst, int32_t const* src, size_t count, 
     size_t numBytes = count * sizeof(int32_t);
     CUdeviceptr srcAddress = reinterpret_cast<CUdeviceptr>(src);
     CUmemcpyAttributes attributes{};
-    // The source is consumed before this returns, which is the point: the caller stages the
-    // ranges in an ordinary vector and may reuse it immediately, and the call does not wait
-    // for the stream to reach the copy.
     attributes.srcAccessOrder = CU_MEMCPY_SRC_ACCESS_ORDER_DURING_API_CALL;
     attributes.srcLocHint.type = CU_MEM_LOCATION_TYPE_HOST;
     attributes.dstLocHint.type = CU_MEM_LOCATION_TYPE_DEVICE;

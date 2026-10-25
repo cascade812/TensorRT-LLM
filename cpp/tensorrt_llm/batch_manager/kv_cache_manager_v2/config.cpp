@@ -68,9 +68,8 @@ void KVCacheManagerConfig::validate() const
         std::visit([](auto const& cfg) { cfg.validate(); }, tier);
     }
 
-    // Zero would ask for host-backed pools with no room for a single slot, which is a
-    // configuration error rather than a way to turn them off: whether a pool is host-backed
-    // is a property of the buffer, declared in the layer config.
+    // Zero asks for host-backed pools with no room for a single slot. It is not a way to turn
+    // them off: whether a pool is host-backed is a property of the buffer, not of this quota.
     if (hostSparsePoolQuota.has_value() && *hostSparsePoolQuota == 0)
     {
         throw AssertionError("KVCacheManagerConfig: host_sparse_pool_quota must be positive when set");
@@ -106,8 +105,8 @@ void KVCacheManagerConfig::validate() const
                         int const unitsPerPage = cfg.sparseCache->unitsPerPage(tokensPerBlock);
                         for (auto const& buf : cfg.buffers)
                         {
-                            // Checked here rather than at the first fetch: a deployment that
-                            // only finds out mid-step has already begun serving.
+                            // Reject an unusable layout now, not at the first fetch, when
+                            // serving has begun.
                             if (buf.isSparse)
                             {
                                 buf.sparseLayout(unitsPerPage);

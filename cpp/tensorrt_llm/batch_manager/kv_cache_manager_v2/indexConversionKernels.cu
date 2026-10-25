@@ -82,9 +82,9 @@ __global__ __launch_bounds__(kThreads) void indexConversionScratchKernel(
     {
         if (block >= scratchBeg && block < scratchEnd)
         {
-            // The slot cursor advances by the sub-pages each scratch block occupies, and
-            // the layer's own offset wraps inside the slot rather than running past it --
-            // a scratch slot is shared, so those sub-page positions are already spoken for.
+            // The slot cursor advances by the sub-pages each scratch block occupies. The
+            // layer's own offset wraps inside the slot: a scratch slot is shared, so the
+            // sub-page positions past it are already spoken for.
             int32_t const total = (block - scratchBeg) * desc.scratchPagesPerBlock;
             int32_t const slotId = scratchSlots[total / desc.scale];
             out[block] = slotId == kBadPageIndex.value()

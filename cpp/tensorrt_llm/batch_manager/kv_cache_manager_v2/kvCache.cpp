@@ -488,9 +488,6 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
 {
     KVCM2_API_GUARD();
     TLLM_CHECK(mStatus == Status::SUSPENDED);
-    // Locking pages writes page indices through the bound Span, which is the Batch's staged
-    // row. Doing that behind the Batch's back would race a publish still reading it, so a
-    // member is resumed before it joins rather than after.
     if (mBatch != nullptr)
     {
         throw LogicError("A KvCache in a Batch cannot be resumed; remove it from the Batch first");
@@ -609,10 +606,6 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
         numSlotsNeeded[lc] += scratchDeltaCounts[lc];
     }
 
-    // Cells backing this request's sparse cache, leased from the life cycle's arena.
-    // The arena lease is the Batch's to hand out, not this call's: a resumed request that
-    // is not being stepped cannot fetch, and a disaggregated one receives its whole history
-    // into host pages without touching the cache at all.
     bool const anyResident
         = std::any_of(numSlotsNeeded.begin(), numSlotsNeeded.end(), [](SlotCount n) { return n > 0; });
     {
@@ -679,7 +672,6 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
     }
     catch (OutOfPagesError const&)
     {
-        // Release pre-allocated deferred slots on failure.
         for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
             if (deferredSlots[lc].has_value())
@@ -854,10 +846,8 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
     mOptionalCandidates.clear();
     // Deferred copies survive a failed decode admission and must not be repeated on retry.
     mPartialCopyRetentionHolds.clear();
-    // A freshly-created cache starts SUSPENDED and is activated by this same
-    // resume() call, so gate the counter on mNeverResumed: only a cache that was
-    // previously ACTIVE and got suspended counts as a preemption recovery.
-    // Without this, the counter would track request admissions, not preemption.
+    // A new cache is SUSPENDED until this resume() activates it, so only one that had
+    // already resumed counts as a preemption recovery.
     bool const firstActivation = mNeverResumed;
     mNeverResumed = false;
     mStatus = Status::ACTIVE;
@@ -922,9 +912,7 @@ bool KvCache::prefetch(CacheLevel target)
 void KvCache::suspend()
 {
     KVCM2_API_GUARD();
-    // Unlocking pages writes kBadPageIndex through the bound Span, which is the Batch's
-    // staged row. A member is removed from its Batch before it suspends, so neither this
-    // nor resume() can race a publish that is still reading those rows.
+    // A member is removed from its Batch before it suspends; see the declaration.
     if (mBatch != nullptr)
     {
         throw LogicError("A KvCache in a Batch cannot be suspended; remove it from the Batch first");
@@ -981,10 +969,8 @@ void KvCache::close()
     TLLM_CHECK_DEBUG(_checkSanity());
     if (mStatus == Status::CLOSED)
         return;
-    // Clearing the blocks below writes kBadPageIndex through the bound Span, which for a
-    // member is the Batch's staged row, and the row would then name a cache that no longer
-    // holds anything. Refused for the same reason suspend() and resume() are; the
-    // destructor detaches first, so it never arrives here seated.
+    // Clearing the blocks below writes the staged row of a seated member; the destructor
+    // detaches first, so close() never arrives here seated.
     if (mBatch != nullptr)
     {
         throw LogicError("A KvCache in a Batch cannot be closed; remove it from the Batch first");
@@ -1581,8 +1567,6 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     }
 
     bool const recordGenerationAllocStats = mGenerationAllocReady && newCap > mCapacity;
-    // Both asked before either is applied: taking the capacity and then finding the history
-    // needs blocks would drop into the slow path below with mCapacity already advanced.
     if (!enableScratch && _canShortcutCapacity(newCap) && _canShortcutHistoryLength(newHist))
     {
         mCapacity = newCap;
@@ -1619,7 +1603,6 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         _decreaseCapacity(newNumBlocks);
     }
 
-    // Compute scratch deltas.
     auto [excessScratchSlots, deltaScratchSlots, scratchRanges] = _takeExcessScratchSlots(newCap, newHist);
 
     if (newNumBlocks >= oldNumBlocks)
@@ -1851,7 +1834,6 @@ bool KvCache::_canShortcutCapacity(int newCap) const
 {
     if (newCap == mCapacity)
         return true;
-    // No shortcut if block count changes.
     return divUp(newCap, mTokensPerBlock) == divUp(mCapacity, mTokensPerBlock);
 }
 
@@ -3241,14 +3223,8 @@ int KvCache::updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc,
     // entry point because this is the one place they all funnel through, so a page-touching
     // API added later is covered without being enumerated.
     //
-    // A check and not a wait: waiting is correct only before the whole operation, which is
-    // what Batch's mutators do. Waiting at this depth would sync under the exclusive manager
-    // lock, and would hide earlier writes of the same operation that had already raced --
-    // the reason publish() refuses rather than waits.
-    //
-    // Gated on the package's cached gDebug rather than TLLM_CHECK_DEBUG_WITH_INFO, whose own
-    // gate is an out-of-line call into another TU wrapping a function-local static. This runs
-    // once per page per life cycle.
+    // Gated on the package's cached gDebug rather than TLLM_CHECK_DEBUG_WITH_INFO, whose
+    // gate is an out-of-line call into another TU. This runs once per page per life cycle.
     if (TLLM_UNLIKELY(gDebug))
     {
         TLLM_CHECK_WITH_INFO(mBatch == nullptr || !mBatch->_publishInFlight(),
@@ -3492,7 +3468,7 @@ void ScratchSlots::unlockAndClear()
     {
         lock.unlock();
     }
-    // Past the live count the mirror already reads sentinel, so only what was live needs it.
+    // The mirror already reads sentinel past the live count.
     auto const live = mSlots.size();
     mSlots.clear();
     _mirrorSentinel(0, live);
@@ -3535,8 +3511,8 @@ Span<int const> ScratchSlots::indices() const
 
 HalfOpenRange<BlockOrdinal> KvCache::getSwaScratchRange(LayerGroupId lgId) const
 {
-    // Lock-free: scratch slots are exclusively owned by this KvCache and defrag-cased page movement
-    // happens only when all KvCache instances are suspended, which means mScratchSlots is empty.
+    // Lock-free: scratch slots are exclusively owned by this KvCache, and defrag-caused page
+    // movement happens only when every KvCache is suspended, which means mScratchSlots is empty.
     TLLM_CHECK_WITH_INFO(isActive(), "getSwaScratchRange() requires an ACTIVE KvCache");
     return _getScratchRange(mManager->lifeCycles().getLifeCycle(lgId));
 }

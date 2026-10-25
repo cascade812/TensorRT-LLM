@@ -48,12 +48,8 @@ public:
     //! constructor rounds up on the caller's behalf; elsewhere a size that is not a
     //! multiple of this is a bug and is rejected.
     //!
-    //! A granularity of sizes and of offsets within the reservation, not an alignment of
-    //! addresses: the base comes from mmap and is only page-aligned. Registration takes
-    //! any address, and the mprotect and madvise calls round to pages themselves.
-    //!
-    //! Runtime rather than constant: it follows the page size, which the platform
-    //! decides. hostMemSizeGranularity() is the one place that settles it.
+    //! A granularity of sizes and offsets, not an alignment of addresses: the base
+    //! comes from mmap and is only page-aligned.
     [[nodiscard]] static size_t sizeGranularity() noexcept
     {
         return hostMemSizeGranularity();
@@ -80,10 +76,6 @@ public:
     //! waits before publishing a sub-range has already covered every later read
     //! of it. Reaching past the watermark faults, so a range that nothing waits
     //! for fails loudly rather than reading zeros.
-    //!
-    //! Do not add a second wait on the read path to be safe. It cannot find an
-    //! unbacked byte the handout wait would have missed, and on a hot path it
-    //! costs an atomic load per access for nothing.
     HostMem(size_t vmSize, size_t initialSize, HostMemBackingOptions const& options = {}, bool waitForFill = true);
 
     //! Reserves exactly as much as it commits, for an allocation that never

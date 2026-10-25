@@ -38,9 +38,7 @@ struct PoolDesc
 
     //! What this pool's pages actually are, which is its group's tier except for a sparse
     //! pool of the GPU tier: those are host-backed, and the group still reports GPU_MEM
-    //! because its other pools are not. Anything that must name the medium of an address --
-    //! registering it for transfer, choosing a copy implementation -- needs it per pool,
-    //! so the medium is resolved here rather than left to be derived from two places.
+    //! because its other pools are not.
     CacheTier storageMedium = CacheTier::GPU_MEM;
 };
 

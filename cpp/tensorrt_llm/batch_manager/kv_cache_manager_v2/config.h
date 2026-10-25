@@ -142,10 +142,9 @@ inline std::optional<size_t> cacheTierMaxQuota(CacheTierConfig const& cfg)
 // which is the part the model integration knows. The manager supplies the page offset from
 // BufferAttr.
 //
-// Describes both sides of the copy, which have the same shape. The fetch reads hot pages in
-// ordinary slot layout and writes cells holding one buffer's worth of the same structure, so
-// one set of strides serves both with only the unit index differing. No codec is involved:
-// a codec transforms pages leaving the hot tier, which the fetch never reads.
+// Describes both sides of the copy: the fetch reads hot pages in ordinary slot layout and
+// writes cells with the same structure, so one set of strides serves both, only the unit
+// index differing. Codecs do not apply -- a codec transforms pages leaving the hot tier.
 // ---------------------------------------------------------------------------
 struct SelectionUnitLayout
 {
@@ -163,8 +162,6 @@ struct SelectionUnitLayout
     {
         auto const chunkStride = static_cast<uint32_t>(pageBytes / static_cast<size_t>(numChunks));
         auto const chunkBytes = chunkStride / static_cast<uint32_t>(unitsPerPage);
-        // Units pack densely inside a chunk, which is what makes the page's own extent
-        // enough to place them: a unit's stride is its size.
         return SelectionUnitLayout{static_cast<uint32_t>(numChunks), chunkBytes, chunkStride, chunkBytes};
     }
 
@@ -203,18 +200,13 @@ struct BufferConfig
 
     //! Pieces a selection unit is gathered from within its page. Sparse buffers only.
     //!
-    //! Per buffer, because it is the dimension order of *this* buffer's page:
-    //!
-    //!   - **1** for a sequence-major page (`[token][head][dim]`), where a unit's tokens
-    //!     carry all their heads with them and the whole unit is one contiguous range.
-    //!     Also 1 for any single-head page -- a compressed or pooled latent, say -- where
-    //!     the two orders are the same bytes.
+    //!   - **1** for a sequence-major page (`[token][head][dim]`), where a unit is one
+    //!     contiguous range; also 1 for a single-head page, where the two orders coincide.
     //!   - **numHeads** for a head-major page (`[head][token][dim]`), where each head
-    //!     contributes its own contiguous run and the unit is that many strided pieces.
+    //!     contributes its own contiguous run.
     //!
-    //! Everything else about the layout follows from this, the layer's unit size and the
-    //! page being densely packed, so a padded page -- an alignment gap between heads or
-    //! between units -- is not expressible.
+    //! The rest of the layout follows from this, the layer's unit size and the page being
+    //! densely packed, so a padded page is not expressible.
     int sparseUnitChunks = 1;
 
     void validate() const
@@ -225,9 +217,7 @@ struct BufferConfig
         }
         if (isSparse && tokensPerBlockOverride.has_value())
         {
-            // Both would name a unit count, and nothing makes them agree. The override is a
-            // storage-wide reinterpretation; a sparse layer says what it means with
-            // SparseCacheConfig::unitTokens, which leaves pages and index spaces alone.
+            // Both would name a unit count, and nothing reconciles them.
             throw std::invalid_argument(
                 "BufferConfig: tokensPerBlockOverride is not supported on a sparse buffer; use the layer's "
                 "sparse_cache.unit_tokens");
@@ -239,8 +229,7 @@ struct BufferConfig
     }
 
     //! Where this buffer's selection units sit inside a page, given how many the layer
-    //! divides a page into. Throws when the page cannot be divided as declared, which is a
-    //! configuration error rather than a fetch-time one.
+    //! divides a page into. Throws when the page cannot be divided as declared.
     [[nodiscard]] SelectionUnitLayout sparseLayout(int unitsPerPage) const
     {
         auto const pieces = static_cast<size_t>(sparseUnitChunks) * static_cast<size_t>(unitsPerPage);
@@ -267,9 +256,6 @@ struct BufferConfig
 struct SparseCacheConfig
 {
     //! Selection width: units a sparse-attention step selects for this layer.
-    //!
-    //! No default: there is no width that suits a layer which did not state one, and a
-    //! zero would only be caught later by validate().
     int numSelectedBlocks;
 
     //! Cells one buffer gets in a request's GPU cache, counting both populations: the
@@ -281,15 +267,11 @@ struct SparseCacheConfig
     //! sparse request contributes one query token per step, so the rest is all reuse.
     int maxCachedUnits;
 
-    //! Original tokens one selection unit spans. A whole page is `tokensPerBlock`, which a
-    //! caller wanting that states rather than omits -- there is no unit size that suits a
-    //! layer which did not name one.
+    //! Original tokens one selection unit spans. A whole page is `tokensPerBlock`.
     //!
     //! Must divide KVCacheManagerConfig::tokensPerBlock; the quotient is how many units a
-    //! page holds. Distinct from BufferConfig::tokensPerBlockOverride, which is a
-    //! storage-wide reinterpretation of a buffer's page: this names the sparse cache's
-    //! granularity and nothing else, so pages, page indices and index spaces all keep the
-    //! manager's tokensPerBlock.
+    //! page holds. It sets the sparse cache's granularity only: pages, page indices and
+    //! index spaces all keep the manager's tokensPerBlock.
     int unitTokens;
 
     //! Selection units one page holds, given the manager's tokensPerBlock.
@@ -379,8 +361,7 @@ struct AttentionLayerConfig
 
     // Private working pages never constrain prefix matching or enter the tree.
     AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
-    //! The sparse fetch path for this layer's sparse buffers, if it has one. Its presence
-    //! is what configures the GPU cache; sparse storage and locking work without it.
+    //! The sparse fetch path for this layer's sparse buffers, if it has one.
     std::optional<SparseCacheConfig> sparseCache;
 
     [[nodiscard]] std::optional<int> windowSize() const noexcept
@@ -391,9 +372,6 @@ struct AttentionLayerConfig
     void validate() const
     {
         detail::validateNoDuplicateBufferRoles(buffers);
-        // A layer may mix sparse and dense buffers. Sparsity decides which pool a buffer
-        // lands in, and nothing above that, so an indexer and the data it selects over can
-        // stay in the one layer they belong to.
         for (auto const& buf : buffers)
         {
             buf.validate();
@@ -636,14 +614,13 @@ struct KVCacheManagerConfig
     // Host memory the GPU tier's host-backed pools may take, in bytes. Unset leaves them
     // unbounded.
     //
-    // A sparse buffer's pages are host memory, so the device quota does not pay for them and
-    // nothing else bounds them either: a slot spans every pool of its group, so their row
-    // count follows from the device-backed pools the quota does size. This is the bound they
-    // otherwise lack. It only ever lowers a slot count, and when several pool groups hold
-    // such pools they share it by the same ratio that divides the device quota.
+    // A sparse buffer's pages are host memory, so the device quota does not size them: a slot
+    // spans every pool of its group, so their row count follows from the device-backed pools.
+    // This only ever lowers a slot count, and pool groups share it by the same ratio that
+    // divides the device quota.
     //
-    // Kept exactly, as is the feasibility floor `constraints` implies; the pool ratio is what
-    // gives way between them. The two can only conflict if the floors alone exceed this
+    // Honored exactly, as is the feasibility floor `constraints` implies; the pool ratio is
+    // what gives way between them. They can only conflict if the floors alone exceed this
     // budget, which construction rejects.
     std::optional<size_t> hostSparsePoolQuota;
 

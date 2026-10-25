@@ -503,9 +503,9 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
     // Shared prefixes and beams may name the same physical page more than once.
     // Reserve and migrate once per page, but issue one lock per owner below.
     //
-    // One destination, always the hot level: that is where every page is locked, whatever
-    // its pool group is made of. A sparse life cycle's hot pages are host memory, but that
-    // is a property of the allocation rather than of the level, so locking does not see it.
+    // Every page is locked at the hot level, whatever its pool group is made of. A sparse
+    // life cycle's hot pages are host memory, but that is a property of the allocation
+    // rather than of the level, so locking does not see it.
     std::unordered_set<Page*> seen;
     std::vector<SharedPtr<Page>> pages;
     pages.reserve(targets.size());
