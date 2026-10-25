@@ -70,6 +70,11 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // bodies can be coalesced, or what one body released reused by another. A driver that
 // expects a single round should check done() afterwards rather than assume it.
 //
+// A body's parameters are copied into its frame, so they are safe to hold across a
+// suspension. A lambda's captures are not: the frame only refers to the closure, so an
+// immediately-invoked capturing lambda leaves the frame pointing at a destroyed object.
+// Write such a body as a function taking what it needs.
+//
 // Not std::generator: no recursive `elements_of`, no allocator customization, and
 // the iterator is single-pass. Move-only, and an exception from the body is
 // rethrown by whichever call resumed it.
@@ -217,7 +222,12 @@ public:
     }
 
     //! What the body returned, once it has finished. Empty until then.
-    [[nodiscard]] std::optional<Return> const& result() const requires(kReturns)
+    //!
+    //! A template so that the signature is formed only where it is called. A
+    //! requires-clause gates overload resolution, not the declaration, so a void Return
+    //! would otherwise reach std::optional here and make the class ill-formed.
+    template <typename R = Return>
+    [[nodiscard]] std::optional<R> const& result() const requires(kReturns)
     {
         _rethrow();
         return mHandle.promise().mReturn;
@@ -232,7 +242,11 @@ public:
 
     //! Hand the body a value and resume it. The `co_yield` it was suspended on
     //! evaluates to `sent`.
-    void send(Send sent) requires(kSends)
+    //!
+    //! A template for the same reason as result(), with S kept out of deduction so the
+    //! parameter stays exactly Send rather than whatever the caller passed.
+    template <typename S = Send>
+    void send(std::type_identity_t<S> sent) requires(kSends)
     {
         _prime();
         if (mHandle.done())

@@ -94,6 +94,12 @@ target_include_directories(
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
           ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
 
+add_gtest(kvCacheManagerV2GeneratorTest
+          "kvCacheManagerV2GeneratorTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
+target_include_directories(
+  kvCacheManagerV2GeneratorTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+
 add_gtest(kvCacheManagerV2DigestPoolTest
           "kvCacheManagerV2DigestPoolTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
 target_include_directories(
