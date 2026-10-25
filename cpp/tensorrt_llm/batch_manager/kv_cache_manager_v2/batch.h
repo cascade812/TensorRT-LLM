@@ -579,6 +579,16 @@ private:
     void writeBackSparseUnits(LifeCycleId lifeCycle, CUstream stream);
 
     //! One layer group's page table on the device, which the index conversion reads.
+    //!
+    //! In the device staging rather than the mirror, because that is where the conversion
+    //! reads it and nothing captured reads the raw form at all. So it holds the staged step,
+    //! not the published one, and it is live: the next publish() refills it.
+    //!
+    //! Read it between waitPublished() and the next publish(). Before the first, the upload
+    //! that fills it may not have landed; after the second is enqueued, the upload stream is
+    //! free to overwrite it. The event that guards the staging against that overwrite covers
+    //! the Batch's own readers, which are enqueued before it is recorded, and cannot cover a
+    //! caller's.
     [[nodiscard]] GpuCoalescedPageTable gpuCoalescedPageTable(LayerGroupId layerGroupId) const;
 
     //! Per-row sparse cache state for one layer group, as the fetch kernel sees it.
@@ -690,9 +700,16 @@ private:
 
     //! Element offset of the per-row lease region within the staged block.
     [[nodiscard]] size_t _leasesOffset() const noexcept;
-    //! Bytes of one staged block: the page table, the row state and the views. A device
-    //! block is the same size, being a copy of it.
+    //! Bytes of one staged block: the page tables, the row state and the leases.
     [[nodiscard]] size_t _totalBytes() const noexcept;
+
+    //! Bytes of the mirror: the staged block from _historyOffset() on, which is everything
+    //! a captured kernel reads. The page tables ahead of it are read from the staging, by
+    //! the conversion, so carrying them across would serve nothing.
+    [[nodiscard]] size_t _mirrorBytes() const noexcept;
+
+    //! A staged element offset, as an address in the mirror.
+    [[nodiscard]] CUdeviceptr _mirrorAt(size_t stagedElement) const noexcept;
 
     //! Outlives the Batch.
     KvCacheManager* const mManager;
@@ -815,11 +832,16 @@ private:
     //! Bytes of that block, and so of each step's transfer.
     size_t mUploadBytes = 0;
 
-    //! What the fetch reads. Its address is baked into a captured graph, so it is written
-    //! only on the caller's stream, after the replay that read the previous publish.
+    //! The row state and the leases, as a captured kernel reads them. Its address is baked
+    //! into a captured graph, so it is written only on the caller's stream, after the replay
+    //! that read the previous publish.
+    //!
+    //! The staged block's tail, not all of it: the page tables leading that block are read
+    //! from mDeviceStaging by the conversion, and what a captured kernel reads of them is
+    //! the converted table instead.
     CudaUniqPtr<> mDevice;
 
-    //! A device-side copy of the same layout, filled from the host ahead of time.
+    //! A device-side copy of the whole staged block, filled from the host ahead of time.
     //!
     //! Nothing captured reads it, so its fill may overlap the previous step.
     CudaUniqPtr<> mDeviceStaging;

@@ -340,8 +340,10 @@ def test_pages_a_decoding_request_holds(
 def test_batch_matches_native_layout() -> None:
     # Three int32 page tables of 8,196 pages, two watermarks per row, and one arena
     # lease per row and life cycle.
-    assert V4_FLASH_BATCH.mirror_bytes == 4 * 256 * (3 * 8196 + 2 + 3)
-    assert V4_FLASH_BATCH.mirror_bytes == 25_183_232
+    assert V4_FLASH_BATCH.block_bytes == 4 * 256 * (3 * 8196 + 2 + 3)
+    assert V4_FLASH_BATCH.block_bytes == 25_183_232
+    # The mirror carries only the block's tail: what a captured kernel reads.
+    assert V4_FLASH_BATCH.mirror_bytes == 4 * 256 * (2 + 3) == 5_120
     # The staging copy is mapped in whole 4 KiB pages.
     assert V4_FLASH_BATCH.staging_bytes == 25_186_304
     # Per row: a slot per selected unit, a miss count and the unit in flight. Then the
@@ -352,9 +354,9 @@ def test_batch_matches_native_layout() -> None:
         256 * (512 + 2) + (3 * 256 * 512 + 1) + 2 * (3 * 256 + 1) + 256 * 2
     )
     assert V4_FLASH_BATCH.fetch_scratch_bytes == 2_107_404
-    # The device holds the mirror twice, the tables the fetch reads and the
-    # staging copy a publish fills ahead of them, beside the work arrays.
-    assert V4_FLASH_BATCH.device_bytes == 2 * 25_183_232 + 2_107_404 == 52_473_868
+    # The device holds the staged block a publish fills ahead of the step, the mirror of
+    # its tail that a captured kernel reads, and the work arrays.
+    assert V4_FLASH_BATCH.device_bytes == 25_183_232 + 5_120 + 2_107_404 == 27_295_756
 
 
 @pytest.mark.cpu_only
@@ -643,7 +645,7 @@ def test_capacity_names_the_binding_limit_and_the_batch_that_fits() -> None:
     assert "4 by host" in report
     assert "limited by host" in report
     assert "513 leases" in report
-    assert "offload buffers 181.1MiB for 256 rows" in report
+    assert "offload buffers 157.0MiB for 256 rows" in report
     assert "A max_batch_size of 240 fits" in report
 
 

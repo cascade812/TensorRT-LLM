@@ -3480,7 +3480,7 @@ def test_sparse_batch_buffers_come_from_a_provisional_config(offload: bool) -> N
     )
     assert batch.num_life_cycles == 2
     assert batch.selection_widths == (1,)
-    assert device_bytes == 2 * batch.mirror_bytes + batch.fetch_scratch_bytes + 1000
+    assert device_bytes == batch.block_bytes + batch.mirror_bytes + batch.fetch_scratch_bytes + 1000
     assert staging_bytes == batch.staging_bytes == 4096
     get_scratch_bytes.assert_called_once_with(config)
     (gpu_tier,) = build.call_args.kwargs["cache_tiers"]

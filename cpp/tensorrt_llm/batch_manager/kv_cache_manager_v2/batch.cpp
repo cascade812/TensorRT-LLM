@@ -129,14 +129,15 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, std::vector<IndexTableSpe
         std::fill(mScratchStaging + ranges, mScratchStaging + scratchElements, kBadPageIndex.value());
     }
 
-    // The staging mirrors the device block exactly, so publishing it is one linear copy.
-    // It doubles what a Batch costs in device memory, which is the price of letting the
-    // host-to-device crossing overlap the previous step. Only the part a captured graph
-    // reads is carried on to mDevice; the scratch tail is read from the staging itself.
-    mDevice = allocateDeviceMemory(_totalBytes());
+    // The device staging takes the whole block, so the host-to-device crossing is one
+    // linear copy that can overlap the previous step. The mirror takes only the tail a
+    // captured kernel reads: the page tables and the scratch are read from the staging, by
+    // the conversion, which runs fresh each publish and so needs no snapshot of its own.
+    mDevice = allocateDeviceMemory(_mirrorBytes());
     mDeviceStaging = allocateDeviceMemory(mUploadBytes);
     auto* const deviceStaging = reinterpret_cast<std::byte*>(mDeviceStaging.get());
-    cuCheck(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(mDevice.get()), staging, _totalBytes(), cudaStream()));
+    cuCheck(cuMemcpyHtoDAsync(
+        reinterpret_cast<CUdeviceptr>(mDevice.get()), staging + _historyOffset(), _mirrorBytes(), cudaStream()));
     cuCheck(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(deviceStaging), staging, mUploadBytes, cudaStream()));
 
     // Hands the layout its slice of the block above and lets it build the descriptors,
@@ -1096,6 +1097,18 @@ size_t Batch::_totalBytes() const noexcept
     return sizeof(int32_t) * _totalElements();
 }
 
+size_t Batch::_mirrorBytes() const noexcept
+{
+    return sizeof(int32_t) * (_totalElements() - _historyOffset());
+}
+
+CUdeviceptr Batch::_mirrorAt(size_t stagedElement) const noexcept
+{
+    // The mirror carries the staged block from _historyOffset() on, so a staged offset
+    // addresses it once rebased. The page indices ahead of that are read from the staging.
+    return reinterpret_cast<CUdeviceptr>(mDevice.get()) + sizeof(int32_t) * (stagedElement - _historyOffset());
+}
+
 void Batch::_stageRowState()
 {
     auto* base = reinterpret_cast<int32_t*>(mStaging.address());
@@ -1492,10 +1505,11 @@ void Batch::publish()
     cuCheck(cuMemcpyHtoDAsync(staging, reinterpret_cast<void*>(mStaging.address()), mUploadBytes, upload));
     mPublished = mUploadStream.recordEvent();
 
-    // The staging now holds this step's tables, so carrying them across is all that is
-    // left on the Batch's stream -- one copy, because the two layouts match.
+    // The staging now holds this step's tables, so carrying the mirror across is all that
+    // is left on the Batch's stream -- one copy, because the mirror is its tail verbatim.
     mPublished.waitInStream(reinterpret_cast<CudaStream>(cudaStream()));
-    cuCheck(cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(mDevice.get()), staging, _totalBytes(), cudaStream()));
+    cuCheck(cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(mDevice.get()),
+        staging + sizeof(int32_t) * _historyOffset(), _mirrorBytes(), cudaStream()));
     _convertIndices(cudaStream());
     mStagingRead = CachedCudaEvent{reinterpret_cast<CudaStream>(cudaStream())};
 }
@@ -1531,7 +1545,9 @@ GpuCoalescedPageTable Batch::gpuCoalescedPageTable(LifeCycleId lifeCycleId) cons
         throw std::out_of_range("Batch::gpuCoalescedPageTable: unknown layer group");
     }
     GpuCoalescedPageTable view;
-    view.data = reinterpret_cast<CUdeviceptr>(mDevice.get())
+    // From the staging: the mirror carries only what a captured kernel reads, and the raw
+    // indices are read there by the conversion rather than copied on.
+    view.data = reinterpret_cast<CUdeviceptr>(mDeviceStaging.get())
         + sizeof(int32_t) * _rowElements() * static_cast<size_t>(lifeCycleId.value());
     view.numRows = mMaxBatchSize;
     view.blocksPerRow = mMaxBlocksPerSeq;
@@ -1544,17 +1560,14 @@ CUdeviceptr Batch::sparseLeases(LifeCycleId lifeCycleId) const
     {
         throw std::out_of_range("Batch::sparseLeases: unknown layer group");
     }
-    return reinterpret_cast<CUdeviceptr>(mDevice.get())
-        + sizeof(int32_t)
-        * (_leasesOffset() + static_cast<size_t>(lifeCycleId.value()) * static_cast<size_t>(mMaxBatchSize));
+    return _mirrorAt(_leasesOffset() + static_cast<size_t>(lifeCycleId.value()) * static_cast<size_t>(mMaxBatchSize));
 }
 
 WatermarkView Batch::watermarks() const
 {
-    auto const base = reinterpret_cast<CUdeviceptr>(mDevice.get());
     WatermarkView view;
-    view.historyLength = base + sizeof(int32_t) * _historyOffset();
-    view.capacity = base + sizeof(int32_t) * _capacityOffset();
+    view.historyLength = _mirrorAt(_historyOffset());
+    view.capacity = _mirrorAt(_capacityOffset());
     view.numRows = mMaxBatchSize;
     return view;
 }

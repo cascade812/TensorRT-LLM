@@ -1,8 +1,7 @@
 # Index conversion in Batch
 
-Status: implemented, except where noted. The conversion, the index modes, the table specs
-and the scratch substitution all live in `Batch`; what remains is retiring the raw mirror,
-under "Buffers" below.
+Status: implemented. The conversion, the index modes, the table specs and the scratch
+substitution all live in `Batch`.
 
 A `Batch` publishes page indices as the cache stores them -- slot ids, level-relative,
 with `kBadPageIndex` preserved. Attention kernels need something else: a plain table of
@@ -163,7 +162,7 @@ so a caller that does not care is not obliged to.
 | `mStaging` | raw `[lc][row][block]`, the row state, the per-row leases, the scratch slot tables; pinned host | the upload |
 | `mDeviceStaging` | the same block, device side | the conversion |
 | `mIndexTableMemory` | the converted tables | the captured kernels |
-| `mDevice` | the row state and the leases, and a copy of the raw indices | the captured kernels |
+| `mDevice` | the row state and the leases | the captured kernels |
 
 The converted tables are their own allocation, carved by a geometry that comes from the mode
 and the merge classes, so `indexTableAddress()` hands out offsets into it and a merged set's
@@ -175,12 +174,17 @@ host-to-device copy and `mDevice` one device-to-device copy, so each is worth pa
 converted tables are produced by the conversion kernel rather than copied, so packing them
 with either would save no call and cost the offset arithmetic.
 
-`mDevice` still carries a copy of the raw page indices, which this design would retire. With
-sparse life cycles converted too, nothing captured reads the raw form: the region's only
-reader is `gpuCoalescedPageTable()`, reached solely from `KvCacheIntrospection`. Retiring it
-leaves `mDevice` holding the row state and the leases -- the two things a captured kernel
-reads that are not converted indices -- and `mDeviceStaging` as the only raw copy on the
-device.
+`mDevice` carries no raw indices. With sparse life cycles converted too, nothing captured
+reads the raw form, so the mirror is the staged block's tail -- the row state and the leases,
+the two things a captured kernel reads that are not converted indices -- and `mDeviceStaging`
+is the only raw copy on the device. `gpuCoalescedPageTable()` reads it there, which is both
+where the truth is and where the conversion reads it.
+
+That makes the mirror a tail rather than a copy of the block, so a staged element offset
+addresses it once rebased by `_historyOffset()`, and the per-step device-to-device copy
+carries the row state and the leases alone. The raw indices dominate the block -- a row's
+page table is `maxBlocksPerSeq` entries where its row state is a handful -- so what used to
+be the larger of the two per-step transfers is now the smaller by orders of magnitude.
 
 Batch's own device footprint rises: the converted tables carry the buffer dimension, and
 under PER_LAYER the layer dimension, where the raw mirror carried neither. The system total

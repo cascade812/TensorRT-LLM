@@ -2441,7 +2441,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         "A view, not a copy, and so unlike its neighbours it neither synchronises nor returns a "
         "plain list. The device copy exists for the index conversion to read, and the kernels a "
         "consumer writes read the converted table instead: Batch.coalesced_page_table() is where "
-        "the indices themselves are read.");
+        "the indices themselves are read.\n\n"
+        "It shows the staged step rather than the published one, and it is live. Read it "
+        "between wait_published() and the next publish(): before the first the upload filling "
+        "it may not have landed, and once the second is enqueued the upload stream is free to "
+        "overwrite it.");
     mIntrospection.def("batch_sparse_view_entries", &kv::KvCacheIntrospection::batchSparseViewEntries, nb::arg("batch"),
         nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(

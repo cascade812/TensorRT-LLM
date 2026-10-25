@@ -381,8 +381,8 @@ class SparseBatchShape:
     flush_capacities: tuple[int, ...]
 
     @property
-    def mirror_bytes(self) -> int:
-        """Device bytes of the mirror: the page tables, watermarks and leases."""
+    def block_bytes(self) -> int:
+        """Device bytes of the staged block: the page tables, watermarks and leases."""
         entries = self.max_batch_size * (
             self.num_life_cycles * self.max_blocks_per_seq
             + _BATCH_WATERMARKS_PER_ROW
@@ -391,15 +391,26 @@ class SparseBatchShape:
         return _INDEX_BYTES * entries
 
     @property
+    def mirror_bytes(self) -> int:
+        """Device bytes of the mirror: the block's tail, which a captured kernel reads.
+
+        The page tables leading the block are read from its device staging copy by the
+        index conversion, so they are not carried on.
+        """
+        return (
+            _INDEX_BYTES * self.max_batch_size * (_BATCH_WATERMARKS_PER_ROW + self.num_life_cycles)
+        )
+
+    @property
     def staging_bytes(self) -> int:
-        """Pinned host bytes of the staging copy of the mirror."""
-        return pad_up(self.mirror_bytes, _HOST_PAGE_BYTES)
+        """Pinned host bytes of the staging copy of the block."""
+        return pad_up(self.block_bytes, _HOST_PAGE_BYTES)
 
     @property
     def device_bytes(self) -> int:
-        """Device bytes of the Batch: the mirror, its device staging copy and the
+        """Device bytes of the Batch: the staged block, the mirror of its tail and the
         fetch's work arrays."""
-        return 2 * self.mirror_bytes + self.fetch_scratch_bytes
+        return self.block_bytes + self.mirror_bytes + self.fetch_scratch_bytes
 
     @property
     def fetch_scratch_bytes(self) -> int:
