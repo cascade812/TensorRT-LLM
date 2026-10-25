@@ -71,8 +71,6 @@ __global__ __launch_bounds__(kThreads) void indexConversionScratchKernel(
     int32_t const row = static_cast<int32_t>(blockIdx.x);
 
     int32_t const* raw = desc.raw + static_cast<ptrdiff_t>(row) * rawRowStride;
-    // Row-major in the entries: a row's entries are adjacent, so a request's K and V
-    // sit together the way an attention kernel's page list wants them.
     int32_t* out = desc.converted + (static_cast<ptrdiff_t>(row) * desc.numBuffers + buffer) * blocksPerRow;
     int32_t const offset = desc.offsets[buffer];
 
@@ -89,7 +87,9 @@ __global__ __launch_bounds__(kThreads) void indexConversionScratchKernel(
             // a scratch slot is shared, so those sub-page positions are already spoken for.
             int32_t const total = (block - scratchBeg) * desc.scratchPagesPerBlock;
             int32_t const slotId = scratchSlots[total / desc.scale];
-            out[block] = slotId * desc.scale + (total % desc.scale + offset) % desc.scale;
+            out[block] = slotId == kBadPageIndex.value()
+                ? kBadPageIndex.value()
+                : slotId * desc.scale + (total % desc.scale + offset) % desc.scale;
             continue;
         }
         int32_t const slot = raw[block];

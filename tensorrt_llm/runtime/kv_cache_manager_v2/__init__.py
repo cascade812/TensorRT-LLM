@@ -161,7 +161,6 @@ PoolRebalanceConfig = _cpp.PoolRebalanceConfig
 ReuseGroupStatus = _cpp.ReuseGroupStatus
 ReuseScope = _cpp.ReuseScope
 ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
-ScratchDesc = _cpp.ScratchDesc
 Batch = _cpp.Batch
 IndexTableSpec = _cpp.IndexTableSpec
 SlotDesc = _cpp.SlotDesc
@@ -269,7 +268,6 @@ __all__ = [
     "Priority",
     "ReuseGroupStatus",
     "ReuseScope",
-    "ScratchDesc",
     "Batch",
     "IndexTableSpec",
     "KVCacheIterationStatsDelta",

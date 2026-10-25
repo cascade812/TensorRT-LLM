@@ -2991,17 +2991,18 @@ class KVCacheManagerV2(BaseResourceManager):
 
         for pool_id in range(self.num_pools):
             for context_idx, request_id in enumerate(request_ids[:num_contexts]):
-                desc = self.kv_cache_map[request_id].get_scratch_desc(pool_id)
-                if desc is None:
+                cache = self.kv_cache_map[request_id]
+                scratch_range = cache.get_swa_scratch_range(pool_id)
+                if not scratch_range:
                     continue
-                slot_ids = desc.slot_ids
+                slot_ids = cache.get_scratch_slots(pool_id)
                 if len(slot_ids) > self._max_scratch_slots:
                     raise RuntimeError(
                         f"Scratch slot count {len(slot_ids)} exceeds staging capacity "
                         f"{self._max_scratch_slots}"
                     )
-                host_begs[pool_id, context_idx] = int(desc.range.beg)
-                host_ends[pool_id, context_idx] = int(desc.range.end)
+                host_begs[pool_id, context_idx] = int(scratch_range.beg)
+                host_ends[pool_id, context_idx] = int(scratch_range.end)
                 for slot_idx, slot_id in enumerate(slot_ids):
                     host_slots[pool_id, context_idx, slot_idx] = int(slot_id)
 

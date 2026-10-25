@@ -805,7 +805,16 @@ class _KVCache:
         its history costs the GPU cache nothing until it is seated.
         """
     def prefetch(self, target: CacheLevel) -> bool: ...
-    def get_scratch_desc(self, layer_group_id: LayerGroupId) -> ScratchDesc | None: ...
+    def get_swa_scratch_range(self, layer_group_id: LayerGroupId) -> HalfOpenRange:
+        """Block ordinal range this life cycle serves from scratch slots.
+
+        Empty when none of its blocks do. Pulled per step rather than mirrored: it is two
+        integers, and keeping it pulled is what stops a range and its slots from being
+        updated at different moments.
+        """
+
+    def get_scratch_slots(self, layer_group_id: LayerGroupId) -> list[int]:
+        """Page indices of this life cycle's scratch slots, in slot order."""
     @property
     def has_scratch_slots(self) -> bool: ...
     @property
@@ -909,22 +918,18 @@ class HalfOpenRange:
     def __eq__(self, other: object) -> bool: ...
 
 @dataclass(slots=True, frozen=True)
-class ScratchDesc:
-    range: HalfOpenRange
-    slot_ids: Sequence[int]
-    def __bool__(self) -> bool: ...
-
-@dataclass(slots=True, frozen=True)
 class PageIndexConverter:
     scale: int
     expansion: int
     layer_offset: int
+    scratch_pages_per_block: int
 
     def __call__(
         self,
         base_indices: Sequence[int],
         index_mode: PageIndexMode | None = None,
-        scratch: ScratchDesc | None = None,
+        scratch_range: HalfOpenRange | None = None,
+        scratch_slots: Sequence[int] = (),
     ) -> list[int]: ...
 
 class IKvCacheColdPageCodec: ...

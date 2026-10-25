@@ -1975,6 +1975,8 @@ def _run_compressor_with_fake_postprocess(
         )
         metadata.sparse_offload_state = SimpleNamespace(
             layers={0: descriptor},
+            # Neither buffer shares a slice here, so each reads at its own index.
+            out_slots={0: (0, 1)},
             batch_rows=torch.tensor([2, -1, -1, -1], device=DEVICE, dtype=torch.int32),
             scatter_start_positions=torch.zeros(4, device=DEVICE, dtype=torch.int32),
         )

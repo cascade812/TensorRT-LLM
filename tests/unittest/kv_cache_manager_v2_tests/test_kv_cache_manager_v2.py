@@ -181,6 +181,21 @@ with temporary_sys_path(_TEST_DIR):
 NULL_STREAM = cast(CudaStream, 0)
 
 
+class _ScratchDesc(NamedTuple):
+    """A life cycle's scratch range and the slot ids serving it."""
+
+    range: HalfOpenRange
+    slot_ids: list[int]
+
+
+def _scratch_desc(kv_cache, lg_id):
+    """The scratch range and the slots serving it, or None when none of the blocks do."""
+    scratch_range = kv_cache.get_swa_scratch_range(lg_id)
+    if not scratch_range:
+        return None
+    return _ScratchDesc(scratch_range, kv_cache.get_scratch_slots(lg_id))
+
+
 def get_cached_cuda_event_type():
     try:
         from bindings.internal.batch_manager.kv_cache_manager_v2 import _introspection
@@ -2875,7 +2890,12 @@ class TestIndexTables(unittest.TestCase):
                 - _introspection.batch_index_table_base(batch, layer, role)
             ) // stride
             reference = list(
-                manager.get_page_index_converter(layer, role)(raw[:blocks], mode, scratch)
+                manager.get_page_index_converter(layer, role)(
+                    raw[:blocks],
+                    mode,
+                    scratch.range if scratch else None,
+                    scratch.slot_ids if scratch else [],
+                )
             )
             want = [x if x == BAD_PAGE_INDEX else x + shift for x in reference]
             # Row-major in the entries: a row carries every entry before the next row
@@ -2942,7 +2962,7 @@ class TestIndexTables(unittest.TestCase):
             manager.shutdown()
 
     def test_scratch_blocks_match_the_reference_converter(self):
-        """The substituting path, against PageIndexConverter given the same ScratchDesc.
+        """The substituting path, against PageIndexConverter given the same scratch range.
 
         A scratch block's slot comes from the spec rather than the page table, and the
         layer's offset wraps inside the shared slot instead of being added to it. Both are
@@ -3003,7 +3023,7 @@ class TestIndexTables(unittest.TestCase):
                 self.assertTrue(cache.resize(prompt_len))
                 self.assertTrue(cache.has_scratch_slots, "config produced no scratch")
 
-                scratch = cache.get_scratch_desc(lg)
+                scratch = _scratch_desc(cache, lg)
                 self.assertIsNotNone(scratch)
                 self.assertGreater(scratch.range.end - scratch.range.beg, 0)
 
@@ -9479,7 +9499,7 @@ class TestScratchReuse(TestKVCacheManagerV2):
             self.assertTrue(kv.resume(stream))
             self.assertTrue(kv.resize(len(prompt)))
             self.assertTrue(kv.enable_swa_scratch_reuse)
-            self.assertIsNotNone(kv.get_scratch_desc(lg_id))
+            self.assertIsNotNone(_scratch_desc(kv, lg_id))
             self.assertTrue(kv.has_scratch_slots)
             with self.assertRaisesRegex(ValueError, "scratch blocks are needed"):
                 kv.enable_swa_scratch_reuse = False
@@ -9487,14 +9507,14 @@ class TestScratchReuse(TestKVCacheManagerV2):
             self.engine.execute([Step(kv, prompt, history)], stream)
             kv.commit(prompt)
             history.extend(prompt)
-            self.assertIsNone(kv.get_scratch_desc(lg_id))
+            self.assertIsNone(_scratch_desc(kv, lg_id))
             self.assertFalse(kv.has_scratch_slots)
 
             kv.enable_swa_scratch_reuse = False
             self.assertFalse(kv.enable_swa_scratch_reuse)
             kv.capacity = len(history) + 1
             self.assertFalse(kv.has_scratch_slots)
-            self.assertIsNone(kv.get_scratch_desc(lg_id))
+            self.assertIsNone(_scratch_desc(kv, lg_id))
 
             self.engine.execute([Step(kv, [decode_token], history)], stream)
             kv.commit([decode_token])
@@ -9504,13 +9524,13 @@ class TestScratchReuse(TestKVCacheManagerV2):
             kv.enable_swa_scratch_reuse = True
             self.assertTrue(kv.enable_swa_scratch_reuse)
             self.assertTrue(kv.resize(len(history) + len(second_prompt), len(history)))
-            self.assertIsNotNone(kv.get_scratch_desc(lg_id))
+            self.assertIsNotNone(_scratch_desc(kv, lg_id))
             self.assertTrue(kv.has_scratch_slots)
 
             self.engine.execute([Step(kv, second_prompt, history)], stream)
             kv.commit(second_prompt)
             history.extend(second_prompt)
-            self.assertIsNone(kv.get_scratch_desc(lg_id))
+            self.assertIsNone(_scratch_desc(kv, lg_id))
             self.assertFalse(kv.has_scratch_slots)
             self.engine.execute([Step(kv, [], history)], stream)
             kv.stop_committing()
@@ -9558,7 +9578,7 @@ class TestScratchReuse(TestKVCacheManagerV2):
             self.assertEqual(len(layer_groups), 1)
             lg_id = LayerGroupId(0)
 
-            scratch_desc = kv.get_scratch_desc(lg_id)
+            scratch_desc = _scratch_desc(kv, lg_id)
             assert scratch_desc is not None
             self.assertIsNotNone(scratch_desc)
             num_blocks = div_up(prompt_len, tokens_per_block)  # 32
@@ -9576,7 +9596,7 @@ class TestScratchReuse(TestKVCacheManagerV2):
             # Verify much less than 32 total slots
             self.assertLess(expected_total, num_blocks)
 
-            # Scratch slot count in ScratchDesc matches expected
+            # Scratch slot count matches expected
             self.assertEqual(len(scratch_desc.slot_ids), expected_scratch_slots)
 
             # Check base page indices: scratch blocks have BAD_PAGE_INDEX, normal have valid
@@ -9637,7 +9657,7 @@ class TestScratchReuse(TestKVCacheManagerV2):
 
     @parameterized.expand([(0, 7), (64, 5)])
     def test_scratch_shared_slot_ids(self, rewind_len: int, expected_scratch_blocks: int):
-        """Verify that scratch blocks share coalesced slot IDs via ScratchDesc."""
+        """Verify that scratch blocks share coalesced slot IDs."""
         # 8 layers, window=32, tokens_per_block=32, prompt=256
         # num_sub_pages = 8 (all layers in one group)
         # rewind_len=0: blocks 0-6 are scratch, block 7 is in-window.
@@ -9662,7 +9682,7 @@ class TestScratchReuse(TestKVCacheManagerV2):
             self.assertTrue(success)
 
             lg_id = LayerGroupId(0)
-            scratch_desc = kv.get_scratch_desc(lg_id)
+            scratch_desc = _scratch_desc(kv, lg_id)
             assert scratch_desc is not None
             self.assertIsNotNone(scratch_desc)
 
@@ -9689,7 +9709,9 @@ class TestScratchReuse(TestKVCacheManagerV2):
             # Verify PageIndexConverter.convert_all produces correct per-layer indices
             layer_id = LayerId(0)
             converter = self.manager.get_page_index_converter(layer_id, DataRole("key"))
-            page_indices = converter(indices, PageIndexMode.PER_LAYER, scratch_desc)
+            page_indices = converter(
+                indices, PageIndexMode.PER_LAYER, scratch_desc.range, scratch_desc.slot_ids
+            )
             # All scratch blocks should produce valid (non-BAD) page indices
             for i in range(scratch_desc.range.beg, scratch_desc.range.end):
                 self.assertNotEqual(
@@ -9776,7 +9798,7 @@ class TestScratchReuse(TestKVCacheManagerV2):
             lg_id_0 = LayerGroupId(0)
             lg_id_1 = LayerGroupId(1)
 
-            scratch_desc_0 = kv.get_scratch_desc(lg_id_0)
+            scratch_desc_0 = _scratch_desc(kv, lg_id_0)
             self.assertIsNotNone(scratch_desc_0)
             self.assertEqual(scratch_desc_0.range.beg, chunk1_scratch_range[0])
             self.assertEqual(scratch_desc_0.range.end, chunk1_scratch_range[1])
@@ -9786,7 +9808,7 @@ class TestScratchReuse(TestKVCacheManagerV2):
             )
 
             # Layer 1 should have 0 scratch blocks
-            scratch_desc_1 = kv.get_scratch_desc(lg_id_1)
+            scratch_desc_1 = _scratch_desc(kv, lg_id_1)
             self.assertIsNone(scratch_desc_1)
 
             self.engine.execute([Step(kv, prompt1, [])], stream)
@@ -9802,7 +9824,7 @@ class TestScratchReuse(TestKVCacheManagerV2):
             success = kv.resize(352, 256)
             self.assertTrue(success)
 
-            scratch_desc_0 = kv.get_scratch_desc(lg_id_0)
+            scratch_desc_0 = _scratch_desc(kv, lg_id_0)
             if chunk2_scratch_range is None:
                 self.assertIsNone(scratch_desc_0)
             else:
@@ -9811,7 +9833,7 @@ class TestScratchReuse(TestKVCacheManagerV2):
                 self.assertEqual(scratch_desc_0.range.end, chunk2_scratch_range[1])
 
             # Layer 1 should still have 0 scratch blocks
-            scratch_desc_1 = kv.get_scratch_desc(lg_id_1)
+            scratch_desc_1 = _scratch_desc(kv, lg_id_1)
             self.assertIsNone(scratch_desc_1)
 
             self.engine.execute([Step(kv, prompt2, prompt1)], stream)

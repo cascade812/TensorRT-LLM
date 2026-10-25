@@ -46,7 +46,6 @@ class Batch;
 class KvCacheIntrospection;
 class KvCacheManager;
 class StorageManager;
-struct ScratchDesc;
 
 // ---------------------------------------------------------------------------
 // BlockPage — what a SeqBlock holds per (beamIndex, lifeCycleId):
@@ -73,6 +72,88 @@ inline SharedPtr<Page> const& blockPageGetPage(BlockPage const& bp) noexcept
         return holder->get() ? (*holder)->page : sNull;
     return sNull;
 }
+
+// ---------------------------------------------------------------------------
+// ScratchSlots — one life cycle's scratch slot locks, and their page-index mirror.
+//
+// The mirror is positional: entry `i` holds the page index of the `i`th lock, which is
+// what the conversion kernel reads when a block falls inside the scratch range. Only this
+// class can change the vector's length, so the two cannot drift; a lock cannot maintain
+// the mirror itself, since it knows neither its position nor which container holds it --
+// excess slots live in a second vector under the same owner and life cycle.
+//
+// Entries past the live count read kBadPageIndex. Zero would be slot zero.
+// ---------------------------------------------------------------------------
+class ScratchSlots
+{
+public:
+    template <typename... Args>
+    void emplaceBack(Args&&... args)
+    {
+        mSlots.emplace_back(std::forward<Args>(args)...);
+        _mirrorBack();
+    }
+
+    [[nodiscard]] ScratchSlotLock popBack();
+
+    //! Unlock every slot and drop them. Paired because a bare clear would leave the mirror
+    //! naming pages that have gone back to the pool.
+    void unlockAndClear();
+
+    void reserve(size_t n)
+    {
+        mSlots.reserve(n);
+    }
+
+    //! Mirror into `buf` instead of the internal vector, seeding it from the live slots.
+    //! A null `buf` reverts to the internal vector, carrying the current contents back.
+    void setBuf(int32_t* buf, int len);
+
+    //! Page indices of the live slots, in order. Under TLLM_DEBUG_MODE every entry is
+    //! checked against the slot id of the lock it mirrors.
+    [[nodiscard]] Span<int const> indices() const;
+
+    [[nodiscard]] size_t size() const noexcept
+    {
+        return mSlots.size();
+    }
+
+    [[nodiscard]] bool empty() const noexcept
+    {
+        return mSlots.empty();
+    }
+
+    [[nodiscard]] ScratchSlotLock const& back() const
+    {
+        return mSlots.back();
+    }
+
+    [[nodiscard]] ScratchSlotLock const& operator[](size_t i) const
+    {
+        return mSlots[i];
+    }
+
+    [[nodiscard]] auto begin() const noexcept
+    {
+        return mSlots.begin();
+    }
+
+    [[nodiscard]] auto end() const noexcept
+    {
+        return mSlots.end();
+    }
+
+private:
+    //! Write the last slot's page index at its own position.
+    void _mirrorBack();
+    //! Fill [from, to) of the mirror with the sentinel; unset `to` means its end.
+    void _mirrorSentinel(size_t from, std::optional<size_t> to = std::nullopt);
+
+    std::vector<ScratchSlotLock> mSlots;
+    //! Owned when the vector, borrowed when the span; the span's length is the Batch's
+    //! per-row stride, so it holds sentinel past `mSlots.size()`.
+    std::variant<std::vector<int32_t>, Span<int32_t>> mIndices;
+};
 
 // ---------------------------------------------------------------------------
 // SeqBlock — one block-slot in a KvCache sequence.
@@ -535,7 +616,21 @@ public:
     // ---- SWA scratch slot management ------------------------------------------
 
     // Return scratch metadata for a layer group, or nullopt if no scratch blocks.
-    std::optional<ScratchDesc> getScratchDesc(LayerGroupId lgId) const;
+    // Block ordinal range this life cycle serves from scratch slots; empty when none of it
+    // does. Pulled per step rather than mirrored: it is two integers, and keeping it pulled
+    // is what stops a range and its slots from being updated at different moments.
+    HalfOpenRange<BlockOrdinal> getSwaScratchRange(LayerGroupId lgId) const;
+
+    // Page indices of this life cycle's scratch slots, in slot order.
+    // Valid until the next scratch slot change or setScratchSlotBuf() for this life cycle.
+    Span<int const> getScratchSlots(LayerGroupId lgId) const;
+
+    // Zero-copy scratch slot buffer: copy the current indices into [buf, buf+len) and
+    // arrange that future scratch slot changes write there too. Pass buf=nullptr / len=0
+    // to revert to internal storage.
+    //
+    // Refused while this cache belongs to a Batch, for the reason setBasePageIndexBuf is.
+    void setScratchSlotBuf(LayerGroupId lgId, int32_t* buf, int len);
 
     // True if any lifecycle has scratch slots allocated.
     bool hasScratchSlots() const;
@@ -787,7 +882,7 @@ private:
 
     // SWA scratch slot support.
     bool mEnableSwaScratchReuse = false;
-    TypedVec<LifeCycleId, std::vector<ScratchSlotLock>> mScratchSlots;
+    TypedVec<LifeCycleId, ScratchSlots> mScratchSlots;
 
     // This request's lease on its sparse cache cells, by life cycle, together with the
     // device-resident residency, recency and write-back scratch describing them. Taken at

@@ -2733,10 +2733,13 @@ class TestDeepseekV4CacheManager:
                 int(copy_idx[row]),
                 0,
             ].tolist()
-            scratch = None
+            scratch_range = None
+            scratch_slots = []
             if row < num_contexts and page_index_mode == PageIndexMode.PER_LAYER:
-                scratch = cache_manager.kv_cache_map[request_id].get_scratch_desc(pool_id)
-            converted = converter(base_indices, page_index_mode, scratch)
+                cache = cache_manager.kv_cache_map[request_id]
+                scratch_range = cache.get_swa_scratch_range(pool_id) or None
+                scratch_slots = cache.get_scratch_slots(pool_id)
+            converted = converter(base_indices, page_index_mode, scratch_range, scratch_slots)
             expected[row, : len(converted)] = torch.tensor(converted, dtype=torch.int32)
         return expected
 

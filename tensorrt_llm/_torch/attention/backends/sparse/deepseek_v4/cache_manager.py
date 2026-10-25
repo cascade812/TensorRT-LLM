@@ -51,10 +51,10 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BatchDesc,
     BufferConfig,
     DataRole,
+    HalfOpenRange,
     KVCacheDesc,
     LayerId,
     PageIndexMode,
-    ScratchDesc,
     SparseCacheConfig,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
@@ -304,6 +304,14 @@ def _get_attn_bytes_per_token(
             return token_bytes / compress_ratio
         token_bytes //= compress_ratio
     return token_bytes
+
+
+def _scratch_entry(kv_cache, pool_id) -> tuple[HalfOpenRange, list[int]] | None:
+    """The scratch range and the slots serving it, or None when none of the blocks do."""
+    scratch_range = kv_cache.get_swa_scratch_range(pool_id)
+    if not scratch_range:
+        return None
+    return scratch_range, kv_cache.get_scratch_slots(pool_id)
 
 
 def _get_index_mode(attn_type: DeepseekV4AttentionType) -> PageIndexMode:
@@ -992,7 +1000,8 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         return converter(
             base_indices,
             page_index_mode,
-            kv_cache.get_scratch_desc(pool_id),
+            kv_cache.get_swa_scratch_range(pool_id) or None,
+            kv_cache.get_scratch_slots(pool_id),
         )
 
     def _get_window_page_headroom(self) -> int | None:
@@ -1633,7 +1642,7 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
 
     def _copy_scratch_metadata_to_device(
         self,
-        scratch_descs_by_pool: list[list[ScratchDesc | None]],
+        scratch_descs_by_pool: list[list[tuple[HalfOpenRange, list[int]] | None]],
         num_contexts: int,
         host_begs_staging: torch.Tensor,
         host_ends_staging: torch.Tensor,
@@ -1650,17 +1659,17 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         host_slots.zero_()
 
         for pool_idx, scratch_descs in enumerate(scratch_descs_by_pool):
-            for context_idx, desc in enumerate(scratch_descs):
-                if desc is None:
+            for context_idx, entry in enumerate(scratch_descs):
+                if entry is None:
                     continue
-                slot_ids = desc.slot_ids
+                scratch_range, slot_ids = entry
                 if len(slot_ids) > self._max_scratch_slots:
                     raise RuntimeError(
                         f"Scratch slot count {len(slot_ids)} exceeds staging capacity "
                         f"{self._max_scratch_slots}"
                     )
-                host_begs[pool_idx, context_idx] = int(desc.range.beg)
-                host_ends[pool_idx, context_idx] = int(desc.range.end)
+                host_begs[pool_idx, context_idx] = int(scratch_range.beg)
+                host_ends[pool_idx, context_idx] = int(scratch_range.end)
                 for slot_idx, slot_id in enumerate(slot_ids):
                     host_slots[pool_idx, context_idx, slot_idx] = int(slot_id)
 
@@ -1689,7 +1698,7 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         if self.enable_swa_scratch_reuse and num_contexts > 0:
             scratch_descs_by_pool = [
                 [
-                    self.kv_cache_map[req].get_scratch_desc(pool_id)
+                    _scratch_entry(self.kv_cache_map[req], pool_id)
                     for req in request_ids[:num_contexts]
                 ]
                 for pool_id in range(self.num_pools)

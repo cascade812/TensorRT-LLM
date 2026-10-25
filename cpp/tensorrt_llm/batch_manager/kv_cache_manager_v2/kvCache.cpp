@@ -661,7 +661,7 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
                 scratchSlots.reserve(scratchSlots.size() + tmpSlots[lc].size());
                 for (auto& slot : tmpSlots[lc])
                 {
-                    scratchSlots.emplace_back(std::move(slot), *this, lc, /*skipWait=*/true);
+                    scratchSlots.emplaceBack(std::move(slot), *this, lc, /*skipWait=*/true);
                     scratchReadyEvents.push_back(scratchSlots.back().slot().readyEvent.handle());
                 }
             }
@@ -1748,7 +1748,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
             {
                 auto slot = std::move(slots[lc].back());
                 slots[lc].pop_back();
-                mScratchSlots[lc].emplace_back(std::move(slot), *this, lc, /*skipWait=*/true);
+                mScratchSlots[lc].emplaceBack(std::move(slot), *this, lc, /*skipWait=*/true);
             }
         }
 
@@ -3442,20 +3442,116 @@ int KvCache::_swaScratchMaxRewindLen() const
     return cfg->maxRewindLen;
 }
 
-std::optional<ScratchDesc> KvCache::getScratchDesc(LayerGroupId lgId) const
+void ScratchSlots::_mirrorBack()
+{
+    auto const index = mSlots.size() - 1;
+    auto const value = slotIdToPageIndexValue(mSlots.back().slot().slotId());
+    std::visit(
+        [&](auto& buf)
+        {
+            using T = std::decay_t<decltype(buf)>;
+            if constexpr (std::is_same_v<T, std::vector<int32_t>>)
+            {
+                if (buf.size() <= index)
+                {
+                    buf.resize(index + 1, kBadPageIndex.value());
+                }
+            }
+            TLLM_CHECK_WITH_INFO(index < static_cast<size_t>(buf.size()),
+                "Scratch slot count %zu exceeds the %zu the batch staged for this life cycle", index + 1,
+                static_cast<size_t>(buf.size()));
+            buf[index] = value;
+        },
+        mIndices);
+}
+
+void ScratchSlots::_mirrorSentinel(size_t from, std::optional<size_t> to)
+{
+    auto const mirror = std::visit(
+        [](auto& buf) {
+            return Span<int32_t>{buf.data(), static_cast<int32_t>(buf.size())};
+        },
+        mIndices);
+    auto const end = to.value_or(static_cast<size_t>(mirror.len));
+    TLLM_CHECK_DEBUG_WITH_INFO(from <= end && end <= static_cast<size_t>(mirror.len),
+        "Scratch mirror range [%zu, %zu) outruns its %d entries", from, end, mirror.len);
+    std::fill(mirror.ptr + from, mirror.ptr + end, kBadPageIndex.value());
+}
+
+ScratchSlotLock ScratchSlots::popBack()
+{
+    ScratchSlotLock lock = std::move(mSlots.back());
+    mSlots.pop_back();
+    _mirrorSentinel(mSlots.size(), mSlots.size() + 1);
+    return lock;
+}
+
+void ScratchSlots::unlockAndClear()
+{
+    for (auto& lock : mSlots)
+    {
+        lock.unlock();
+    }
+    // Past the live count the mirror already reads sentinel, so only what was live needs it.
+    auto const live = mSlots.size();
+    mSlots.clear();
+    _mirrorSentinel(0, live);
+}
+
+void ScratchSlots::setBuf(int32_t* buf, int len)
+{
+    auto const live = indices();
+    if (buf == nullptr || len == 0)
+    {
+        std::vector<int32_t> owned(mSlots.size(), kBadPageIndex.value());
+        std::copy(live.data(), live.data() + live.len, owned.begin());
+        mIndices = std::move(owned);
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(static_cast<size_t>(len) >= mSlots.size(),
+        "setScratchSlotBuf: buffer of %d is shorter than the %zu live scratch slots", len, mSlots.size());
+    std::vector<int32_t> seed(live.data(), live.data() + live.len);
+    std::fill(buf, buf + len, kBadPageIndex.value());
+    std::ranges::copy(seed, buf);
+    mIndices = Span<int32_t>{buf, len};
+}
+
+Span<int const> ScratchSlots::indices() const
+{
+    auto const result = std::visit(
+        [this](auto const& buf) -> Span<int const> {
+            return {buf.data(), static_cast<int32_t>(mSlots.size())};
+        },
+        mIndices);
+    if (TLLM_UNLIKELY(gDebug))
+    {
+        for (size_t i = 0; i < mSlots.size(); ++i)
+        {
+            TLLM_CHECK(result[static_cast<int>(i)] == slotIdToPageIndexValue(mSlots[i].slot().slotId()));
+        }
+    }
+    return result;
+}
+
+HalfOpenRange<BlockOrdinal> KvCache::getSwaScratchRange(LayerGroupId lgId) const
 {
     // Lock-free: scratch slots are exclusively owned by this KvCache and defrag-cased page movement
     // happens only when all KvCache instances are suspended, which means mScratchSlots is empty.
-    TLLM_CHECK_WITH_INFO(isActive(), "getScratchDesc() requires an ACTIVE KvCache");
-    auto const& lc = mManager->lifeCycles().getLifeCycle(lgId);
-    auto sr = _getScratchRange(lc);
-    if (!sr)
-        return std::nullopt;
-    std::vector<int> slotIds;
-    slotIds.reserve(mScratchSlots[lgId].size());
-    for (auto const& lock : mScratchSlots[lgId])
-        slotIds.push_back(slotIdToPageIndexValue(lock.slot().slotId()));
-    return ScratchDesc{sr, std::move(slotIds)};
+    TLLM_CHECK_WITH_INFO(isActive(), "getSwaScratchRange() requires an ACTIVE KvCache");
+    return _getScratchRange(mManager->lifeCycles().getLifeCycle(lgId));
+}
+
+Span<int const> KvCache::getScratchSlots(LayerGroupId lgId) const
+{
+    return mScratchSlots[lgId].indices();
+}
+
+void KvCache::setScratchSlotBuf(LayerGroupId lgId, int32_t* buf, int len)
+{
+    TLLM_CHECK_WITH_INFO(mBatch == nullptr,
+        "setScratchSlotBuf: this KvCache is a Batch member, so its scratch slots are the Batch's row; "
+        "remove it from the Batch first");
+    mScratchSlots[lgId].setBuf(buf, len);
 }
 
 void KvCache::setEnableSwaScratchReuse(bool enable)
@@ -3532,8 +3628,7 @@ KvCache::DeltaScratchSlots KvCache::_takeExcessScratchSlots(int capacity, int hi
         {
             for (int i = 0; i < -delta; ++i)
             {
-                result.excess[lcIdx].push_back(std::move(mScratchSlots[lcIdx].back()));
-                mScratchSlots[lcIdx].pop_back();
+                result.excess[lcIdx].push_back(mScratchSlots[lcIdx].popBack());
             }
         }
     }
@@ -3546,7 +3641,7 @@ void KvCache::_recoverExcessScratchSlots(TypedVec<LifeCycleId, std::vector<Scrat
     {
         for (auto& lock : excess[lcId])
         {
-            mScratchSlots[lcId].push_back(std::move(lock));
+            mScratchSlots[lcId].emplaceBack(std::move(lock));
         }
         excess[lcId].clear();
     }
@@ -3556,9 +3651,7 @@ void KvCache::_freeReservedGpuSlots()
 {
     for (auto& lcSlots : mScratchSlots)
     {
-        for (auto& lock : lcSlots)
-            lock.unlock();
-        lcSlots.clear();
+        lcSlots.unlockAndClear();
     }
     for (auto& lease : mSparseCache)
         lease.release();

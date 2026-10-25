@@ -174,8 +174,12 @@ class FakeEngine:
         else:
             base_pages = kv_cache.get_base_page_indices(lc_id, beam)
         page_converter = manager.get_page_index_converter(layer_id, role)
-        scratch_desc = kv_cache.get_scratch_desc(lc_id)
-        pages = page_converter(base_pages, index_mode, scratch_desc)
+        pages = page_converter(
+            base_pages,
+            index_mode,
+            kv_cache.get_swa_scratch_range(lc_id) or None,
+            kv_cache.get_scratch_slots(lc_id),
+        )
         capacity = kv_cache.capacity
         history_len = len(history)
         if is_ssm:
@@ -252,8 +256,12 @@ class FakeEngine:
                 : div_up(history_len + len(input), tokens_per_block)
             ]
         page_converter = manager.get_page_index_converter(layer_id, role)
-        scratch_desc = kv_cache.get_scratch_desc(lc_id)
-        pages = page_converter(base_pages, index_mode, scratch_desc)
+        pages = page_converter(
+            base_pages,
+            index_mode,
+            kv_cache.get_swa_scratch_range(lc_id) or None,
+            kv_cache.get_scratch_slots(lc_id),
+        )
         capacity = kv_cache.capacity
         input_range = HalfOpenRange(history_len, history_len + len(input))
         if not is_ssm:

@@ -36,12 +36,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 namespace
 {
 
-//! Enforce a precondition that correct use cannot violate.
-//!
-//! There is no reporting channel: trapping destroys the context, so nothing survives to
-//! carry a status home, and the host checks that would catch these cases legitimately run
-//! before the launch. A debug build names the condition; a release build just halts, which
-//! still beats proceeding with indices that would be read as real.
+//! Enforce a precondition that correct use cannot violate. A debug build names the condition.
 #define KVCM2_SPARSE_REQUIRE(cond)                                                                                     \
     do                                                                                                                 \
     {                                                                                                                  \
@@ -54,13 +49,10 @@ namespace
 
 constexpr int kThreads = 256;
 constexpr uint32_t kWarpSize = 32;
-//! Warps in one copy CTA. The CTA size is chosen for occupancy; how many warps serve one
-//! row is a separate number, so the two are decoupled by remapping a global warp id.
 constexpr int32_t kWarpsPerCopyCta = kThreads / static_cast<int>(kWarpSize);
 constexpr int32_t kEmptyKey = -1;
 //! kBadPageIndex as a plain int32, since device code cannot use the strong typedef.
 constexpr int32_t kBadPageIndexValue = kBadPageIndex.value();
-//! Evaluated on the host so device code never calls StrongIndex::value().
 constexpr int32_t kFreeOrdinal = kBadBlockOrdinal.value();
 
 //! Recency classes, ordered: a hit outranks a unit fetched this step, which outranks an
@@ -294,8 +286,6 @@ __global__ __launch_bounds__(kThreads) void sparsePrepareWriteKernel(SparseResol
 __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArgs args, int32_t tableSize)
 {
     extern __shared__ unsigned char smem[];
-    // One CTA per row: the call resolves a single layer, whose metadata row every sparse
-    // buffer of that layer shares.
     int32_t const layer = args.layerInGroup;
     int32_t const row = static_cast<int32_t>(blockIdx.x);
     SparseCacheView const view = args.views[row];
@@ -309,11 +299,9 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     int32_t const width = args.selectionWidth;
     uint32_t const mask = static_cast<uint32_t>(tableSize) - 1U;
 
-    // Both watermarks are read from device memory: they move every step, so a captured
-    // graph must see the current value.
     int32_t const historyUnits = args.historyTokens[row] / args.unitTokens;
     int32_t const inFlight = args.capacityTokens[row] / args.unitTokens - historyUnits;
-    // resize() rejects a gap wider than the cache can pin, so this cannot hold.
+    // resize() rejects a gap wider than the cache can pin, so the check cannot fire.
     KVCM2_SPARSE_REQUIRE(inFlight >= 0 && inFlight <= args.maxInFlightUnits);
     // The probe walks one virtual list: the in-flight units, which must be resident before
     // the selection takes any victim, then the selection itself.
@@ -413,11 +401,6 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
 
     // Probe once per required unit. A hit resolves immediately; a miss is recorded against
     // its position in the virtual list and resolved once a victim is chosen.
-    //
-    // Selection entries naming real history are counted as they pass: they are the
-    // denominator of the fetch's hit rate, and only this pass knows which they are. A
-    // padded entry is neither hit nor miss, and an in-flight unit is not a fetch -- its
-    // host page is not written until the watermark passes it.
     int32_t resolvedMine = 0;
     for (int32_t i = static_cast<int32_t>(threadIdx.x); i < required; i += kThreads)
     {
@@ -476,9 +459,6 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
             KVCM2_SPARSE_REQUIRE(copyBase + claimed <= args.work.capacity);
             if (args.hitMiss != nullptr)
             {
-                // This row's own contribution, not a total read back later: the step's
-                // counters are cleared per publish, not per fetch, so anything reading them
-                // afterwards would count a second fetch of the same layer twice.
                 atomicAdd(&args.hitMiss->resolved, static_cast<unsigned long long>(numResolved));
                 atomicAdd(&args.hitMiss->misses, static_cast<unsigned long long>(claimed));
             }
@@ -619,8 +599,7 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
 //!
 //! The width is the launcher's choice, made from the layout and the addresses it produces,
 //! so there is no alignment test here and no tail: `bytes` divides by `sizeof(Vec)` and both
-//! pointers are aligned to it. Cold reads cross PCIe, which is what makes the wide types
-//! worth choosing when a layout admits them.
+//! pointers are aligned to it.
 template <typename Vec>
 __device__ inline void copyChunkWarp(char* dst, char const* src, uint32_t bytes, uint32_t lane)
 {
@@ -694,8 +673,8 @@ __device__ void copySparseUnits(SparseUnitCopyArgs const& args, SparseCopyDesc c
     }
 }
 
-//! One warp per work item, walking the compacted list with a grid-stride loop. `blockIdx.z`
-//! is the pool, `blockIdx.y` its buffer, `blockIdx.x` the work.
+//! One warp per work item, walking the compacted list with a grid-stride loop. `blockIdx.y`
+//! is the buffer, `blockIdx.x` the work.
 __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyArgs args)
 {
     // Broadcast from lane zero before anything can diverge: threadIdx.x varies within the
@@ -710,10 +689,6 @@ __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyA
     // buffer and list follow from the block's own coordinates. Resolving it here is what the
     // launch dependency is for -- the block is resident and addressed before the kernel it
     // waits on has finished.
-    //
-    // One flat buffer range rather than pools by buffers-per-pool, so a pool narrower than
-    // its neighbours costs no idle blocks, and one descriptor load rather than a map into a
-    // per-pool table: everything that would have been looked up is folded in at build time.
     int32_t const buffer = args.bufferBase + static_cast<int32_t>(blockIdx.y);
     SparseCopyDesc const desc = args.copyDesc[buffer];
     // The buffer is this block's, so its layer -- and therefore its list -- is uniform and
@@ -775,7 +750,7 @@ __global__ __launch_bounds__(kThreads) void sparseOutIndexKernel(SparseOutIndexA
     }
 }
 
-//! One CTA per layer. The units wanted form a contiguous ordinal range, so a scan of the
+//! One CTA per (layer, row). The units wanted form a contiguous ordinal range, so a scan of the
 //! reverse map finds them without a probe index.
 __global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushListArgs args)
 {
@@ -861,17 +836,15 @@ __global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushLis
         args.work.slot[j] = s;
     }
 
-    // Unlike the resolve, the list is the last thing this kernel writes, so there is no tail
-    // to overlap -- only the copy's launch to bring forward.
+    // The list is the last thing this kernel writes, so the release only brings the copy's
+    // launch forward.
     __syncthreads();
     gridDependencyRelease();
 }
 
 } // namespace
 
-//! Throw unless the work list is fully described. Shared because all three launchers take
-//! the same descriptor, and a half-set one is the easiest mistake to make when adding a
-//! caller.
+//! Throw unless the work list is fully described.
 void checkWorkList(SparseWorkList const& work, char const* api)
 {
     if (work.row == nullptr || work.ordinal == nullptr || work.slot == nullptr || work.total == nullptr)
@@ -1003,10 +976,8 @@ int32_t sparseCopyMultiprocessors(CUdevice device)
 
 int32_t sparseCopyGridCtas(int32_t workCapacity, int32_t smCount) noexcept
 {
-    //! Resident CTAs per SM this heuristic aims for.
     constexpr int32_t kCtasPerSm = 4;
 
-    // Capped by the work itself: a CTA past the list's capacity could never find an item.
     int32_t const full = std::max(smCount, 1) * kCtasPerSm;
     int32_t const needed = (workCapacity + kWarpsPerCopyCta - 1) / kWarpsPerCopyCta;
     return std::max(1, std::min(full, needed));

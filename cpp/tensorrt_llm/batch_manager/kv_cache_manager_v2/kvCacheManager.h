@@ -64,22 +64,6 @@ struct AggregatedPageDesc
 };
 
 // ---------------------------------------------------------------------------
-// ScratchDesc — scratch metadata for one layer group of one sequence.
-// Scratch blocks store ephemeral KV data using shared coalesced slots.
-// Mirrors _kv_cache_manager.py::ScratchDesc.
-// ---------------------------------------------------------------------------
-struct ScratchDesc
-{
-    HalfOpenRange<BlockOrdinal> range; // block ordinal range [beg, end)
-    std::vector<int> slotIds;          // scratch slot IDs, length = ceil(numScratchBlocks / scale)
-
-    explicit operator bool() const noexcept
-    {
-        return static_cast<bool>(range);
-    }
-};
-
-// ---------------------------------------------------------------------------
 // PageIndexConverter — convert base page index → kernel page indices.
 // ---------------------------------------------------------------------------
 struct PageIndexConverter
@@ -91,10 +75,13 @@ struct PageIndexConverter
 
     // Convert a sequence of base page indices to per-layer page indices.
     // indexMode: SHARED (default) or PER_LAYER. When scratch is active, must be PER_LAYER.
-    // scratch: optional scratch descriptor from KvCache::getScratchDesc().
+    // scratchRange: block ordinals served from scratch slots, as KvCache::getSwaScratchRange()
+    //               reports them; empty means none are. scratchSlots are their page indices,
+    //               from KvCache::getScratchSlots().
     // Mirrors _kv_cache_manager.py::PageIndexConverter.__call__.
     std::vector<int> operator()(std::vector<int> const& baseIndices,
-        std::optional<PageIndexMode> indexMode = std::nullopt, ScratchDesc const* scratch = nullptr) const;
+        std::optional<PageIndexMode> indexMode = std::nullopt, HalfOpenRange<BlockOrdinal> scratchRange = {},
+        Span<int const> scratchSlots = {}) const;
 
     // Backward-compatible single-index overload.
     std::vector<int> operator()(int baseIndex) const;

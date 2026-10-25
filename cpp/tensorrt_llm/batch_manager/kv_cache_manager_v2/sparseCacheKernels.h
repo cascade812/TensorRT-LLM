@@ -30,26 +30,10 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 //! Written to an output slot that carries no selection, i.e. selection padding.
 inline constexpr int32_t kNoSparseSlot = -1;
 
-//! These kernels enforce their preconditions by trapping, not by reporting.
-//!
-//! Each is unreachable unless KVCM2 itself is wrong: the reservation covers a full
-//! selection plus the in-flight span, and resize() rejects a gap wider than the cache can
-//! pin, so a violation is a logic error rather than a runtime condition. A status word
-//! would be unreadable anyway -- the trap destroys the context, so no later copy back can
-//! succeed -- which is why there is none. A debug build names the condition before halting.
+//! These kernels enforce their preconditions by trapping, not by reporting: a violation is
+//! a KVCM2 logic error, and the trap destroys the context, so no status could be read back.
+//! A debug build names the condition before halting.
 
-//! One layer's resolve across a batch: turn each row's selection of unit ordinals into
-//! cache entry indices, allocating entries for the units that are not resident.
-//!
-//! The scope is one layer, not a layer group, because a layer's selection depends on the
-//! previous layer's output: they are not all known at the start of a step. Consecutive
-//! layers that happen to share a selection still get a call each, so the first layer's
-//! copies start as early as possible; the caller simply passes the same selection array
-//! again, and KVCM2 need not know they are related.
-//!
-//! One result serves every sparse buffer of the layer, since they select the same units
-//! and share one metadata row. Layouts are therefore [row][...], with no buffer dimension.
-//! Every array is device memory.
 //! A list of units for the copy to move, compacted across rows.
 //!
 //! Each producer CTA claims a contiguous run with one `atomicAdd` on its list's counter and
@@ -92,9 +76,7 @@ struct SparseWorkList
 //! `unsigned long long` rather than `uint64_t` because the device side accumulates with
 //! `atomicAdd`, which has no overload for `unsigned long` on LP64.
 //!
-//! 64-bit because a step at B = 256 with a 2048-wide selection resolves millions of units
-//! per layer: a 32-bit pair would wrap within a few hundred steps, and a wrapped miss count
-//! makes the hit rate improve.
+//! 64-bit because a step resolves millions of units per layer and a 32-bit pair would wrap.
 struct SparseHitMiss
 {
     //! Selection entries that named real history. Padding and in-flight units are neither
@@ -112,6 +94,18 @@ struct SparseHitMiss
     }
 };
 
+//! One layer's resolve across a batch: turn each row's selection of unit ordinals into
+//! cache entry indices, allocating entries for the units that are not resident.
+//!
+//! The scope is one layer, not a layer group, because a layer's selection depends on the
+//! previous layer's output: they are not all known at the start of a step. Consecutive
+//! layers that happen to share a selection still get a call each, so the first layer's
+//! copies start as early as possible; the caller simply passes the same selection array
+//! again, and KVCM2 need not know they are related.
+//!
+//! One result serves every sparse buffer of the layer, since they select the same units
+//! and share one metadata row. Layouts are therefore [row][...], with no buffer dimension.
+//! Every array is device memory.
 struct SparseResolveArgs
 {
     //! [numRows] cache state per row, as Batch::sparseCacheViews() publishes it. A row with
@@ -191,7 +185,6 @@ struct SparseResolveArgs
 [[nodiscard]] size_t sparseResolveSharedBytes(
     int32_t entriesPerLayer, int32_t selectionWidth, int32_t maxInFlightUnits);
 
-//! Largest entriesPerLayer this kernel can serve on `device`, given its shared memory limit.
 //! Multiprocessors `device` has, which is the one part of the grid sizing below that costs
 //! a driver call and so the one part worth holding on to.
 [[nodiscard]] int32_t sparseCopyMultiprocessors(CUdevice device);
@@ -212,16 +205,6 @@ enum class SparseCopyDirection : uint8_t
     kWriteBack = 1,
 };
 
-//! Move units between their cold pages and their cache entries.
-//!
-//! The default codec relocates buffer bytes verbatim, so a unit has the same internal
-//! shape on both sides and one layout describes both; only the buffer's offset within a
-//! page and the unit's index differ. See "Fast path: a layout value" in
-//! SPARSE_ATTENTION_DESIGN.md.
-//!
-//! Both directions use the same addressing: the cold side is reached through the page
-//! table by unit ordinal, the hot side through the cache page list by entry index. Only
-//! which of the two is the source changes.
 //! Vector type one pool's copy moves at a time, chosen from the layout's sizes alone.
 //!
 //! Sizes rather than addresses, so the width is a property of the layout and can live in a
@@ -264,9 +247,7 @@ struct SparseCopyRun
 //! Per buffer rather than per pool so a block resolves itself in a single load, and so the
 //! two indirections a pool-level descriptor needs -- the buffer's slot within its pool and
 //! its entry within the page table -- can be folded in here instead of being paid per work
-//! item. `deviceBase` therefore already names this buffer's sub-region of the pool (the
-//! value half of a key-and-value pool starts midway through it) and `pageTable` already
-//! points at this buffer's entry.
+//! item.
 //!
 //! Sixteen-byte aligned and exactly four of them wide, so the load vectorises; the strides
 //! are 32-bit because a page, a lease and a cell are all far smaller than that, and only
@@ -303,6 +284,16 @@ struct alignas(16) SparseCopyDesc
 
 static_assert(sizeof(SparseCopyDesc) == 64, "A copy descriptor is meant to be four vector loads");
 
+//! Move units between their cold pages and their cache entries.
+//!
+//! The default codec relocates buffer bytes verbatim, so a unit has the same internal
+//! shape on both sides and one layout describes both; only the buffer's offset within a
+//! page and the unit's index differ. See "Fast path: a layout value" in
+//! SPARSE_ATTENTION_DESIGN.md.
+//!
+//! Both directions use the same addressing: the cold side is reached through the page
+//! table by unit ordinal, the hot side through the cache page list by entry index. Only
+//! which of the two is the source changes.
 struct SparseUnitCopyArgs
 {
     //! [numRows] per-row cache state: the lease and the per-buffer pool slots live here,
@@ -312,10 +303,6 @@ struct SparseUnitCopyArgs
     int32_t numRows = 0;
 
     //! One descriptor per BufferId of the life cycle, indexed by `blockIdx.y` directly.
-    //! One launch for every pool: a pool's cells are disjoint from every other pool's and
-    //! the converted table they share is read-only, so nothing orders them against each
-    //! other, and one grid both runs them concurrently and gives every one of them the
-    //! launch dependency.
     SparseCopyDesc const* copyDesc = nullptr;
 
     //! The buffers this call covers: `numBuffers` of them from `bufferBase`, which for a
@@ -376,11 +363,8 @@ void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream);
 //! `(page * buffersPerSlot + cell) * unitsPerPage + unit`.
 //!
 //! The result is compact -- one entry per selection slot, in the selection's own order --
-//! rather than a table indexed by unit ordinal. That is the shape every sparse attention
-//! consumer in this repository takes: a token-sparse kernel is handed the index list in
-//! place of its page table and reads one unit per slot, and a block-sparse kernel takes
-//! the list beside a page table it still uses. None indexes a table by ordinal, so
-//! producing one would only oblige the caller to compact it again.
+//! which is the shape every sparse attention consumer takes: a token-sparse kernel reads it
+//! in place of its page table, a block-sparse kernel beside one.
 //!
 //! The buffer dimension cannot be collapsed. A layer's buffers share the resolve but not
 //! their cells, because the cache packs one buffer's entries densely across every cell of
@@ -462,7 +446,7 @@ struct SparseFlushListArgs
 //! Launch the flush-list scan. One CTA per (layer, row).
 void launchSparseFlushList(SparseFlushListArgs const& args, CUstream stream);
 
-//! Launch the resolve. One CTA per layer; enqueues and returns.
+//! Launch the resolve. One CTA per row; enqueues and returns.
 //!
 //! Throws std::invalid_argument when the shape is inconsistent or needs more shared memory
 //! than the device allows.

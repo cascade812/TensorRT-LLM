@@ -1469,11 +1469,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .value("SHARED", kv::PageIndexMode::SHARED)
         .value("PER_LAYER", kv::PageIndexMode::PER_LAYER);
 
-    nb::class_<kv::ScratchDesc>(m, "ScratchDesc")
-        .def_ro("range", &kv::ScratchDesc::range)
-        .def_ro("slot_ids", &kv::ScratchDesc::slotIds)
-        .def("__bool__", [](kv::ScratchDesc const& self) { return static_cast<bool>(self); });
-
     nb::enum_<kv::AttentionReusePolicy>(m, "AttentionReusePolicy")
         .value("REQUIRED", kv::AttentionReusePolicy::REQUIRED)
         .value("PRIVATE", kv::AttentionReusePolicy::PRIVATE)
@@ -2030,10 +2025,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             { return self.getSsmBlockBaseIndex(kv::LayerGroupId{layerGroupId}, kv::BeamIndex{beamId}); },
             nb::arg("layer_group_id"), nb::arg("beam_id") = 0, nb::call_guard<nb::gil_scoped_release>())
         .def(
-            "get_scratch_desc",
+            "get_swa_scratch_range",
             [](kv::KvCache const& self, int layerGroupId)
-            { return self.getScratchDesc(kv::LayerGroupId{layerGroupId}); },
-            nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>())
+            { return self.getSwaScratchRange(kv::LayerGroupId{layerGroupId}); },
+            nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>(),
+            "Block ordinal range this life cycle serves from scratch slots; empty when none of it does.")
+        .def(
+            "get_scratch_slots",
+            [](kv::KvCache const& self, int layerGroupId)
+            {
+                auto const slots = self.getScratchSlots(kv::LayerGroupId{layerGroupId});
+                return std::vector<int>(slots.begin(), slots.end());
+            },
+            nb::arg("layer_group_id"), nb::call_guard<nb::gil_scoped_release>(),
+            "Page indices of this life cycle's scratch slots, in slot order.")
         .def_prop_ro("has_scratch_slots", &kv::KvCache::hasScratchSlots)
         .def_prop_rw("enable_swa_scratch_reuse", &kv::KvCache::isSwaScratchReuseEnabled,
             [](kv::KvCache& self, bool enable)
@@ -3543,18 +3548,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "__call__",
             [](kv::PageIndexConverter const& self, std::vector<int> const& baseIndices,
-                std::optional<kv::PageIndexMode> indexMode, nb::object scratchObj) -> std::vector<int>
+                std::optional<kv::PageIndexMode> indexMode,
+                std::optional<kv::HalfOpenRange<kv::BlockOrdinal>> scratchRange,
+                std::vector<int> const& scratchSlots) -> std::vector<int>
             {
-                kv::ScratchDesc const* scratch = nullptr;
-                std::optional<kv::ScratchDesc> scratchHolder;
-                if (!scratchObj.is_none())
-                {
-                    scratchHolder = nb::cast<kv::ScratchDesc>(scratchObj);
-                    scratch = &*scratchHolder;
-                }
-                return self(baseIndices, indexMode, scratch);
+                return self(baseIndices, indexMode, scratchRange.value_or(kv::HalfOpenRange<kv::BlockOrdinal>{}),
+                    kv::Span<int const>{scratchSlots.data(), static_cast<int>(scratchSlots.size())});
             },
-            nb::arg("base_indices"), nb::arg("index_mode") = nb::none(), nb::arg("scratch") = nb::none());
+            nb::arg("base_indices"), nb::arg("index_mode") = nb::none(), nb::arg("scratch_range") = nb::none(),
+            nb::arg("scratch_slots") = std::vector<int>{});
 
     m.def(
         "gen_multimodal_cache_key_tokens",

@@ -55,9 +55,6 @@ struct GpuCoalescedPageTable
 //! a key and value page list as one pair -- XQA's is
 //! [batchSize][beamWidth][2][maxNbPagesPerSeq] -- and this is that shape, so a table can be
 //! handed over as it stands instead of being repacked every step.
-//!
-//! Packed, like the tables either side of it: the Batch allocates it, so there is no stride
-//! a caller has to be told separately.
 struct ConvertedIndexTable
 {
     CUdeviceptr data = 0;
@@ -83,18 +80,10 @@ struct PoolSpec
 };
 
 //! One lifecycle's page table as the host writes it, in the Batch's pinned staging.
-//! Packed like the device one, and for the same reason: the Batch allocates it.
-//!
-//! A consumer that needs these indices for its own purposes reads this rather than lending
-//! the Batch storage of its own. One buffer with one writer is what keeps a member's
-//! binding alive for the whole decode; which side allocates it never mattered to that.
 struct CoalescedPageTable
 {
-    //! Const: this points straight into the pinned staging block, which publish() uploads
-    //! asynchronously. A caller writing here would race that copy with nothing able to
-    //! notice -- the Batch cannot know when it happened -- and would anyway be overwritten,
-    //! since a resize() rewrites only the entries it changes and keeps no record of edits
-    //! made behind it. The page indices are the members' to write, through their locks.
+    //! Points into the pinned staging block, which publish() uploads asynchronously. A host
+    //! write here races that copy and is in any case overwritten by the next resize().
     int32_t const* data = nullptr;
     int32_t numRows = 0;
     int32_t blocksPerRow = 0;
@@ -107,13 +96,9 @@ using IndexTableId = StrongIndex<int, struct IndexTableIdTag>;
 //! the copy and the index scatter read it back, and what a write-back lists before its own
 //! copy reads it.
 //!
-//! Batch-owned rather than per request, because both consumers are one launch spanning
-//! every row and a kernel takes one pointer. The reservation in a request's lease is its
-//! own; this is the step's.
-//!
-//! Owned by Batch rather than allocated per call because every extent is a configuration
-//! constant -- rows, selection width, in-flight headroom -- so one allocation serves every
-//! step, and a step that allocates nothing is a step a CUDA graph can capture.
+//! Batch-owned: both consumers are one launch spanning every row, and every extent is a
+//! configuration constant, so one allocation serves every step and the step allocates
+//! nothing -- which is what lets a CUDA graph capture it.
 struct SparseStepScratch
 {
     int32_t* outSlot = nullptr;      //!< [numRows][selectionWidth]
@@ -183,17 +168,14 @@ class Batch
 public:
     //! @param indexTables what consumers need addressable together. Requests whose
     //! converted indices coincide are merged onto one table, which is how a quantised
-    //! layer's data and block scales come to share one. Required, and `{}` is how a caller
-    //! that converts no indices says so: an empty list is a choice about what the consumer
-    //! reads, not an absence the Batch could fill in.
+    //! layer's data and block scales come to share one.
     //!
     //! @param maxBatchSize    rows, i.e. the most requests that can be stepped together.
     //! @param maxBlocksPerSeq columns, i.e. the longest sequence a row can describe.
     //!
     //! Both bound device arrays whose shape must not change between steps, so neither can
-    //! be grown later. Left unset they derive from the manager's `constraints`, which fails
-    //! when none were declared -- a pool-sizing hint is not a batch bound, so it is only a
-    //! default, never an inference.
+    //! be grown later. Left unset they derive from the manager's `constraints`, which
+    //! throws when none were declared.
     //!
     //! @param mode page index mode, applied to every life cycle. Left unset, each life
     //! cycle takes the smaller table -- SHARED where the manager says it is always
@@ -205,9 +187,6 @@ public:
     //! undecided; naming SHARED is the caller's narrower claim that no member of *this*
     //! batch will hold scratch slots there. A decode-only batch is the case it exists for:
     //! scratch covers the blocks a prefill chunk adds, and a one-token request adds none.
-    //! That is what lets prefill and decode run as two batches over one manager with SWA
-    //! scratch enabled, the decode one still taking SHARED for the sliding life cycles --
-    //! which is where the table count is worth saving, since it holds the most rows.
     //!
     //! The claim is validated, not trusted: every publish() checks each member against
     //! KvCache::supportsIndexMode(SHARED, lc) and throws if one holds scratch after all.
@@ -216,22 +195,18 @@ public:
     //!
     //! The mode is fixed here because a converted table's shape is baked into a captured
     //! graph. It cannot follow a member's scratch state, which varies per step.
-    //! @param stream the stream every member runs on, taken here rather than one per call:
-    //! a member's own work and the Batch's transfers have to be ordered against each other,
-    //! and two streams would leave that ordering to the caller. setCudaStream() moves the
-    //! Batch and its members together, which is the only way it changes. The caller keeps
-    //! it -- a Batch neither creates nor destroys it, and it must outlive the Batch.
+    //!
+    //! @param stream the stream every member runs on: a member's own work and the Batch's
+    //! transfers have to be ordered against each other. setCudaStream() moves the Batch and
+    //! its members together, which is the only way it changes. The caller keeps it -- a
+    //! Batch neither creates nor destroys it, and it must outlive the Batch.
     //!
     //! @param maxTotalInputTokens tokens one step may ingest across every row, as the
     //! runtime's own batching bound gives it. It sizes the write-back's work list: a row
     //! advancing `t` tokens crosses at most `t / unitTokens + 1` units, so the batch
     //! crosses at most `maxTotalInputTokens / unitTokens + maxBatchSize` of them.
     //!
-    //! Only an aggregate bound works here, and only because the list is compacted across
-    //! rows. Were it indexed by row, each row's slice would have to allow for that row
-    //! taking the whole budget, and the product would be hundreds of times larger.
-    //!
-    //! Left unset it falls back to `maxBatchSize * maxInFlightUnits`, which today is
+    //! Left unset it falls back to `maxBatchSize * maxInFlightUnits`, which is
     //! `maxBatchSize` -- a decode step advances capacity one token per row, so one row
     //! crosses at most one unit boundary. Pass it once a step can ingest more than that,
     //! which is what chunked prefill under in-flight batching does.
@@ -251,9 +226,7 @@ public:
     //! caller need not synchronize: the device arrays and the staging buffer are the same
     //! objects either side of the move, and work that names them stays ordered.
     //!
-    //! Members move too. A KvCache in a Batch runs on the Batch's stream -- its own setter
-    //! refuses while it is a member -- so leaving them behind would split the very ordering
-    //! a Batch exists to keep.
+    //! A KvCache's own stream setter refuses while it is a member.
     //!
     //! Like the constructor, this takes no ownership: the caller's stream must outlive the
     //! Batch, or be replaced here before it is destroyed.
@@ -272,19 +245,17 @@ public:
 
     //! Which table serves this spec. The spec must be one the Batch was built with.
     //!
-    //! The query to prefer: a caller that asked for a table by naming its buffers gets it
-    //! back without going through a buffer, and equivalent specs resolve to the same id --
-    //! a layer's data and its block scales name one table between them. The spec's buffers
-    //! occupy entries [0, buffers.size()) in its own order, so an entry needs no separate
-    //! lookup.
+    //! Equivalent specs resolve to the same id -- a layer's data and its block scales name
+    //! one table between them. The spec's buffers occupy entries [0, buffers.size()) in its
+    //! own order.
     [[nodiscard]] IndexTableId indexTableOf(IndexTableSpec const& spec) const;
 
     //! How to turn this spec's converted indices into addresses.
     //!
     //! Keyed by the spec because the base is: a merged table serves several specs and each
     //! reads its entries through its own pool. The spec must be one the Batch was built
-    //! with, and its buffers must share a page stride -- they sit in one pool, which is
-    //! what lets one base serve them with their offsets already in the entries.
+    //! with, and its buffers must share a page stride -- they sit in one pool, so one base
+    //! serves them all.
     //!
     //! The result is stable for the Batch's lifetime, so a captured graph may bake it.
     [[nodiscard]] PoolSpec poolSpecFor(IndexTableSpec const& spec) const;
@@ -308,10 +279,7 @@ public:
     //! Seat a request only once it is ready to be stepped. Seating takes the sparse arena
     //! lease, so a request that holds pages without being stepped -- a disaggregated one
     //! still receiving its KV, or one sitting out a step -- costs the arena nothing while it
-    //! stays out, and the arena is sized for the rows rather than for every request the
-    //! scheduler admits precisely because of that. Nothing here checks it: the Batch cannot
-    //! see what a request is waiting on, so an early seat is a caller's error that shows up
-    //! as arena pressure rather than as a throw.
+    //! stays out. Nothing here checks it: an early seat costs arena pressure, not a throw.
     //!
     //! Throws when the row is taken or out of range, the batch is full, the cache already
     //! belongs to a batch, or its beam width exceeds one -- only beam 0 is mirrored, so a
@@ -325,8 +293,7 @@ public:
     //! with every entry free. Call flushSparseUnits() first for anything worth keeping.
     std::shared_ptr<KvCache> removeKvCache(KvCache& kvCache);
 
-    //! The same, by the row addKvCache returned. Null when nothing is seated there, since
-    //! a caller sweeping rows should not have to ask twice about each one.
+    //! The same, by the row addKvCache returned. Null when nothing is seated there.
     std::shared_ptr<KvCache> removeKvCache(int row);
 
     //! Move the member at `srcRow` to the empty `dstRow`, leaving `srcRow` free.
@@ -335,10 +302,6 @@ public:
     //! stream binding all survive, which is what separates this from removeKvCache() followed
     //! by addKvCache(). That pair would hand the lease back -- a lease returns with every
     //! entry free -- and so would discard residency the member is still entitled to.
-    //!
-    //! It also writes each life cycle's index-table row once rather than twice: the pair
-    //! poisons the old row and then copies the indices into the new one, where this hands the
-    //! row's contents straight across.
     //!
     //! Throws when either row is out of range, when `srcRow` holds nothing, or when `dstRow`
     //! is occupied -- including `dstRow == srcRow`, which is both at once.
@@ -349,11 +312,9 @@ public:
 
     //! Resize every member, then publish once.
     //!
-    //! The sanctioned way to advance a batched step, and the reason it exists: it waits on
-    //! the previous publish before touching anyone, so the staging hazard is closed by
-    //! construction rather than by a caller remembering waitPublished(). Per-request
-    //! operations with no Batch equivalent -- commit(), a beam fork, an SWA recycle -- still
-    //! need that call, so the simple rule is to make it once at the top of a step.
+    //! Waits on the previous publish before touching any member. Per-request operations with
+    //! no Batch equivalent -- commit(), a beam fork, an SWA recycle -- still need an explicit
+    //! waitPublished().
     //!
     //! One result per row, in row order; false for a free row. A member that fails rolls
     //! itself back, so a batch can partially fail and the table published afterwards
@@ -376,9 +337,7 @@ public:
     //!
     //! The staging rows are written by the members themselves, so they are always current;
     //! what this adds is a stream-ordered snapshot. Without it the host would be mutating
-    //! the table a previously enqueued fetch is still reading. That snapshot is why the
-    //! table is copied rather than read in place: the host has to be free to write the next
-    //! step's rows long before the kernels reading this step's have retired.
+    //! the table a previously enqueued fetch is still reading.
     //!
     //! Two stages. The host-to-device fill runs on an upload stream of this Batch's own, so
     //! it can overlap the previous step; the Batch's stream then carries one linear
@@ -423,6 +382,19 @@ public:
     //! the same reason -- they were allocated by an earlier step.
     void flushSparseUnits(std::vector<int> const& newHistoryLengths);
 
+    //! Where each of `buffers` reads its indices in fetchSparsePages()' output.
+    //!
+    //! Buffers whose converted indices coincide share a slice. A layer's data and scale
+    //! pools mirror -- equal buffer counts, so a lease spans the same cells in both -- and
+    //! a selection then resolves to one index serving each, the caller applying the base
+    //! of the pool it is reading. Buffers that do not coincide keep slices of their own: a
+    //! single scale shared by key and value is its own index table, so it gets one.
+    //!
+    //! One entry per buffer, in the order given. A slice no buffer maps to is never
+    //! written and holds whatever was there: read a buffer's indices at its own slot and
+    //! nowhere else.
+    [[nodiscard]] std::vector<int> sparseOutSlots(std::vector<BufferId> const& buffers) const;
+
     //! Resolve a batch's selections against each buffer's per-request history cache.
     //!
     //! Device-driven and stream-ordered throughout: the selection is read from device
@@ -453,21 +425,7 @@ public:
     //! Compact, in the selection's own order, rather than a table indexed by unit ordinal,
     //! because that is the shape sparse attention kernels take. See
     //! SPARSE_ATTENTION_DESIGN.md's "Fetch".
-    //! Where each of `buffers` reads its indices in fetchSparsePages()' output.
     //!
-    //! Buffers whose converted indices coincide share a slice. A layer's data and scale
-    //! pools mirror -- equal buffer counts, so a lease spans the same cells in both -- and
-    //! a selection then resolves to one index serving each, the caller applying the base
-    //! of the pool it is reading. Buffers that do not coincide keep slices of their own: a
-    //! single scale shared by key and value is its own index table, so it gets one.
-    //!
-    //! One entry per buffer, in the order given. `out` keeps one entry per buffer, so a
-    //! slice no buffer maps to is never written and holds whatever was there: read a
-    //! buffer's indices at its own slot and nowhere else. Deduplication follows the index
-    //! tables rather than the pools, so it is the grouping `_buildIndexTables` already
-    //! settled for the dense side rather than a second opinion about it.
-    [[nodiscard]] std::vector<int> sparseOutSlots(std::vector<BufferId> const& buffers) const;
-
     //! `stream` defaults to the Batch's own, which is the only correct choice while the
     //! layers are fetched in order: a layer's selection comes from the one before it. Name
     //! a stream only to run ahead of that -- a model that fetches several layers early can
@@ -483,9 +441,7 @@ public:
     //! past it -- so nothing is fetched here: the call assigns a cell and leaves its bytes
     //! to the model.
     //!
-    //! Separate from fetchSparsePages because the orders differ. A fetch needs the
-    //! selection, which the indexer produces from the previous layer; a write needs only
-    //! the watermarks, so it can run first, which is the order the model requires.
+    //! Needs only the watermarks, not the selection, so it runs before fetchSparsePages.
     //!
     //! Idempotent while the watermarks and the reservation hold: the resolve probes
     //! residency before it takes a victim, so a later call -- including the fetch's own
@@ -507,9 +463,7 @@ public:
 
     //! Block until the last publish() has finished reading the staging rows.
     //!
-    //! Cheap once complete, and a no-op when nothing is in flight, so a caller may use it
-    //! freely at the top of a step. Batch's own mutators call it; a caller manipulating a
-    //! member directly is the one that has to.
+    //! A no-op when nothing is in flight, so a caller may use it freely at the top of a step.
     void waitPublished();
 
     //! One layer group's page table on the host, as a publish will upload it. Read-only:
@@ -525,8 +479,7 @@ public:
     //! Row of a member; nullopt when this cache is not one.
     [[nodiscard]] std::optional<int> rowOf(KvCache const& kvCache) const;
 
-    //! Members seated, which is the rows occupied. Also the leases held: seating takes one
-    //! from every life cycle's arena and leaving returns it.
+    //! Members seated, which is the rows occupied.
     [[nodiscard]] int numKvCaches() const noexcept;
 
     //! Cumulative fetch statistics, in selection units, since the Batch was built or the
@@ -549,17 +502,13 @@ public:
     //! Device bytes every life cycle's sparse arena holds, zero without sparse offload.
     //!
     //! The arenas sit outside the cache tiers' quota, so a caller budgeting device memory
-    //! has to account for them separately and otherwise has to predict the layout to do it.
-    //! This reports what was allocated, which makes such a prediction checkable rather than
-    //! something only a profiler disagrees with.
+    //! must account for them separately.
     [[nodiscard]] size_t sparseArenaBytes() const;
 
     //! Whether the occupied rows are exactly [0, numKvCaches()).
     //!
     //! A Batch does not require it. Removing a member leaves its row free and the next join
-    //! takes the lowest free one, so a hole is legal and transient. An engine that maps rows
-    //! onto its own request slots usually does require it, and asking here beats keeping a
-    //! mirror of the membership to check against -- a mirror can disagree, this cannot.
+    //! takes the lowest free one, so a hole is legal and transient.
     [[nodiscard]] bool isContiguous() const noexcept;
 
     [[nodiscard]] int maxBatchSize() const noexcept
@@ -583,18 +532,13 @@ public:
     [[nodiscard]] std::shared_ptr<KvCache> const& operator[](int row) const;
 
 private:
-    //! Reaches the step state below, which has no caller outside this class and the
-    //! introspection hooks that report it. KvCache mirrors the same arrangement.
+    //! Reads the private step state below in order to report it.
     friend class KvCacheIntrospection;
 
-    //! Where one table's converted indices live. Internal: convertedIndexTable() returns
-    //! the same address with the extents that make it readable, and is what a caller takes.
+    //! Where one table's converted indices live.
     [[nodiscard]] CUdeviceptr indexTableAddress(IndexTableId tableId) const;
 
-    //! How a sparse copy addresses a run of buffers that begins at `first`.
-    //!
-    //! Internal: the sparse copy path is its only reader. A consumer names a table by the
-    //! spec it asked for and takes convertedIndexTable() with poolSpecFor().
+    //! How a sparse copy addresses the run of buffers beginning at (layerId, role).
     //!
     //! The run's buffers occupy consecutive entries of one request, which construction
     //! checked, so naming the first is enough: the rest follow by BufferId.
@@ -612,24 +556,16 @@ private:
     [[nodiscard]] SparseIndexRun sparseIndexRun(LayerId layerId, DataRole const& role) const;
 
     //! Which table serves this buffer, and its entry in that table's buffer dimension.
-    //!
-    //! Internal: the sparse copy path resolves a single buffer with it, and the
-    //! introspection hooks report it. A caller names a table by the spec it asked for --
-    //! indexTableOf() -- and reads a buffer by slicing that table at the buffer's position
-    //! in the spec, which it already knows. Specs may not overlap, so the two agree.
     [[nodiscard]] std::pair<IndexTableId, int> indexTableSlot(LayerId layerId, DataRole const& role) const;
 
-    //! What a converted index for this buffer is added to. Buffers sharing a pool share
-    //! it, their own offsets being already in the entries.
+    //! What a converted index for this buffer is added to.
     [[nodiscard]] MemAddress indexTableBase(LayerId layerId, DataRole const& role) const;
 
     //! Write back every row's crossed units for one life cycle, from the ranges the Batch
     //! staged. One scan over (layer, row), then one copy per pool covering the whole batch.
     void writeBackSparseUnits(LifeCycleId lifeCycle, CUstream stream);
 
-    //! One layer group's page table on the device, which the index conversion reads. A
-    //! consumer reads the converted table instead; coalescedPageTable() is the host copy
-    //! and the one with the indices a caller wants.
+    //! One layer group's page table on the device, which the index conversion reads.
     [[nodiscard]] GpuCoalescedPageTable gpuCoalescedPageTable(LayerGroupId layerGroupId) const;
 
     //! Per-row sparse cache state for one layer group, as the fetch kernel sees it.
@@ -675,10 +611,7 @@ private:
 
     //! Whether the last publish() is still reading the staging rows.
     //!
-    //! For a seated member to check before writing its page indices, which live in those
-    //! rows. publish() enforces the same separation from its own side, and refuses outright;
-    //! this exists because a member mutated before publish() has already raced by then, so
-    //! the write is where the problem is visible.
+    //! For a seated member to check before writing its page indices, which live in those rows.
     [[nodiscard]] bool _publishInFlight() const noexcept
     {
         return !mPublished.isClosed();
@@ -686,6 +619,9 @@ private:
 
     //! Host-side page-index row for one (layer group, row), inside the pinned staging block.
     [[nodiscard]] int32_t* _stagingRow(LifeCycleId lifeCycleId, int row) const;
+    //! A (life cycle, row)'s slice of the scratch slot staging. Only valid once the
+    //! staging exists, i.e. when mMaxScratchSlots is positive.
+    [[nodiscard]] int32_t* _scratchSlotRow(LifeCycleId lifeCycleId, int row) const;
 
     //! Block until every transfer this Batch issued has retired, so its buffers can go.
     void _drain() noexcept;
@@ -701,9 +637,8 @@ private:
     //! whatever the last one left.
     void _seedRowWatermarks(int row, int historyLength, int capacity);
 
-    //! Refresh the staged watermarks and cache views from the members. Cheap, and it keeps
-    //! KvCache ignorant of the staging: only its page indices are written through
-    //! setBasePageIndexBuf.
+    //! Refresh the staged watermarks and cache views from the members. KvCache reaches the
+    //! staging only through setBasePageIndexBuf, for its page indices.
     void _stageRowState();
 
     void _allocateStepScratch();
@@ -716,9 +651,8 @@ private:
     void _allocateCopyDesc();
 
     //! Device room for the per-row unit ranges a write-back reads:
-    //! [life cycle][2][maxBatchSize], as [from][to]. Allocated with the fetch scratch
-    //! because it has the same lifetime and the same reason to exist -- a step that
-    //! allocates nothing is a step a graph can capture.
+    //! [life cycle][2][maxBatchSize], as [from][to]. Allocated with the fetch scratch,
+    //! which has the same lifetime.
     void _allocateFlushRanges();
 
     CudaUniqPtr<int32_t> mFlushRanges;
@@ -735,16 +669,15 @@ private:
     //! block is the same size, being a copy of it.
     [[nodiscard]] size_t _totalBytes() const noexcept;
 
-    //! Const: the manager is fixed at construction and outlives the Batch.
+    //! Outlives the Batch.
     KvCacheManager* const mManager;
     CUstream mCudaStream = nullptr;
     int mMaxBatchSize = 0;
     int mMaxBlocksPerSeq = 0;
     std::optional<int> mMaxTotalInputTokens;
 
-    //! Owning: a seated member cannot be destroyed under the Batch, so a caller is free to
-    //! keep only the Batch. Leaving returns the reference. KvCache points back with a raw
-    //! `mBatch`, so there is no cycle.
+    //! A seated member cannot be destroyed under the Batch, so a caller may keep only the
+    //! Batch. KvCache points back with a raw `mBatch`, so there is no cycle.
     std::vector<std::shared_ptr<KvCache>> mRows;
 
     //! Cumulative fetch statistics, across every life cycle and step. Outside mStepScratch
@@ -767,13 +700,8 @@ private:
     //! cannot hold scratch takes SHARED and the single smaller table that implies.
     TypedVec<LifeCycleId, PageIndexMode> mIndexModes;
 
-    //! Whether the caller named the mode rather than letting it be derived.
-    //!
-    //! A named SHARED is a claim about this batch's members -- that none will hold scratch
-    //! slots -- which configuration alone cannot settle, since the manager answers for every
-    //! request a life cycle could carry. A decode-only batch is the case that makes it true:
-    //! scratch covers the blocks a prefill chunk adds, so a request contributing one token
-    //! holds none. publish() checks the claim against each member, every step.
+    //! Whether the caller named the mode rather than letting it be derived. publish()
+    //! validates a named SHARED against each member, every step.
     bool mIndexModeNamed = false;
 
     //! One converted index table: the specs it serves, and what a consumer needs to read
@@ -790,9 +718,7 @@ private:
 
     std::vector<IndexTable> mIndexTables;
 
-    //! Where one buffer's indices are. The base belongs to the buffer's request, not to the
-    //! table: merged requests share entries precisely so they can be read through different
-    //! bases, which is what keeps a quantised layer's data and block scales apart.
+    //! Where one buffer's indices are.
     struct BufferSlot
     {
         IndexTableId table{0};
@@ -808,8 +734,7 @@ private:
     [[nodiscard]] IndexTableSpec const& _specOf(LayerId layerId, DataRole const& role, char const* api) const;
 
     //! What a converted index of `spec` is added to: its first buffer's pool base, under
-    //! the index mode this Batch chose. Every buffer of the spec shares it, their own
-    //! offsets being already in the entries.
+    //! the index mode this Batch chose. Every buffer of the spec shares it.
     [[nodiscard]] MemAddress _specBase(IndexTableSpec const& spec) const;
 
     //! Validate the requests, merge those whose converted indices coincide, and record
@@ -829,12 +754,10 @@ private:
     void _allocateIndexTables();
 
     //! Collect each member's scratch slots for the life cycles that can hold them.
-    //! Kept out of the staged block because that block's offsets are shared with the
-    //! watermarks and the views; a separate buffer leaves those alone for one small extra
-    //! transfer on the upload stream.
+    //! Staged separately from the main block, which the watermarks and views share.
     void _stageScratch();
 
-    //! Elements of the scratch staging: [begs][ends][slots].
+    //! Elements of the scratch staging.
     [[nodiscard]] size_t _scratchElements() const noexcept;
 
     //! Host and device sides of the scratch metadata, laid out [begs][ends][slots].
@@ -865,12 +788,7 @@ private:
 
     //! A device-side copy of the same layout, filled from the host ahead of time.
     //!
-    //! Nothing captured reads it, so its fill is free to overlap the previous step --
-    //! which is the only way the host-to-device crossing can overlap compute at all. With
-    //! one buffer the crossing has to follow the previous replay, since the kernels
-    //! reading the table are inside it and the table's address is fixed by capture.
-    //! Double-buffering the table itself cannot work for that same reason, so the second
-    //! buffer goes upstream of the fixed address instead.
+    //! Nothing captured reads it, so its fill may overlap the previous step.
     CudaUniqPtr<> mDeviceStaging;
 
     //! Carries the host-to-device fill, off the caller's stream so it can run early.

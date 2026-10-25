@@ -758,8 +758,12 @@ void Batch::_allocateIndexTables()
         mScratchStaging = std::make_unique<StaticHostMem>(sizeof(int32_t) * elements);
         auto* host = reinterpret_cast<int32_t*>(mScratchStaging->address());
         // An empty range leaves every block on the plain path, which is what a member
-        // holding no scratch should look like.
-        std::fill(host, host + elements, 0);
+        // holding no scratch should look like. The slots behind the ranges hold the
+        // sentinel instead: zero there would name slot zero.
+        auto const ranges
+            = 2 * static_cast<size_t>(mManager->numLifeCycles().value()) * static_cast<size_t>(mMaxBatchSize);
+        std::fill(host, host + ranges, 0);
+        std::fill(host + ranges, host + elements, kBadPageIndex.value());
         mScratchDevice = allocateDeviceMemory<int32_t>(elements);
         cuCheck(cuMemcpyHtoDAsync(
             reinterpret_cast<CUdeviceptr>(mScratchDevice.get()), host, sizeof(int32_t) * elements, cudaStream()));
@@ -906,38 +910,33 @@ void Batch::_stageScratch()
     auto const groups = static_cast<size_t>(mManager->numLifeCycles().value());
     auto* const begs = reinterpret_cast<int32_t*>(mScratchStaging->address());
     auto* const ends = begs + groups * rows;
-    auto* const slots = ends + groups * rows;
 
+    // Only the ranges: a member's slot ids reach its row as they change, through the
+    // buffer bound when it joined.
     for (size_t row = 0; row < mRows.size(); ++row)
     {
         auto const& kvCache = mRows[row];
         for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
         {
             auto const flat = static_cast<size_t>(lcId.value()) * rows + row;
-            auto* const rowSlots = slots + flat * static_cast<size_t>(mMaxScratchSlots);
 
             // A free row, a suspended member, or one holding no scratch here all leave an
             // empty range, which the kernel reads as "every block takes the plain path".
-            auto const desc = kvCache != nullptr && kvCache->isActive() ? kvCache->getScratchDesc(lcId) : std::nullopt;
-            if (!desc.has_value())
+            auto const range = kvCache != nullptr && kvCache->isActive() ? kvCache->getSwaScratchRange(lcId)
+                                                                         : HalfOpenRange<BlockOrdinal>{};
+            begs[flat] = range.beg.value();
+            ends[flat] = range.end.value();
+            if (range.empty())
             {
-                begs[flat] = 0;
-                ends[flat] = 0;
                 continue;
             }
-            begs[flat] = desc->range.beg.value();
-            ends[flat] = desc->range.end.value();
-            // The slot check below is what keeps the copy in bounds. This one tests the
-            // bound the sizing was derived from, against a range an actual request
-            // reached -- so a mistake in that derivation is caught where it was made,
-            // rather than only when some request's conversion happens to need the slot
-            // the arithmetic lost.
-            TLLM_CHECK_DEBUG_WITH_INFO(desc->range.end.value() - desc->range.beg.value()
+            // Tests the bound the sizing was derived from against a range an actual request
+            // reached, so a mistake in that derivation is caught where it was made rather
+            // than only when some request's conversion happens to need the slot the
+            // arithmetic lost.
+            TLLM_CHECK_DEBUG_WITH_INFO(range.end.value() - range.beg.value()
                     <= mManager->_maxScratchBlocks(lcId, mMaxBlocksPerSeq, mMaxTotalInputTokens),
                 "A request's scratch range outruns the blocks the batch was sized for");
-            TLLM_CHECK_WITH_INFO(desc->slotIds.size() <= static_cast<size_t>(mMaxScratchSlots),
-                "A request holds more scratch slots than the batch was sized for");
-            std::copy(desc->slotIds.begin(), desc->slotIds.end(), rowSlots);
         }
     }
 }
@@ -1119,6 +1118,15 @@ int32_t* Batch::_stagingRow(LifeCycleId lifeCycleId, int row) const
         + static_cast<int64_t>(mMaxBlocksPerSeq) * row;
 }
 
+int32_t* Batch::_scratchSlotRow(LifeCycleId lifeCycleId, int row) const
+{
+    auto const rows = static_cast<size_t>(mMaxBatchSize);
+    auto const groups = static_cast<size_t>(mManager->numLifeCycles().value());
+    auto const flat = static_cast<size_t>(lifeCycleId.value()) * rows + static_cast<size_t>(row);
+    auto* base = reinterpret_cast<int32_t*>(mScratchStaging->address());
+    return base + 2 * groups * rows + flat * static_cast<size_t>(mMaxScratchSlots);
+}
+
 int Batch::addKvCache(KvCache& kvCache, std::optional<int> requestedRow)
 {
     if (kvCache.mBatch != nullptr)
@@ -1170,6 +1178,10 @@ int Batch::addKvCache(KvCache& kvCache, std::optional<int> requestedRow)
     {
         // Beam 0 only; addKvCache rejects anything wider.
         kvCache.setBasePageIndexBuf(kDefaultBeamIndex, lc, _stagingRow(lc, row), mMaxBlocksPerSeq);
+        if (mMaxScratchSlots > 0)
+        {
+            kvCache.setScratchSlotBuf(lc, _scratchSlotRow(lc, row), mMaxScratchSlots);
+        }
     }
 
     _seedRowWatermarks(row, kvCache.historyLength(), kvCache.capacity());
@@ -1257,6 +1269,12 @@ std::shared_ptr<KvCache> Batch::removeKvCache(KvCache& kvCache)
     {
         // Hands the indices back to the cache's own storage before the row is reused.
         kvCache.setBasePageIndexBuf(kDefaultBeamIndex, lc, nullptr, 0);
+        if (mMaxScratchSlots > 0)
+        {
+            kvCache.setScratchSlotBuf(lc, nullptr, 0);
+            auto* slots = _scratchSlotRow(lc, row);
+            std::fill(slots, slots + mMaxScratchSlots, kBadPageIndex.value());
+        }
         auto* staged = _stagingRow(lc, row);
         std::fill(staged, staged + mMaxBlocksPerSeq, kBadPageIndex.value());
     }

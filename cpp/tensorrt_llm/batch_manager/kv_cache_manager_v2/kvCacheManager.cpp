@@ -51,12 +51,13 @@ static double nowSeconds()
 // PageIndexConverter
 // ---------------------------------------------------------------------------
 
-std::vector<int> PageIndexConverter::operator()(
-    std::vector<int> const& baseIndices, std::optional<PageIndexMode> indexMode, ScratchDesc const* scratch) const
+std::vector<int> PageIndexConverter::operator()(std::vector<int> const& baseIndices,
+    std::optional<PageIndexMode> indexMode, HalfOpenRange<BlockOrdinal> scratchRange,
+    Span<int const> scratchSlots) const
 {
     if (!indexMode.has_value())
     {
-        if (scratch)
+        if (!scratchRange.empty())
         {
             throw std::invalid_argument("index_mode must be provided when scratch is active");
         }
@@ -72,13 +73,16 @@ std::vector<int> PageIndexConverter::operator()(
     for (BlockOrdinal ordinal{0}; ordinal < BlockOrdinal{static_cast<int>(baseIndices.size())}; ++ordinal)
     {
         int index;
-        if (scratch && scratch->range.contains(ordinal))
+        if (scratchRange.contains(ordinal))
         {
-            // Scratch block: slot IDs come from ScratchDesc, not base_indices.
-            int blockPos = ordinal - scratch->range.beg;
+            // Scratch block: its slot comes from the request's own scratch slots, not from
+            // base_indices.
+            int blockPos = ordinal - scratchRange.beg;
             int totalOffset = blockPos * scratchPages;
             int slotIdx = totalOffset / scale;
-            int slotId = scratch->slotIds[static_cast<size_t>(slotIdx)];
+            TLLM_CHECK_DEBUG_WITH_INFO(slotIdx < scratchSlots.size(), "Scratch slot %d past the %d the range describes",
+                slotIdx, scratchSlots.size());
+            int slotId = scratchSlots[slotIdx];
             int offset = totalOffset % scale;
             index = slotId * scale + (offset + appliedLayerOffset) % scale;
         }
@@ -100,7 +104,7 @@ std::vector<int> PageIndexConverter::operator()(
 
 std::vector<int> PageIndexConverter::operator()(int baseIndex) const
 {
-    return operator()(std::vector<int>{baseIndex}, std::nullopt, nullptr);
+    return operator()(std::vector<int>{baseIndex});
 }
 
 // ---------------------------------------------------------------------------
@@ -171,15 +175,7 @@ void KvCacheManager::_computeSparseCacheShape()
         // is per life cycle and its metadata is one stride: a layer's rows are found at
         // `residentOrdinal + layer * entriesPerLayer`, so a single entry count serves them
         // all, and cellsPerBuffer follows from maxCachedUnits and unitsPerPage alike.
-        //
-        // Not a fundamental limit, just unimplemented. The way out is to size a cell from
-        // the largest unit -- or from a whole page -- and let a layer with a smaller unit
-        // subdivide that cell, which is the mechanism a cell already uses to hold
-        // `unitsPerPage` units. Requiring unit sizes to be powers of two makes every such
-        // division exact. The resident set and recency order are already per layer, so
-        // they need no change. See SPARSE_ATTENTION_DESIGN.md.
-        //
-        // Until then, disagreement is rejected rather than silently resolved.
+        // See SPARSE_ATTENTION_DESIGN.md.
         auto& shape = mSparseCacheShape[lcId];
         if (shape.layers > 0)
         {
@@ -198,11 +194,9 @@ void KvCacheManager::_computeSparseCacheShape()
             {
                 continue;
             }
-            // One more cell in a reserved slot.
             ++shape.buffers;
             if (!layerCounted)
             {
-                // One more metadata row: the layer's buffers share it.
                 ++shape.layers;
                 layerCounted = true;
             }
@@ -217,8 +211,6 @@ int KvCacheManager::_sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const n
     {
         return 0;
     }
-    // maxCachedUnits counts both populations, the history this caches and everything still
-    // in flight, so the reservation follows from configuration alone.
     return divUp(maxUnits, sparseCacheUnitsPerPage(lifeCycle));
 }
 
@@ -237,8 +229,7 @@ int KvCacheManager::_sparseCacheMaxInFlightUnits(LifeCycleId lifeCycle) const no
 
 std::vector<SparseBufferPlan> KvCacheManager::_sparseBufferPlan(LifeCycleId lifeCycle) const
 {
-    // Layers outermost, as _computeSparseCacheShape walks them, so a layer's buffers stay
-    // consecutive -- the fetch resolves one layer and names its buffers as a range.
+    // Layers outermost, as _computeSparseCacheShape walks them.
     std::vector<SparseBufferPlan> plan;
     std::optional<LayerId> previousLayer;
     int32_t layerRow = -1;
@@ -268,15 +259,12 @@ std::vector<SparseBufferPlan> KvCacheManager::_sparseBufferPlan(LifeCycleId life
                 static_cast<uint32_t>(attr.offset),
                 buf.sparseLayout(attn->sparseCache->unitsPerPage(mConfig.tokensPerBlock)), layerRow, 0});
         }
-        // Group a layer's buffers by pool so a (layer, pool) run is consecutive too: a pool is
-        // what fixes a cell's size, the slot stride it is read from, and the unit layout, so
-        // the copy addresses one pool per launch and needs to name its buffers as a range.
-        // Stable, so declaration order survives within a pool.
+        // Group a layer's buffers by pool so a (layer, pool) run is consecutive too; the copy
+        // addresses one pool per launch. Stable, so declaration order survives within a pool.
         std::stable_sort(plan.begin() + static_cast<ptrdiff_t>(firstOfLayer), plan.end(),
             [](SparseBufferPlan const& a, SparseBufferPlan const& b) { return a.poolIndex < b.poolIndex; });
     }
 
-    // Where each buffer's cells sit inside its pool's arena region.
     std::map<PoolIndex, int32_t> nextSlot;
     for (auto& entry : plan)
     {
@@ -326,9 +314,8 @@ void KvCacheManager::_buildSparseArenas()
     LifeCycleId const numLc = mStorage->numLifeCycles();
     mSparseArenas = TypedVec<LifeCycleId, SparseCellArena>(numLc);
 
-    // Concurrent requests the arena must serve. `constraints` is the existing declaration of
-    // the batch shape, and the one Batch already derives its rows from, so a sparse
-    // deployment sizes both from one place.
+    // Concurrent requests the arena must serve; `constraints` is where a Batch's rows come
+    // from too, so both are sized from one place.
     int maxLeases = 0;
     for (auto const& desc : mConfig.constraints)
     {
@@ -384,9 +371,8 @@ void KvCacheManager::_buildSparseArenas()
 
 int32_t KvCacheManager::_sparseCopyGridCtas(int32_t workCapacity) const
 {
-    // Only the multiprocessor count is worth keeping: it is a device property behind a
-    // driver call, where the grid it feeds is two arithmetic steps a fetch can redo for
-    // every layer it resolves.
+    // The SM count is behind a driver call, so it is cached; the grid it feeds is two
+    // arithmetic steps, so it is not.
     if (mSmCount == 0)
     {
         CUdevice device{};
@@ -426,18 +412,15 @@ std::vector<SparseCopyRun> KvCacheManager::_sparseCopyTemplates(LifeCycleId life
         }
 
         SparseCopyRun args;
-        // The page side is the life cycle's own hot pool. It is host memory, registered
-        // device-mapped, so the kernel addresses it directly; but its layout is KVCM2's
-        // rather than a codec's, which is what keeps the fetch independent of whatever a
-        // codec does on the way to level 1.
+        // The page side is the life cycle's own hot pool: host memory, registered device-mapped,
+        // so the kernel addresses it directly.
         //
         // A converted index counts whole buffers, not coalesced slots, so the stride is one
         // buffer and the pool's slot size never enters. The base belongs to the index table
         // the run was declared in, which only the caller's Batch knows, so it is left unset
         // here.
         args.hostPageStride = static_cast<uint32_t>(plan[begin].size);
-        // The hot side is the cache arena, not a storage pool: a cell is the only GPU-resident
-        // copy a kernel can read, and the arena is where cells live.
+        // The hot side is the cache arena, not a storage pool.
         args.deviceBase = arena.base(pool);
         args.bufferBytes = static_cast<uint32_t>(arena.bufferBytes(pool));
         args.cellsPerBuffer = _sparseCacheSubSlotsPerBuffer(lifeCycle);
@@ -463,8 +446,6 @@ MemAddress KvCacheManager::getSparseCacheBaseAddress(LayerId layerId, DataRole c
     {
         throw std::invalid_argument("getSparseCacheBaseAddress: this buffer has no sparse fetch path");
     }
-    // Per pool, not per buffer: the arena mirrors the hot pool group, and an index the fetch
-    // emits already carries which buffer of the pool it belongs to.
     return static_cast<MemAddress>(arena.base(it->poolIndex));
 }
 
@@ -774,15 +755,10 @@ int KvCacheManager::_maxScratchBlocks(
 
     if (maxTotalInputTokens.has_value())
     {
-        // Input-limited: scratch is the blocks a step adds that are already stale at
-        // capacity, so a step of T tokens reaches across T - window - rewind + 1 of them.
-        // The subtraction is in tokens, before the division: converting to blocks first
-        // and subtracting after would lose the alignment this is exact at.
-        //
-        // Exact rather than an estimate. With the stale end and the input start a fixed
-        // distance apart, the block count depends only on where that end falls inside its
-        // block, and is largest when it falls on the boundary -- which is also when the
-        // input start does, both giving this quotient.
+        // The subtraction is in tokens, before the division: converting to blocks first and
+        // subtracting after would lose the alignment this is exact at. The bound is tight --
+        // the count is largest when the stale end falls on a block boundary, which is the
+        // case this quotient gives.
         auto const reach = static_cast<int64_t>(*maxTotalInputTokens) - *attn->windowSize - rewind + 1;
         bound = std::min(bound, reach / tpb);
     }
