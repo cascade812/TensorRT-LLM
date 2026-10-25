@@ -2961,6 +2961,98 @@ class TestIndexTables(unittest.TestCase):
         finally:
             manager.shutdown()
 
+    def test_scratch_staging_covers_the_layer_taking_the_most_sub_pages(self):
+        """A life cycle whose layers put unequal buffer counts in one pool.
+
+        The slots a request takes come from the life cycle's widest sub-pages-per-slot
+        ratio, so the staging has to be sized by that same ratio. Sizing it from whichever
+        buffer an index table happens to name first under-counts whenever that buffer's
+        layer is not the widest, and the request then holds more slots than its row has.
+        """
+        window, tpb, prompt_len = 128, 32, 1024
+        # Layer 0 puts four buffers in the pool, layers 1-3 put two. Same size, so one
+        # pool; same window, so one life cycle.
+        layers = [
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[
+                    BufferConfig(role=DataRole(role), size=8192)
+                    for role in ("key", "value", "key2", "value2")
+                ],
+                sliding_window_size=window,
+                num_sink_tokens=0,
+            )
+        ] + [
+            AttentionLayerConfig(
+                layer_id=LayerId(i),
+                buffers=[
+                    BufferConfig(role=DataRole("key"), size=8192),
+                    BufferConfig(role=DataRole("value"), size=8192),
+                ],
+                sliding_window_size=window,
+                num_sink_tokens=0,
+            )
+            for i in range(1, 4)
+        ]
+        cfg = KVCacheManagerConfig(
+            tokens_per_block=tpb,
+            cache_tiers=[GpuCacheTierConfig(quota=64 << 20)],
+            layers=layers,
+            swa_scratch_reuse=SwaScratchReuseConfig(max_rewind_len=0),
+        )
+        manager = KVCacheManager(cfg)
+        cache = None
+        batch = None
+        try:
+            lg = manager.get_layer_group_id(0)
+            max_blocks = div_up(prompt_len, tpb)
+
+            # The premise: the widest layer takes strictly more sub-pages per slot than a
+            # two-buffer one, so the two sizings genuinely differ.
+            widest = manager.get_page_index_converter(0, "key")
+            narrow = manager.get_page_index_converter(1, "key")
+            self.assertEqual(widest.scale, narrow.scale, "expected one pool for the group")
+            self.assertGreater(
+                widest.scratch_pages_per_block,
+                narrow.scratch_pages_per_block,
+                "config is uniform, so it cannot distinguish the two sizings",
+            )
+
+            # A table naming only a narrow layer's buffers must still stage the widest
+            # layer's slots, because the request takes them for the whole life cycle.
+            spec = IndexTableSpec([BufferId(1, "key"), BufferId(1, "value")])
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(
+                    manager,
+                    handle,
+                    index_tables=[spec],
+                    max_batch_size=1,
+                    max_blocks_per_seq=max_blocks,
+                    mode=PageIndexMode.PER_LAYER,
+                )
+                cache = manager.create_kv_cache(None, [TokenId(i) for i in range(prompt_len)])
+                self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
+                # Taking the slots is what overruns a row sized from the narrow buffer.
+                self.assertTrue(cache.resize(prompt_len))
+                self.assertTrue(cache.has_scratch_slots, "config produced no scratch")
+
+                slots = cache.get_scratch_slots(lg)
+                self.assertLessEqual(
+                    len(slots),
+                    manager.max_scratch_slots(max_blocks),
+                    "the request holds more scratch slots than the manager sizes for",
+                )
+                batch.wait_published()
+                batch.publish()
+                batch.wait_published()
+        finally:
+            if batch is not None and cache is not None:
+                batch.remove_kv_cache(cache)
+            if cache is not None:
+                cache.close()
+
     def test_scratch_blocks_match_the_reference_converter(self):
         """The substituting path, against PageIndexConverter given the same scratch range.
 

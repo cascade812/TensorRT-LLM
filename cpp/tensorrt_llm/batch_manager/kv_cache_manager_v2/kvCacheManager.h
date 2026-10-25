@@ -649,10 +649,10 @@ private:
     [[nodiscard]] int _maxScratchBlocks(
         LifeCycleId lcId, int maxBlocksPerSeq, std::optional<int> maxTotalInputTokens = std::nullopt) const;
 
-    //! Slots one buffer's worst request needs, which is its scratch blocks converted at
-    //! that buffer's own sub-pages-per-block and slot width. Zero where it can hold none.
+    //! Slots a life cycle's worst request needs: its scratch blocks at the widest
+    //! sub-pages-per-slot ratio any of its layers reaches. Zero where it can hold none.
     [[nodiscard]] int _scratchSlotsFor(
-        BufferId const& buffer, int maxBlocksPerSeq, std::optional<int> maxTotalInputTokens = std::nullopt) const;
+        LifeCycleId lcId, int maxBlocksPerSeq, std::optional<int> maxTotalInputTokens = std::nullopt) const;
 
     // Throw unless every KvCache has been closed. `api` names the caller so the message
     // points at the mistake rather than at whatever breaks later.

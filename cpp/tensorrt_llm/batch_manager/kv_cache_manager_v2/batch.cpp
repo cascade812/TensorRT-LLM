@@ -724,8 +724,8 @@ void Batch::_allocateIndexTables()
     // step can outrun the window, and so adds no already-stale block.
     for (size_t index = static_cast<size_t>(mNumPlainTables); index < mIndexTables.size(); ++index)
     {
-        auto const& first = mIndexTables[index].served.front().buffers.front();
-        auto const slots = mManager->_scratchSlotsFor(first, mMaxBlocksPerSeq, mMaxTotalInputTokens);
+        auto const slots
+            = mManager->_scratchSlotsFor(mIndexTables[index].lifeCycle, mMaxBlocksPerSeq, mMaxTotalInputTokens);
         mMaxScratchSlots = std::max(mMaxScratchSlots, slots);
     }
 

@@ -705,28 +705,26 @@ PageIndexConverter KvCacheManager::getPageIndexConverter(LayerId layerId, DataRo
 }
 
 int KvCacheManager::_scratchSlotsFor(
-    BufferId const& buffer, int maxBlocksPerSeq, std::optional<int> maxTotalInputTokens) const
+    LifeCycleId lcId, int maxBlocksPerSeq, std::optional<int> maxTotalInputTokens) const
 {
-    auto const lcId = _bufferAttr(buffer.layerId, buffer.role).lifeCycleId;
     auto const blocks = _maxScratchBlocks(lcId, maxBlocksPerSeq, maxTotalInputTokens);
     if (blocks <= 0)
     {
         return 0;
     }
-    // A scratch block takes scratchPagesPerBlock sub-pages and a slot holds scale of them,
-    // which is how the conversion indexes them: scratchSlots[block * pages / scale].
-    auto const converter = getPageIndexConverter(buffer.layerId, buffer.role);
-    auto const slots
-        = (static_cast<int64_t>(blocks) * converter.scratchPagesPerBlock + converter.scale - 1) / converter.scale;
-    return static_cast<int>(slots);
+    // The same fraction KvCache::_takeExcessScratchSlots converts with, so what a request
+    // takes and what the batch stages for it cannot disagree. It is the widest ratio any
+    // of the life cycle's (layer, pool) pairs reaches, and a narrower one would leave the
+    // widest layer's slots past the end of the row.
+    return mStorage->slotUtilFracMax(lcId).ceilMul(blocks);
 }
 
 int KvCacheManager::maxScratchSlots(int maxBlocksPerSeq) const
 {
     int result = 0;
-    for (auto const& id : allBufferIds())
+    for (LifeCycleId lcId{0}; lcId < numLifeCycles(); ++lcId)
     {
-        result = std::max(result, _scratchSlotsFor(id, maxBlocksPerSeq));
+        result = std::max(result, _scratchSlotsFor(lcId, maxBlocksPerSeq));
     }
     return result;
 }
