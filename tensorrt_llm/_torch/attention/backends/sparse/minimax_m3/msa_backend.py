@@ -333,7 +333,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
         With host reads (``kv_cache_manager.m3_sparse_host_pages``), a block not
         yet in the arena takes an entry below -1 naming its host page, which
-        attention reads in place; ``finish_sparse_fetch`` then fills its cell.
+        attention reads in place while its cell is filled beside it.
         """
         from .kernels.offload import build_block_table, prepare_selection
 
@@ -357,14 +357,16 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         return self.msa_sparse_block_table[: topk.shape[0]]
 
     def finish_sparse_fetch(self, layer_idx: int) -> None:
-        """Fill the arena cells a host-read fetch admitted, once attention is enqueued.
+        """Join the host-read copies after the last offloaded layer's attention.
 
-        Attention read those blocks from host memory this step; the copy makes
-        them arena hits from the next step on. A no-op without host reads.
+        Each host-read fetch fills its admitted cells on the copy stream, beside
+        attention; the next fetch joins the previous copy. The last offloaded
+        layer joins its own once its attention is enqueued, so the forward, and
+        a captured graph, ends with every cell filled. A no-op otherwise.
         """
         state = self.sparse_offload_state
-        if state is not None and state.uncopied_layer == layer_idx:
-            self.kv_cache_manager.copy_sparse_misses(state, layer_idx)
+        if state is not None and layer_idx == max(state.layers, default=None):
+            self.kv_cache_manager.join_sparse_copies(state)
 
     @property
     def msa_qo_lens_cpu(self) -> Optional[torch.Tensor]:
