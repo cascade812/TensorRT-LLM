@@ -8020,7 +8020,7 @@
         },
         "read_misses_from_host": {
           "default": false,
-          "description": "Read the selected units that are not in the GPU cache directly from host memory in attention, instead of waiting for them to be copied in first. The copy into the GPU cache still runs, after attention is enqueued, so later steps find those units on the GPU. Pairs with host_history_memory='managed'. Supported by MiniMax-M3.",
+          "description": "Read the selected units that are not in the GPU cache directly from host memory in attention, instead of waiting for them to be copied in first. The copy into the GPU cache still runs, on its own stream beside attention, so later steps find those units on the GPU. Pairs with host_history_memory='managed'. Supported by MiniMax-M3.",
           "status": "prototype",
           "title": "Read Misses From Host",
           "type": "boolean"
