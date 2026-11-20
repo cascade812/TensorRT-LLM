@@ -1071,6 +1071,15 @@ class SparseKvCacheOffloadConfig(StrictBaseModel):
         "place through its own mapping, without page faults, and the driver "
         "does not migrate it into GPU memory. Either kind counts against "
         "host_history_size.")
+    read_misses_from_host: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Read the selected units that are not in the GPU cache directly from "
+        "host memory in attention, instead of waiting for them to be copied "
+        "in first. The copy into the GPU cache still runs, after attention is "
+        "enqueued, so later steps find those units on the GPU. Pairs with "
+        "host_history_memory='managed'. Supported by MiniMax-M3.")
 
 
 class BaseSparseAttentionConfig(StrictBaseModel):
@@ -1115,6 +1124,9 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 class _SparseKvCacheOffloadConfigMixin(StrictBaseModel):
     """Sizing and validation shared by backends with host-backed sparse history."""
 
+    supports_reading_misses_from_host: ClassVar[bool] = False
+    """Whether the backend can read units missing from its GPU cache from host memory."""
+
     enable_kv_cache_offload: bool = Field(
         default=False,
         description=
@@ -1137,6 +1149,10 @@ class _SparseKvCacheOffloadConfigMixin(StrictBaseModel):
             raise ValueError(
                 "kv_cache_offload_config requires enable_kv_cache_offload=True."
             )
+        if (self.kv_cache_offload_config.read_misses_from_host
+                and not self.supports_reading_misses_from_host):
+            raise ValueError(f"{type(self).__name__} does not support "
+                             "kv_cache_offload_config.read_misses_from_host.")
         return self
 
     def get_kv_cache_offload_config(
@@ -1304,6 +1320,7 @@ class MiniMaxM3SparseAttentionConfig(_SparseKvCacheOffloadConfigMixin,
     """
 
     algorithm: Literal["minimax_m3"] = "minimax_m3"
+    supports_reading_misses_from_host: ClassVar[bool] = True
     sparse_num_index_heads: PositiveInt = Field(
         default=4,
         description=

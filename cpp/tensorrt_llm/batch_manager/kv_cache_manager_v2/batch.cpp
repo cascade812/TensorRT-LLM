@@ -1943,7 +1943,7 @@ void Batch::fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const
 }
 
 void Batch::resolveSparseSelection(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
-    std::optional<CUstream> streamOpt)
+    std::optional<CUstream> streamOpt, bool hostReads)
 {
     CUstream const stream = streamOpt.value_or(cudaStream());
     TLLM_CHECK_WITH_INFO(selected != nullptr, "resolveSparseSelection: selected must be a device pointer");
@@ -1971,6 +1971,7 @@ void Batch::resolveSparseSelection(std::vector<BufferId> const& buffers, int32_t
     resolve.capacityTokens = reinterpret_cast<int32_t const*>(marks.capacity);
     resolve.unitTokens = mManager->config().tokensPerBlock / unitsPerPage;
     resolve.includePartialUnits = mManager->sparseCacheIncludesPartialUnits(lcId);
+    resolve.markAdmitted = hostReads;
     resolve.outSlot = scratch.outSlot;
     resolve.inFlightSlot = scratch.inFlightSlot;
     resolve.maxInFlightUnits = scratch.maxInFlightUnits;
@@ -1985,25 +1986,22 @@ void Batch::resolveSparseSelection(std::vector<BufferId> const& buffers, int32_t
 void Batch::fetchResolvedPages(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
     int32_t* out, std::optional<CUstream> streamOpt)
 {
-    CUstream const stream = streamOpt.value_or(cudaStream());
     TLLM_CHECK_WITH_INFO(
         selected != nullptr && out != nullptr, "fetchResolvedPages: selected and out must be device pointers");
+    // The copy releases its launch dependency as soon as it is addressed, so the index
+    // write follows it on the stream without waiting for it to finish.
+    copyResolvedPages(buffers, streamOpt);
+    fetchResolvedIndices(buffers, selected, selectionWidth, out, streamOpt);
+}
 
-    auto const span = mManager->_sparseLayerSpan(buffers, "fetchResolvedPages");
+void Batch::copyResolvedPages(std::vector<BufferId> const& buffers, std::optional<CUstream> streamOpt)
+{
+    CUstream const stream = streamOpt.value_or(cudaStream());
+    auto const span = mManager->_sparseLayerSpan(buffers, "copyResolvedPages");
     LifeCycleId const lcId = span.lifeCycle;
-    auto const bufferBase = span.bufferBase;
-    auto const numBuffers = span.numBuffers;
 
     auto const& scratch = sparseStepScratch(lcId);
-    TLLM_CHECK_WITH_INFO(scratch.outSlot != nullptr, "fetchResolvedPages: this layer group carries no sparse cache");
-    TLLM_CHECK_WITH_INFO(selectionWidth == scratch.selectionWidth,
-        "fetchResolvedPages: selectionWidth must match the configured numSelectedBlocks");
-
-    int const unitsPerPage = mManager->sparseCacheUnitsPerPage(lcId);
-    auto const leases = _leaseMirror();
-    auto const arena = _sparseArena(lcId).view();
-    auto const numRows = maxBatchSize();
-    auto const layerWork = _sparseFetchWork(scratch, span.selectionSlot);
+    TLLM_CHECK_WITH_INFO(scratch.outSlot != nullptr, "copyResolvedPages: this layer group carries no sparse cache");
 
     // The misses the selection produced, applied to each of this layer's buffers. Layers
     // sharing the selection each run this and each fill their own mirror of the entry.
@@ -2012,24 +2010,45 @@ void Batch::fetchResolvedPages(std::vector<BufferId> const& buffers, int32_t con
     // clip each pool to the layer's buffers and name its index table, so nothing here
     // depends on which layer is being fetched beyond choosing the buffer range.
     SparseUnitCopyArgs copy;
-    copy.leases = leases;
-    copy.arena = arena;
-    copy.numRows = numRows;
+    copy.leases = _leaseMirror();
+    copy.arena = _sparseArena(lcId).view();
+    copy.numRows = maxBatchSize();
     // The same descriptors as the write-back: a run never spans layers, so it already
     // names this layer's index table. Only the buffer range below differs.
     copy.copyDesc = scratch.copyDesc;
-    copy.bufferBase = bufferBase;
-    copy.numBuffers = numBuffers;
+    copy.bufferBase = span.bufferBase;
+    copy.numBuffers = span.numBuffers;
     copy.direction = SparseCopyDirection::kFetch;
-    copy.unitsPerPage = unitsPerPage;
-    copy.work = layerWork;
+    copy.unitsPerPage = mManager->sparseCacheUnitsPerPage(lcId);
+    copy.work = _sparseFetchWork(scratch, span.selectionSlot);
     copy.gridCtas = sparseCopyGridCtas(scratch.fetchWork.capacity, mManager->_smCount());
     launchSparseUnitCopy(copy, stream);
+}
+
+void Batch::fetchResolvedIndices(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
+    int32_t* out, std::optional<CUstream> streamOpt, bool hostReads)
+{
+    CUstream const stream = streamOpt.value_or(cudaStream());
+    TLLM_CHECK_WITH_INFO(
+        selected != nullptr && out != nullptr, "fetchResolvedIndices: selected and out must be device pointers");
+
+    auto const span = mManager->_sparseLayerSpan(buffers, "fetchResolvedIndices");
+    LifeCycleId const lcId = span.lifeCycle;
+    auto const bufferBase = span.bufferBase;
+    auto const numBuffers = span.numBuffers;
+
+    auto const& scratch = sparseStepScratch(lcId);
+    TLLM_CHECK_WITH_INFO(scratch.outSlot != nullptr, "fetchResolvedIndices: this layer group carries no sparse cache");
+    TLLM_CHECK_WITH_INFO(selectionWidth == scratch.selectionWidth,
+        "fetchResolvedIndices: selectionWidth must match the configured numSelectedBlocks");
+
+    int const unitsPerPage = mManager->sparseCacheUnitsPerPage(lcId);
+    auto const leases = _leaseMirror();
+    auto const arena = _sparseArena(lcId).view();
+    auto const numRows = maxBatchSize();
 
     // The index table the attention kernel reads is derived from the resolve's slots alone:
-    // it neither reads a cell nor waits for one to be filled. The copy releases its launch
-    // dependency as soon as it is addressed, so this follows it on the stream without
-    // waiting for it to finish.
+    // it neither reads a cell nor waits for one to be filled, so it may run beside the copy.
     auto const plan = mManager->_sparseBufferPlan(lcId);
     // Buffers whose indices coincide share a slice, so a run that only repeats slices an
     // earlier one already wrote is not launched at all. A layer's data and scale pools
@@ -2072,6 +2091,9 @@ void Batch::fetchResolvedPages(std::vector<BufferId> const& buffers, int32_t con
         indices.cellsPerBuffer = pool.cellsPerBuffer;
         indices.cellsPerLease = pool.cellsPerLease;
         indices.unitsPerPage = unitsPerPage;
+        // A run's buffers address host pages through their own descriptors, indexed by
+        // the same buffer number as the arena's.
+        indices.hostDesc = hostReads ? scratch.copyDesc : nullptr;
         launchSparseOutIndices(indices, stream);
     }
 }

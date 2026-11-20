@@ -747,6 +747,7 @@ def _test_sparse_offload_long_context(
     unit_tokens: int,
     block_reuse: bool = False,
     server_waiting_timeout: int = 1200,
+    kv_cache_offload_config: dict[str, Any] | None = None,
 ) -> None:
     """Require exact resident/offload tokens and real host fetches.
 
@@ -759,6 +760,8 @@ def _test_sparse_offload_long_context(
 
     Exact comparisons use eager, deterministic TP attention. CUDA graph replay
     and request remapping remain covered by the native offload component tests.
+    ``kv_cache_offload_config`` adds to the offload run's sizing, whose GPU cache
+    holds one selection.
     """
     is_m3 = gen_server_config["sparse_attention_config"][
         "algorithm"] == "minimax_m3"
@@ -878,7 +881,10 @@ def _test_sparse_offload_long_context(
     offload_config = copy.deepcopy(gen_server_config)
     offload_config["sparse_attention_config"].update(
         enable_kv_cache_offload=True,
-        kv_cache_offload_config={"gpu_cache_factor": 1.0})
+        kv_cache_offload_config={
+            "gpu_cache_factor": 1.0,
+            **(kv_cache_offload_config or {})
+        })
     deterministic_env = {
         "TLLM_LOG_LEVEL": "info",
         "TLLM_LOG_LEVEL_BY_MODULE": "info:_torch",
@@ -3413,8 +3419,25 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         """M3 repeated prompts reuse received KV and match resident decode exactly."""
         self._run_kv_cache_offload(kv_dtype, block_reuse=True)
 
-    def _run_kv_cache_offload(self, kv_dtype: str, *,
-                              block_reuse: bool) -> None:
+    @pytest.mark.timeout(3600)
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("kv_dtype", ["fp8", "nvfp4"])
+    def test_kv_cache_offload_host_reads(self, kv_dtype: str) -> None:
+        """M3 decode attending uncached blocks in managed host memory matches resident."""
+        self._run_kv_cache_offload(kv_dtype,
+                                   block_reuse=False,
+                                   kv_cache_offload_config={
+                                       "host_history_memory": "managed",
+                                       "read_misses_from_host": True,
+                                   })
+
+    def _run_kv_cache_offload(
+            self,
+            kv_dtype: str,
+            *,
+            block_reuse: bool,
+            kv_cache_offload_config: dict[str, Any] | None = None) -> None:
         common = {
             "tensor_parallel_size": 2,
             "moe_expert_parallel_size": 2,
@@ -3458,6 +3481,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             index_topk=16 * 2,
             unit_tokens=128,
             block_reuse=block_reuse,
+            kv_cache_offload_config=kv_cache_offload_config,
         )
 
     @pytest.mark.skip_less_device(6)

@@ -4344,6 +4344,89 @@ class TestSparseDataPath(unittest.TestCase):
                 cache.close()
             manager.shutdown()
 
+    def test_host_reads_name_the_page_the_copy_reads_until_it_is_a_hit(self):
+        """Host reads index a newly admitted unit by the host page its copy reads.
+
+        Its cell holds that page's bytes once the copy has run.
+        """
+        ctypes, cudart, torch = self._deps()
+        for managed in (False, True):
+            with self.subTest(managed=managed):
+                manager = self._manager(managed=managed)
+                cache = None
+                try:
+                    lg = manager.get_layer_group_id(0)
+                    pool = int(manager.get_mem_pool_base_address(LayerId(0), "key"))
+                    stride = manager.get_page_stride(LayerId(0), "key")
+                    buffers = [BufferId(0, "key")]
+                    (spec,) = [
+                        spec
+                        for spec in manager.sparse_index_table_specs()
+                        if BufferId(0, "key") in list(spec.buffers)
+                    ]
+                    cache = manager.create_kv_cache()
+                    with TemporaryCudaStream([]) as stream:
+                        handle = cast(CudaStream, stream.handle)
+                        batch = Batch(
+                            manager,
+                            handle,
+                            max_batch_size=1,
+                            max_blocks_per_seq=8,
+                            index_tables=manager.sparse_index_table_specs(),
+                        )
+                        arena = int(batch.get_sparse_cache_base_address(LayerId(0), "key"))
+                        base, page_stride = batch.pool_spec_for(spec)
+                        self.assertTrue(cache.resume(handle))
+                        batch.add_kv_cache(cache)
+                        self.assertTrue(cache.resize(4 * self.TPB, 4 * self.TPB))
+                        pages = [int(x) for x in cache.get_base_page_indices(lg)]
+                        pattern = self._pattern(self.BUF, 5)
+                        ctypes.memmove(pool + pages[2] * stride, pattern, self.BUF)
+                        selected = torch.tensor([[2, 0]], dtype=torch.int32, device="cuda")
+                        out = torch.full((1, 1, self.SELECTED), 0, dtype=torch.int32, device="cuda")
+
+                        def fetch() -> list[int]:
+                            batch.publish()
+                            batch.resolve_sparse_selection(
+                                buffers, selected, handle, host_reads=True
+                            )
+                            batch.fetch_resolved_indices(
+                                buffers, selected, out, handle, host_reads=True
+                            )
+                            torch.cuda.synchronize()
+                            indices = out[0][0].tolist()
+                            batch.wait_published()
+                            return indices
+
+                        first = fetch()
+                        # Both units are misses: each names its own host page, which the
+                        # Batch's pool spec addresses as the copy does.
+                        self.assertTrue(all(index < -1 for index in first), first)
+                        self.assertEqual(
+                            [base + (-2 - index) * page_stride for index in first],
+                            [pool + pages[2] * stride, pool + pages[0] * stride],
+                        )
+                        batch.copy_resolved_pages(buffers, handle)
+                        second = fetch()
+                        # Resident now: the same selection hits cells holding the bytes.
+                        self.assertTrue(all(index >= 0 for index in second), second)
+                        got = bytearray(self.BUF)
+                        sink = (ctypes.c_ubyte * self.BUF).from_buffer(got)
+                        (err,) = cudart.cudaMemcpy(
+                            ctypes.addressof(sink),
+                            arena + second[0] * self.BUF,
+                            self.BUF,
+                            cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                        )
+                        self.assertEqual(int(err), 0)
+                        self.assertEqual(bytes(got), pattern)
+                        batch.flush_sparse_units([4 * self.TPB])
+                        batch.remove_kv_cache(cache)
+                finally:
+                    if cache is not None:
+                        cache.close()
+                    manager.shutdown()
+
     def test_managed_hot_pages_move_their_bytes_like_pinned_ones(self):
         """Managed host-backed pools are managed memory that fetch and write-back reach in place.
 

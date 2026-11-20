@@ -6244,12 +6244,23 @@ class TestDeepSeekV4SparseAttentionConfig:
     @pytest.mark.parametrize("field, value",
                              [("gpu_cache_factor", 3.0),
                               ("host_history_size", 1 << 30),
-                              ("host_history_memory", "managed")])
+                              ("host_history_memory", "managed"),
+                              ("read_misses_from_host", True)])
     def test_kv_cache_offload_sizes_require_offload(self, field, value):
         with pytest.raises(ValidationError,
                            match="requires enable_kv_cache_offload"):
             DeepSeekV4SparseAttentionConfig(
                 kv_cache_offload_config={field: value})
+
+    def test_only_minimax_m3_reads_misses_from_host(self):
+        offload = {"read_misses_from_host": True}
+        with pytest.raises(ValidationError,
+                           match="does not support .*read_misses_from_host"):
+            DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True,
+                                            kv_cache_offload_config=offload)
+        config = llm_args_mod.MiniMaxM3SparseAttentionConfig(
+            enable_kv_cache_offload=True, kv_cache_offload_config=offload)
+        assert config.get_kv_cache_offload_config().read_misses_from_host
 
     def test_only_offloading_configs_report_kv_cache_offload(self):
         assert llm_args_mod.DeepSeekSparseAttentionConfig(

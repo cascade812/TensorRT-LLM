@@ -164,9 +164,12 @@ class MsaDecodeFmha(PhasedFmha):
 
         kv_block_indexes = params.fwd.sparse_runtime_params.sparse_attn_indices
         if kv_block_indexes is not None:
-            if metadata.sparse_offload_state is not None:
+            offloaded = metadata.sparse_offload_state is not None
+            if offloaded:
                 block_table = metadata.fetch_sparse_blocks(params.attn.layer_idx, kv_block_indexes)
             self._run_sparse(params, kv_block_indexes, block_table, seq_lens)
+            if offloaded:
+                metadata.finish_sparse_fetch(params.attn.layer_idx)
         else:
             self._run_dense(params, block_table, seq_lens)
 
@@ -188,6 +191,8 @@ class MsaDecodeFmha(PhasedFmha):
         k_paged, v_paged = msa_paged_kv(params.meta.kv_cache_manager, attn.layer_idx)
         nvfp4_args = {}
         manager = params.meta.kv_cache_manager
+        # Blocks an offload fetch left in host memory are read there, in place.
+        host_pages = getattr(manager, "m3_sparse_host_pages", lambda _: None)(attn.layer_idx)
         if getattr(manager, "is_nvfp4_layer", lambda _: False)(attn.layer_idx):
             from .msa_prefill import _aligned_nvfp4_dequant_scales
 
@@ -218,6 +223,7 @@ class MsaDecodeFmha(PhasedFmha):
             sm_scale=(head_dim**-0.5) / float(attn.q_scaling),
             output=params.output.view(num_tokens, attn.num_heads, head_dim),
             decode_query_len=params.input_seq_length,
+            host_pages=host_pages,
             **nvfp4_args,
         )
 

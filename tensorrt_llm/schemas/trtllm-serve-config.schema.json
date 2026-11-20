@@ -1751,6 +1751,9 @@
                   },
                   "host_history_size": {
                     "const": null
+                  },
+                  "read_misses_from_host": {
+                    "const": false
                   }
                 }
               }
@@ -1951,6 +1954,9 @@
                   },
                   "host_history_size": {
                     "const": null
+                  },
+                  "read_misses_from_host": {
+                    "const": false
                   }
                 }
               }
@@ -4961,6 +4967,9 @@
                   },
                   "host_history_size": {
                     "const": null
+                  },
+                  "read_misses_from_host": {
+                    "const": false
                   }
                 }
               }
@@ -8008,6 +8017,13 @@
           "description": "Pinned host memory in bytes, per rank, for offloaded attention history and the staging buffers that publish it to the GPU. The KV cache manager holds the history pools within it, beside the GPU KV cache quota, which it does not lower; a size too small for the batches the manager must always hold, such as one max_seq_len request, is rejected. It is separate from kv_cache_config.host_cache_size, the host tier that evicted KV cache pages move to, and the two together must fit this rank's share of available host memory and the pinned-memory limit. When unset, the history pools come first: they may take the host memory automatic sizing may pin, beside the staging buffers and, unless kv_cache_config.host_cache_size or a disk tier is set, room in the host tier for one max_seq_len request. Either way it is an upper bound: the history pools share their slot count with the GPU KV cache pools, so they pin only what the GPU quota's slots pair with. When unset, the automatic host tier takes the host memory they leave, up to the GPU KV cache quota.",
           "status": "prototype",
           "title": "Host History Size"
+        },
+        "read_misses_from_host": {
+          "default": false,
+          "description": "Read the selected units that are not in the GPU cache directly from host memory in attention, instead of waiting for them to be copied in first. The copy into the GPU cache still runs, after attention is enqueued, so later steps find those units on the GPU. Pairs with host_history_memory='managed'. Supported by MiniMax-M3.",
+          "status": "prototype",
+          "title": "Read Misses From Host",
+          "type": "boolean"
         }
       },
       "title": "SparseKvCacheOffloadConfig",

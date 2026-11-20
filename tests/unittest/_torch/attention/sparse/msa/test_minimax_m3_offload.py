@@ -63,6 +63,7 @@ def _manager(
     offload: bool = True,
     block_reuse: bool = False,
     host_memory: str = "pinned",
+    host_reads: bool = False,
 ) -> MiniMaxM3KVCacheManagerV2:
     return MiniMaxM3KVCacheManagerV2(
         kv_cache_config=KvCacheConfig(
@@ -86,6 +87,7 @@ def _manager(
                 "gpu_cache_factor": 1.0,
                 "host_history_size": 512 << 20,
                 "host_history_memory": host_memory,
+                "read_misses_from_host": host_reads,
             }
             if offload
             else {},
@@ -170,7 +172,7 @@ def _write(data, scales, slots, k, v, quant):
         )
 
 
-def _attention(q, data, scales, topk, table, lengths, out, quant):
+def _attention(q, data, scales, topk, table, lengths, out, quant, host_pages=None):
     extra = (
         {}
         if scales is None
@@ -191,7 +193,19 @@ def _attention(q, data, scales, topk, table, lengths, out, quant):
         sm_scale=HEAD_DIM**-0.5,
         output=out,
         decode_query_len=1,
+        host_pages=host_pages,
         **extra,
+    )
+
+
+def _host_unit(pages, unit: int, data_like: torch.Tensor) -> torch.Tensor:
+    """K and V of one host page a host-read block-table entry names, [2, heads, page, dim]."""
+    shape, dtype = tuple(data_like.shape[1:]), data_like.dtype
+    return torch.stack(
+        [
+            convert_to_torch_tensor(TensorWrapper(base + unit * pages.stride, dtype, shape))
+            for base in (pages.k, pages.v)
+        ]
     )
 
 
@@ -380,20 +394,31 @@ def test_m3_offload_reuses_received_prompt(dtype, heads, shorter_prefix):
 
 
 @pytest.mark.parametrize(
-    "dtype,heads,graph,host_memory",
+    "dtype,heads,graph,host_memory,host_reads",
     [
-        (DataType.BF16, 2, False, "pinned"),
-        (DataType.HALF, 1, False, "pinned"),
-        (DataType.FP8, 1, False, "pinned"),
-        (DataType.FP8, 4, True, "pinned"),
-        (DataType.NVFP4, 1, False, "pinned"),
-        (DataType.NVFP4, 2, True, "pinned"),
-        (DataType.FP8, 1, False, "managed"),
-        (DataType.NVFP4, 2, True, "managed"),
+        (DataType.BF16, 2, False, "pinned", False),
+        (DataType.HALF, 1, False, "pinned", False),
+        (DataType.FP8, 1, False, "pinned", False),
+        (DataType.FP8, 4, True, "pinned", False),
+        (DataType.NVFP4, 1, False, "pinned", False),
+        (DataType.NVFP4, 2, True, "pinned", False),
+        (DataType.FP8, 1, False, "managed", False),
+        (DataType.NVFP4, 2, True, "managed", False),
+        (DataType.BF16, 2, False, "managed", True),
+        (DataType.FP8, 1, False, "managed", True),
+        (DataType.FP8, 4, True, "managed", True),
+        (DataType.NVFP4, 1, False, "managed", True),
+        (DataType.NVFP4, 2, True, "managed", True),
+        (DataType.NVFP4, 2, False, "pinned", True),
     ],
 )
 def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseating(
-    dtype: DataType, heads: int, graph: bool, host_memory: str, monkeypatch: pytest.MonkeyPatch
+    dtype: DataType,
+    heads: int,
+    graph: bool,
+    host_memory: str,
+    host_reads: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Bitwise data/scale and attention parity, including replay with changing batch rows.
 
@@ -401,11 +426,13 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
     Per-head selections rotate, a request leaves and rejoins inside a growing block, and
     requests cross page boundaries at different steps. Padded graph queries
     must never write into another request's arena or become native Batch members.
+    With host reads, blocks missing from the arena are attended in host memory and
+    copied in after attention, and must be hits on the steps that select them again.
     """
     history_blocks = 2 * TOPK * heads + 7
     max_blocks = history_blocks + 4
     max_seq_len = max_blocks * PAGE
-    manager = _manager(dtype, heads, max_seq_len, host_memory=host_memory)
+    manager = _manager(dtype, heads, max_seq_len, host_memory=host_memory, host_reads=host_reads)
     generator = torch.Generator(device="cuda").manual_seed(437)
     nvfp4 = dtype == DataType.NVFP4
     requests = [
@@ -521,8 +548,10 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
             for layer in SPARSE_LAYERS
         }
         outputs = {layer: torch.empty_like(q) for layer in SPARSE_LAYERS}
+        host_entries = 0
 
         def decode():
+            nonlocal host_entries
             for layer in SPARSE_LAYERS:
                 k, v = inputs[layer]
                 MiniMaxM3MsaSparseAttention.write_layer_caches(
@@ -534,18 +563,35 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                     quant,
                 )
                 table = metadata.fetch_sparse_blocks(layer, topk)
+                host_pages = manager.m3_sparse_host_pages(layer)
+                assert (host_pages is not None) == host_reads
                 if not graph:
                     arena = manager.get_buffers(layer, "HND").view(torch.uint8)
                     for position, (rid, history) in enumerate(zip(ids, histories)):
                         units = topk[position].flatten().unique()
                         units = units[units >= 0].long()
                         physical = table[position, units].long()
-                        assert (physical >= 0).all(), (step, layer, rid)
+                        on_host = physical < -1
+                        assert (physical != -1).all() and (host_reads or not on_host.any()), (
+                            step,
+                            layer,
+                            rid,
+                        )
+                        host_entries += int(on_host.sum())
+                        expected = reference[rid, layer][0].view(torch.uint8)[units]
+                        actual = torch.stack(
+                            [
+                                _host_unit(host_pages, -2 - int(page), arena[0]).view(torch.uint8)
+                                if page < -1
+                                else arena[page]
+                                for page in physical.tolist()
+                            ]
+                        )
                         valid = units[:, None] * PAGE + torch.arange(PAGE, device="cuda") <= history
                         mask = ~valid[:, None, None, :, None]
                         torch.testing.assert_close(
-                            arena[physical].masked_fill(mask, 0),
-                            reference[rid, layer][0].view(torch.uint8)[units].masked_fill(mask, 0),
+                            actual.masked_fill(mask, 0),
+                            expected.masked_fill(mask, 0),
                             rtol=0,
                             atol=0,
                             msg=(
@@ -562,7 +608,9 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                     metadata.msa_seq_lens_cuda,
                     outputs[layer],
                     quant,
+                    host_pages=host_pages,
                 )
+                metadata.finish_sparse_fetch(layer)
 
         captured = None
         permuted = False
@@ -644,6 +692,8 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
             else:
                 captured.replay()
             torch.cuda.synchronize()
+            if graph:
+                host_entries += int((metadata.msa_sparse_block_table[: len(ids)] < -1).sum())
             assert (metadata.msa_sparse_write_slots[len(active) :] == -1).all()
             for layer in SPARSE_LAYERS:
                 expected = torch.empty_like(q)
@@ -701,6 +751,7 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                             atol=0,
                         )
         assert permuted
+        assert (host_entries > 0) == host_reads
         for request in requests:
             manager.free_resources(request)
     finally:

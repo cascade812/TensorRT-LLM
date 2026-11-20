@@ -18,6 +18,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferId,
     KVCacheManagerConfig,
+    PageIndexMode,
 )
 
 from ..offload import (
@@ -31,16 +32,23 @@ __all__ = ["MiniMaxM3SparseOffloadMixin"]
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
+    from .kernels.triton_sparse_decode import HostKVPages
+
 
 class MiniMaxM3SparseOffloadMixin(SparseOffloadCacheMixin):
     """Keep dense layers and index keys resident while offloading sparse K/V blocks."""
 
     def _init_m3_sparse_offload(self, config: MiniMaxM3SparseAttentionConfig | None) -> None:
         sizing = None if config is None else config.get_kv_cache_offload_config()
-        self._init_sparse_offload(enabled=sizing is not None, topk=None)
+        self._init_sparse_offload(
+            enabled=sizing is not None,
+            topk=None,
+            host_reads=sizing is not None and sizing.read_misses_from_host,
+        )
         self._m3_topk_blocks = 0 if config is None else config.sparse_topk_blocks
         self._m3_offload_descriptors: dict[int, SparseOffloadLayerDescriptor] | None = None
         self._m3_arena_views: dict[tuple[int, bool], torch.Tensor] = {}
+        self._m3_host_pages: dict[int, HostKVPages] = {}
 
     def offloads_layer(self, layer_idx: int) -> bool:
         return self._enable_kv_cache_offload and layer_idx in self.sparse_layer_ids
@@ -158,6 +166,69 @@ class MiniMaxM3SparseOffloadMixin(SparseOffloadCacheMixin):
         )
         self._m3_arena_views[key] = view
         return view
+
+    def m3_sparse_host_pages(self, layer_idx: int) -> HostKVPages | None:
+        """Where attention reads this layer's host pages, or None without host reads.
+
+        A fetch with host reads names a selected unit that is not yet in the
+        arena by its host page: the converted page index of the layer's K
+        buffer, which ``Batch.pool_spec_for`` turns into K's address. V shares
+        that slot at a fixed offset, and the NVFP4 block scales share K's
+        converted indices under their own base and stride.
+        """
+        if not self._sparse_host_reads or not self.offloads_layer(layer_idx):
+            return None
+        pages = self._m3_host_pages.get(layer_idx)
+        if pages is not None:
+            return pages
+        from .kernels.triton_sparse_decode import HostKVPages
+
+        batch = self._ensure_sparse_batch()
+        local = self.layer_offsets[layer_idx]
+        if self.impl.get_sparse_cache_units_per_page(local) != 1:
+            raise ValueError("MiniMax-M3 host reads require one selection unit per page")
+        specs = self.impl.sparse_index_table_specs()
+
+        def spec_of(role) -> tuple[object, int]:
+            buffer = BufferId(local, role)
+            for spec in specs:
+                buffers = list(spec.buffers)
+                if buffer in buffers:
+                    return spec, buffers.index(buffer)
+            raise ValueError(f"MiniMax-M3 layer {layer_idx}'s {role} has no index table spec")
+
+        def slot_offset(base_role, role) -> int:
+            """Bytes from base_role's page to role's within one host slot."""
+            return int(
+                self.impl.get_mem_pool_base_address(local, role, PageIndexMode.SHARED)
+            ) - int(self.impl.get_mem_pool_base_address(local, base_role, PageIndexMode.SHARED))
+
+        k_spec, k_entry = spec_of(Role.KEY)
+        v_spec, _ = spec_of(Role.VALUE)
+        if list(k_spec.buffers) != list(v_spec.buffers):
+            raise ValueError("MiniMax-M3 host reads require K and V in one index table spec")
+        base, stride = batch.pool_spec_for(k_spec)
+        pages = HostKVPages(
+            k=int(base), v=int(base) + slot_offset(Role.KEY, Role.VALUE), stride=int(stride)
+        )
+        if self.is_nvfp4_layer(layer_idx):
+            scale_spec, scale_entry = spec_of(Role.KEY_BLOCK_SCALE)
+            if (
+                batch.index_table_id(scale_spec) != batch.index_table_id(k_spec)
+                or scale_entry != k_entry
+            ):
+                raise ValueError(
+                    "MiniMax-M3 host reads require the NVFP4 block scales to share K's "
+                    "converted page indices"
+                )
+            scale_base, scale_stride = batch.pool_spec_for(scale_spec)
+            pages = pages._replace(
+                k_scale=int(scale_base),
+                v_scale=int(scale_base) + slot_offset(Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE),
+                scale_stride=int(scale_stride),
+            )
+        self._m3_host_pages[layer_idx] = pages
+        return pages
 
     def get_sparse_offload_scratch_bytes(self, config: KVCacheManagerConfig) -> int:
         shared = super().get_sparse_offload_scratch_bytes(config)

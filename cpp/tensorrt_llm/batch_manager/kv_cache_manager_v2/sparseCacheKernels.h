@@ -30,6 +30,17 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 //! Written to an output slot that carries no selection, i.e. selection padding.
 inline constexpr int32_t kNoSparseSlot = -1;
 
+//! Ored into the slot of a selection the resolve admitted this step, when the resolve was
+//! asked to mark them (SparseResolveArgs::markAdmitted): the unit has a cell, and the copy
+//! that fills the cell from its host page has yet to run. Every reader of a slot strips it.
+inline constexpr int32_t kSparseAdmittedSlotBit = 1 << 30;
+
+//! Host reads: an index naming a unit's host page instead of a cell is
+//! kSparseHostIndexBase - u, for the unit's host position u = page * unitsPerPage + unit,
+//! where `page` is the buffer's converted page index (Batch::poolSpecFor's base plus
+//! page * pageStride addresses it). So it is never a cell index (>= 0) nor kBadPageIndex.
+inline constexpr int32_t kSparseHostIndexBase = -2;
+
 //! These kernels enforce their preconditions by trapping, not by reporting: a violation is
 //! a KVCM2 logic error, and the trap destroys the context, so no status could be read back.
 //! A debug build names the condition before halting.
@@ -144,6 +155,9 @@ struct SparseResolveArgs
     int32_t unitTokens;
     //! Round capacity up to a unit, restoring a partial history prefix on a miss.
     bool includePartialUnits = false;
+    //! Mark the slot of every selection admitted from history with kSparseAdmittedSlotBit,
+    //! so an index write can point at the unit's host page while its copy is pending.
+    bool markAdmitted = false;
 
     //! [numRows][selectionWidth] entry index per selection, kNoSparseSlot where padded or
     //! where the row holds no reservation. One list serves every buffer of the layer.
@@ -435,6 +449,12 @@ struct SparseOutIndexArgs
     int32_t cellsPerBuffer;
     int32_t cellsPerLease;
     int32_t unitsPerPage;
+
+    //! Host reads. When set, [buffer] the copy descriptors, and a slot carrying
+    //! kSparseAdmittedSlotBit is written as its unit's host index (kSparseHostIndexBase),
+    //! read through the buffer's descriptor: the same page the pending copy reads. When
+    //! null, the bit is only stripped and the cell is written as usual. Requires `selected`.
+    SparseCopyDesc const* hostDesc = nullptr;
 };
 
 //! Launch the index scatter. One CTA per (row, buffer).

@@ -612,7 +612,17 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         int32_t const ordinal = missOrd[j];
         int32_t const position = missIdx[j];
         entry[s] = SparseEntry::pack(SparseEntry::usedByte(stepAge, false), static_cast<uint32_t>(ordinal));
-        (position < inFlight ? inFlightSlot[position] : outSlot[position - inFlight]) = s;
+        if (position < inFlight)
+        {
+            inFlightSlot[position] = s;
+        }
+        else
+        {
+            // A selection admitted from history is filled by the copy listed below; a caller
+            // that reads the unit before that copy runs asked to have it marked.
+            outSlot[position - inFlight]
+                = args.markAdmitted && ordinal < copyableUnits ? (s | kSparseAdmittedSlotBit) : s;
+        }
         // Fetch complete history and, when configured, the host prefix of a newly
         // reserved partial unit. Resident units are hits, so a fetch never overwrites
         // the token the model has just appended to its reserved cell.
@@ -817,12 +827,31 @@ __global__ __launch_bounds__(kThreads) void sparseOutIndexKernel(SparseOutIndexA
     // an unreserved row both just take the sentinel here rather than needing a prior fill.
     for (int32_t i = static_cast<int32_t>(threadIdx.x); i < args.selectionWidth; i += kThreads)
     {
-        int32_t const slot = reserved ? args.outSlot[slotBase + i] : kNoSparseSlot;
+        int32_t slot = reserved ? args.outSlot[slotBase + i] : kNoSparseSlot;
         // Without a selection array the slot alone says whether the entry is live, which is
         // what the write-index path passes: its in-flight list is already self-describing.
         if ((args.selected != nullptr && args.selected[base + i] < 0) || slot < 0)
         {
             out[i] = kBadPageIndexValue;
+            continue;
+        }
+        bool const admitted = (slot & kSparseAdmittedSlotBit) != 0;
+        slot &= ~kSparseAdmittedSlotBit;
+        if (admitted && args.hostDesc != nullptr)
+        {
+            // The unit's host page, which the copy that will fill its cell reads too.
+            SparseCopyDesc const& desc = args.hostDesc[buffer];
+            int32_t const ordinal = args.selected[base + i];
+            int32_t const block = ordinal / args.unitsPerPage;
+            if (block >= static_cast<int32_t>(desc.numBlocks))
+            {
+                out[i] = kBadPageIndexValue;
+                continue;
+            }
+            auto const page
+                = static_cast<int64_t>(desc.pageTable[static_cast<ptrdiff_t>(row) * desc.pageTableStride + block]);
+            out[i]
+                = static_cast<int32_t>(kSparseHostIndexBase - (page * args.unitsPerPage + ordinal % args.unitsPerPage));
             continue;
         }
 

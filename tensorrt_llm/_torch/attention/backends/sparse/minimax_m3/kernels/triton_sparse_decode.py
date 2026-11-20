@@ -37,7 +37,7 @@ Differences from upstream:
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 import triton
@@ -64,6 +64,55 @@ _TARGET_GRID = 256
 # NVFP4 quantizes in groups of 16 cache elements along head_dim, one E4M3 scale
 # byte each; see the fp4_quantize call in msa_scatter.fused_write_layer_caches_nvfp4.
 NVFP4_SF_VEC_SIZE = 16
+
+
+class HostKVPages(NamedTuple):
+    """Byte addresses of the host pages a block table's host entries name.
+
+    A block-table entry ``p < -1`` names host page ``u = -2 - p``: its K at
+    ``k + u * stride`` and its V at ``v + u * stride``, and with NVFP4 its block
+    scales at ``k_scale + u * scale_stride`` and ``v_scale + u * scale_stride``.
+    Each page has the layout of one page of the paged cache views.
+    """
+
+    k: int
+    v: int
+    stride: int
+    k_scale: int = 0
+    v_scale: int = 0
+    scale_stride: int = 0
+
+
+def _host_offsets(
+    host_pages: Optional[HostKVPages],
+    k_paged: torch.Tensor,
+    v_paged: torch.Tensor,
+    k_scales: Optional[torch.Tensor],
+    v_scales: Optional[torch.Tensor],
+) -> tuple[int, int, int, int, int, int]:
+    """Element offsets from each tensor's data pointer to host page 0, and page strides."""
+    if host_pages is None:
+        return 0, 0, 0, 0, 0, 0
+
+    def elements(tensor: torch.Tensor, nbytes: int, name: str) -> int:
+        size = tensor.element_size()
+        if nbytes % size:
+            raise ValueError(f"Host {name} is not aligned to its {size}-byte elements")
+        return nbytes // size
+
+    offsets = [
+        elements(k_paged, host_pages.k - k_paged.data_ptr(), "K"),
+        elements(v_paged, host_pages.v - v_paged.data_ptr(), "V"),
+        0,
+        0,
+        elements(k_paged, host_pages.stride, "page stride"),
+        0,
+    ]
+    if k_scales is not None:
+        offsets[2] = elements(k_scales, host_pages.k_scale - k_scales.data_ptr(), "K scales")
+        offsets[3] = elements(v_scales, host_pages.v_scale - v_scales.data_ptr(), "V scales")
+        offsets[5] = elements(k_scales, host_pages.scale_stride, "scale page stride")
+    return tuple(offsets)
 
 
 def _pdl_enabled() -> bool:
@@ -115,6 +164,24 @@ def _dequant_nvfp4_rows(
         tl.broadcast_to(scales[:, :, None], (BLOCK_N, SCALE_COLS, SF_VEC)), (BLOCK_N, D)
     )
     return values * scales
+
+
+@triton.jit
+def _page_offset(page, stride_blk, host_off, host_stride, HOST_READS: tl.constexpr):
+    """Element offset of one page from its tensor's base pointer.
+
+    ``page`` is a block-table entry. A nonnegative entry is an arena page,
+    ``stride_blk`` elements apart. With HOST_READS, an entry below -1 names host
+    page ``-2 - page``, ``host_stride`` elements apart from ``host_off``.
+
+    The host offsets and strides stay specialized on alignment, as the arena
+    strides are: losing it would change how the block scales are loaded and,
+    through their register layout, the order the NVFP4 dot products accumulate
+    in, so a kernel reading host pages would no longer match one that does not.
+    """
+    if HOST_READS:
+        return tl.where(page < -1, host_off + (-2 - page) * host_stride, page * stride_blk)
+    return page * stride_blk
 
 
 @triton.heuristics(
@@ -170,6 +237,12 @@ def _gqa_sparse_decode_kernel(
     stride_l_b,
     stride_l_h,
     stride_bt_b,
+    host_k_off,  # element offsets from k_ptr, v_ptr, k_sc_ptr, v_sc_ptr to host page 0
+    host_v_off,
+    host_ksc_off,
+    host_vsc_off,
+    host_stride,  # elements between host K/V pages
+    host_sc_stride,  # elements between host block-scale pages
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
@@ -182,6 +255,7 @@ def _gqa_sparse_decode_kernel(
     USE_LINEAR_SOFTMAX: tl.constexpr,  # measured NVFP4 online-softmax recurrence
     SCALE_COLS: tl.constexpr,  # head_dim // NVFP4_SF_VEC_SIZE, NVFP4 only
     DIRECT_OUTPUT: tl.constexpr,  # one chunk needs neither FP32 scratch nor a merge
+    HOST_READS: tl.constexpr,  # block-table entries below -1 name host pages
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     if KV_NVFP4:
@@ -262,6 +336,10 @@ def _gqa_sparse_decode_kernel(
         # int64 page offsets: a large cache overflows int32 well before the
         # per-page block offsets do.
         page = tl.load(bt_row + blk).to(tl.int64)
+        k_off = _page_offset(page, stride_k_blk, host_k_off, host_stride, HOST_READS)
+        v_off = _page_offset(page, stride_v_blk, host_v_off, host_stride, HOST_READS)
+        ksc_off = _page_offset(page, stride_ksc_blk, host_ksc_off, host_sc_stride, HOST_READS)
+        vsc_off = _page_offset(page, stride_vsc_blk, host_vsc_off, host_sc_stride, HOST_READS)
         pos_mask = blk * BLOCK_SIZE_K + off_n < kv_len
         if KV_NVFP4:
             # K block scales are token-major linear within the page-head region;
@@ -269,7 +347,7 @@ def _gqa_sparse_decode_kernel(
             k_deq = _dequant_nvfp4_rows(
                 tl.load(
                     k_ptr
-                    + page * stride_k_blk
+                    + k_off
                     + pid_kh * stride_k_h
                     + off_n[:, None] * stride_k_pos
                     + off_dp[None, :] * stride_k_d,
@@ -278,7 +356,7 @@ def _gqa_sparse_decode_kernel(
                 ),
                 tl.load(
                     k_sc_ptr
-                    + page * stride_ksc_blk
+                    + ksc_off
                     + pid_kh * stride_ksc_h
                     + off_n[:, None] * SCALE_COLS
                     + off_s[None, :],
@@ -294,7 +372,7 @@ def _gqa_sparse_decode_kernel(
         else:
             k = tl.load(
                 k_ptr
-                + page * stride_k_blk
+                + k_off
                 + pid_kh * stride_k_h
                 + off_n[None, :] * stride_k_pos
                 + off_d[:, None] * stride_k_d,
@@ -319,7 +397,7 @@ def _gqa_sparse_decode_kernel(
             v = _dequant_nvfp4_rows(
                 tl.load(
                     v_ptr
-                    + page * stride_v_blk
+                    + v_off
                     + pid_kh * stride_v_h
                     + off_n[:, None] * stride_v_pos
                     + off_dp[None, :] * stride_v_d,
@@ -328,7 +406,7 @@ def _gqa_sparse_decode_kernel(
                 ),
                 tl.load(
                     v_sc_ptr
-                    + page * stride_vsc_blk
+                    + vsc_off
                     + pid_kh * stride_vsc_h
                     + (off_n[:, None] // 4) * (4 * SCALE_COLS)
                     + 4 * off_s[None, :]
@@ -344,7 +422,7 @@ def _gqa_sparse_decode_kernel(
         else:
             v = tl.load(
                 v_ptr
-                + page * stride_v_blk
+                + v_off
                 + pid_kh * stride_v_h
                 + off_n[:, None] * stride_v_pos
                 + off_d[None, :] * stride_v_d,
@@ -444,6 +522,12 @@ def _gqa_sparse_decode_pair_kernel(
     stride_l_b,
     stride_l_h,
     stride_bt_b,
+    host_k_off,  # element offsets from k_ptr, v_ptr, k_sc_ptr, v_sc_ptr to host page 0
+    host_v_off,
+    host_ksc_off,
+    host_vsc_off,
+    host_stride,  # elements between host K/V pages
+    host_sc_stride,  # elements between host block-scale pages
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
@@ -458,6 +542,7 @@ def _gqa_sparse_decode_pair_kernel(
     MAX_TOPK: tl.constexpr,
     SCALE_COLS: tl.constexpr,  # head_dim // NVFP4_SF_VEC_SIZE, NVFP4 only
     DIRECT_OUTPUT: tl.constexpr,  # one chunk needs neither FP32 scratch nor a merge
+    HOST_READS: tl.constexpr,  # block-table entries below -1 name host pages
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     if KV_NVFP4:
@@ -602,6 +687,10 @@ def _gqa_sparse_decode_pair_kernel(
             # int64 page offsets: a large cache overflows int32 well before the
             # per-page block offsets do.
             page = tl.load(bt_row + blk).to(tl.int64)
+            k_off = _page_offset(page, stride_k_blk, host_k_off, host_stride, HOST_READS)
+            v_off = _page_offset(page, stride_v_blk, host_v_off, host_stride, HOST_READS)
+            ksc_off = _page_offset(page, stride_ksc_blk, host_ksc_off, host_sc_stride, HOST_READS)
+            vsc_off = _page_offset(page, stride_vsc_blk, host_vsc_off, host_sc_stride, HOST_READS)
             pos_mask = blk * BLOCK_SIZE_K + off_n < kv_len_max
             q_pos_mask = blk * BLOCK_SIZE_K + off_n[None, :] < kv_len[:, None]
             if KV_NVFP4:
@@ -610,7 +699,7 @@ def _gqa_sparse_decode_pair_kernel(
                 k_deq = _dequant_nvfp4_rows(
                     tl.load(
                         k_ptr
-                        + page * stride_k_blk
+                        + k_off
                         + pid_kh * stride_k_h
                         + off_n[:, None] * stride_k_pos
                         + off_dp[None, :] * stride_k_d,
@@ -619,7 +708,7 @@ def _gqa_sparse_decode_pair_kernel(
                     ),
                     tl.load(
                         k_sc_ptr
-                        + page * stride_ksc_blk
+                        + ksc_off
                         + pid_kh * stride_ksc_h
                         + off_n[:, None] * SCALE_COLS
                         + off_s[None, :],
@@ -635,7 +724,7 @@ def _gqa_sparse_decode_pair_kernel(
             else:
                 k = tl.load(
                     k_ptr
-                    + page * stride_k_blk
+                    + k_off
                     + pid_kh * stride_k_h
                     + off_n[None, :] * stride_k_pos
                     + off_d[:, None] * stride_k_d,
@@ -658,7 +747,7 @@ def _gqa_sparse_decode_pair_kernel(
                 v = _dequant_nvfp4_rows(
                     tl.load(
                         v_ptr
-                        + page * stride_v_blk
+                        + v_off
                         + pid_kh * stride_v_h
                         + off_n[:, None] * stride_v_pos
                         + off_dp[None, :] * stride_v_d,
@@ -667,7 +756,7 @@ def _gqa_sparse_decode_pair_kernel(
                     ),
                     tl.load(
                         v_sc_ptr
-                        + page * stride_vsc_blk
+                        + vsc_off
                         + pid_kh * stride_vsc_h
                         + (off_n[:, None] // 4) * (4 * SCALE_COLS)
                         + 4 * off_s[None, :]
@@ -683,7 +772,7 @@ def _gqa_sparse_decode_pair_kernel(
             else:
                 v = tl.load(
                     v_ptr
-                    + page * stride_v_blk
+                    + v_off
                     + pid_kh * stride_v_h
                     + off_n[:, None] * stride_v_pos
                     + off_d[None, :] * stride_v_d,
@@ -1019,6 +1108,7 @@ def minimax_m3_sparse_attn_decode(
     k_global_scale: Optional[torch.Tensor] = None,
     v_global_scale: Optional[torch.Tensor] = None,
     num_topk_chunks: Optional[int] = None,
+    host_pages: Optional[HostKVPages] = None,
 ) -> None:
     """Block-sparse GQA decode attention, written into output in place.
 
@@ -1037,6 +1127,11 @@ def minimax_m3_sparse_attn_decode(
 
     num_topk_chunks overrides the split-K factor and exists for tests: the
     merged result must not depend on it.
+
+    host_pages lets block_table name pages outside the paged views: an entry
+    below -1 is read from the host page it encodes (see HostKVPages), in place,
+    through the GPU's mapping of that memory. Without it, every entry the kernel
+    reads must be a page of the views.
     """
     total_q, num_heads, head_dim = q.shape
     num_kv_heads = int(k_paged.shape[1])
@@ -1081,6 +1176,13 @@ def minimax_m3_sparse_attn_decode(
     scale_arg = kv_scale if use_scale else output
     k_sc_arg, v_sc_arg = (k_block_scale, v_block_scale) if kv_nvfp4 else (output, output)
     k_gs_arg, v_gs_arg = (k_global_scale, v_global_scale) if kv_nvfp4 else (output, output)
+    host_args = _host_offsets(
+        host_pages,
+        k_paged,
+        v_paged,
+        k_block_scale if kv_nvfp4 else None,
+        v_block_scale if kv_nvfp4 else None,
+    )
 
     widen_q = q.dtype in _FP8_DTYPES
     if widen_q and output.dtype not in _TL_DTYPES:
@@ -1248,6 +1350,7 @@ def minimax_m3_sparse_attn_decode(
         *o_strides,
         *lse_strides,
         block_table.stride(0),
+        *host_args,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         NUM_TOPK_CHUNKS=num_topk_chunks,
         USE_SCALE=use_scale,
@@ -1258,6 +1361,7 @@ def minimax_m3_sparse_attn_decode(
         USE_LINEAR_SOFTMAX=use_linear_softmax,
         SCALE_COLS=scale_cols,
         DIRECT_OUTPUT=direct_output,
+        HOST_READS=host_pages is not None,
         **pair_kernel_options,
         **pdl_launch,
         **launch_options,
@@ -1293,6 +1397,7 @@ def minimax_m3_sparse_attn_decode(
 
 
 __all__ = [
+    "HostKVPages",
     "NVFP4_SF_VEC_SIZE",
     "SPARSE_BLOCK_SIZE",
     "_sm100f_nvfp4_merge_launch_options",

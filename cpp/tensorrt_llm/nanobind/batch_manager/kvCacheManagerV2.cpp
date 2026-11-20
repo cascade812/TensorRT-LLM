@@ -3348,7 +3348,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "resolve_sparse_selection",
             [](kv::Batch& self, std::vector<kv::BufferId> const& buffers, DeviceArray2D const& selected,
-                nb::object stream)
+                nb::object stream, bool hostReads)
             {
                 if (static_cast<int>(selected.shape(0)) != self.maxBatchSize())
                 {
@@ -3362,16 +3362,76 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 auto* selectedPtr = selected.data();
                 auto const width = static_cast<int>(selected.shape(1));
                 nb::gil_scoped_release rel;
-                self.resolveSparseSelection(buffers, selectedPtr, width, handle);
+                self.resolveSparseSelection(buffers, selectedPtr, width, handle, hostReads);
             },
-            nb::arg("buffers"), nb::arg("selected"), nb::arg("stream") = nb::none(),
+            nb::arg("buffers"), nb::arg("selected"), nb::arg("stream") = nb::none(), nb::arg("host_reads") = false,
             "Resolve one selection, admitting what it names and listing what has to be copied.\n\n"
             "The first half of fetch_sparse_pages, split out for the layers that share a "
             "selection_id: they resolve once between them and then fetch a layer at a time. "
             "buffers names any one member layer -- the residency and the miss list belong to the "
             "selection, not to the layer that happened to name it.\n\n"
             "The miss list it leaves behind is read by every fetch_resolved_pages that follows, "
-            "and is overwritten by the next resolve of the same selection.")
+            "and is overwritten by the next resolve of the same selection.\n\n"
+            "With host_reads, the units it admits from history are marked, so a "
+            "fetch_resolved_indices with host_reads can name their host pages.")
+        .def(
+            "copy_resolved_pages",
+            [](kv::Batch& self, std::vector<kv::BufferId> const& buffers, nb::object stream)
+            {
+                auto const handle = stream.is_none()
+                    ? std::optional<CUstream>{}
+                    : std::optional<CUstream>{reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream))};
+                nb::gil_scoped_release rel;
+                self.copyResolvedPages(buffers, handle);
+            },
+            nb::arg("buffers"), nb::arg("stream") = nb::none(),
+            "The copy half of fetch_resolved_pages: fill one layer's cells with the resolved misses.\n\n"
+            "With fetch_resolved_indices it does what fetch_resolved_pages does, in two calls that may "
+            "run on different streams, since the indices come from the resolve's slots alone. Order "
+            "both after the matching resolve_sparse_selection, and the next resolve of the life cycle "
+            "after both. Whatever reads the cells, sparse attention included, must wait for this copy.")
+        .def(
+            "fetch_resolved_indices",
+            [](kv::Batch& self, std::vector<kv::BufferId> const& buffers, DeviceArray2D const& selected,
+                DeviceArray3D const& out, nb::object stream, bool hostReads)
+            {
+                if (selected.shape(0) != out.shape(0))
+                {
+                    throw std::invalid_argument(
+                        "fetch_resolved_indices: selected and out must agree on the batch size");
+                }
+                if (static_cast<int>(selected.shape(0)) != self.maxBatchSize())
+                {
+                    throw std::invalid_argument(
+                        "fetch_resolved_indices: selected must carry one row per batch row, not one per "
+                        "query token");
+                }
+                if (out.shape(1) != buffers.size())
+                {
+                    throw std::invalid_argument("fetch_resolved_indices: out's middle extent must be len(buffers)");
+                }
+                if (out.shape(2) != selected.shape(1))
+                {
+                    throw std::invalid_argument(
+                        "fetch_resolved_indices: out's last extent must be the selection width");
+                }
+                auto const handle = stream.is_none()
+                    ? std::optional<CUstream>{}
+                    : std::optional<CUstream>{reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream))};
+                auto* selectedPtr = selected.data();
+                auto* outPtr = out.data();
+                auto const width = static_cast<int>(selected.shape(1));
+                nb::gil_scoped_release rel;
+                self.fetchResolvedIndices(buffers, selectedPtr, width, outPtr, handle, hostReads);
+            },
+            nb::arg("buffers"), nb::arg("selected"), nb::arg("out").noconvert(), nb::arg("stream") = nb::none(),
+            nb::arg("host_reads") = false,
+            "The index half of fetch_resolved_pages: write one layer's indices for selected.\n\n"
+            "selected and out are as fetch_resolved_pages takes them. It reads only the resolve's "
+            "slots, so it need not wait for copy_resolved_pages. With host_reads, after a resolve that "
+            "had it too, a unit that resolve admitted is written as -2 - u for its host page u, the "
+            "buffer's converted page index (pool_spec_for's base + u * page_stride addresses it), so "
+            "a reader can take it from host memory before the copy fills its cell.")
         .def(
             "fetch_resolved_pages",
             [](kv::Batch& self, std::vector<kv::BufferId> const& buffers, DeviceArray2D const& selected,

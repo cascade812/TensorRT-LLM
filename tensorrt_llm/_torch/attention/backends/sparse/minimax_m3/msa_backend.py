@@ -329,7 +329,12 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self.msa_sparse_block_table.fill_(-1)
 
     def fetch_sparse_blocks(self, layer_idx: int, topk: torch.Tensor) -> torch.Tensor:
-        """Fetch the union of per-head blocks and return their arena page table."""
+        """Fetch the union of per-head blocks and return their arena page table.
+
+        With host reads (``kv_cache_manager.m3_sparse_host_pages``), a block not
+        yet in the arena takes an entry below -1 naming its host page, which
+        attention reads in place; ``finish_sparse_fetch`` then fills its cell.
+        """
         from .kernels.offload import build_block_table, prepare_selection
 
         state = self.sparse_offload_state
@@ -344,11 +349,22 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             self.msa_sparse_selected,
             self.msa_sparse_request_indices,
             self.msa_sparse_unit_lengths,
+            host_reads=self.kv_cache_manager.m3_sparse_host_pages(layer_idx) is not None,
         )
         build_block_table(
             state, layer_idx, self.msa_sparse_selected[: topk.shape[0]], self.msa_sparse_block_table
         )
         return self.msa_sparse_block_table[: topk.shape[0]]
+
+    def finish_sparse_fetch(self, layer_idx: int) -> None:
+        """Fill the arena cells a host-read fetch admitted, once attention is enqueued.
+
+        Attention read those blocks from host memory this step; the copy makes
+        them arena hits from the next step on. A no-op without host reads.
+        """
+        state = self.sparse_offload_state
+        if state is not None and state.uncopied_layer == layer_idx:
+            self.kv_cache_manager.copy_sparse_misses(state, layer_idx)
 
     @property
     def msa_qo_lens_cpu(self) -> Optional[torch.Tensor]:

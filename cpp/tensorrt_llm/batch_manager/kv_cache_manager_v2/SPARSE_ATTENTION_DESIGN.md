@@ -654,6 +654,22 @@ layer whose selection is its own; it rejects a shared one rather than mis-servin
 a second resolve would count the first's admissions as hits, issue no copies, and leave the
 second layer's cells unfilled.
 
+`fetchResolvedPages()` is itself the copy followed by the index write, and the two are also
+callable apart, as `copyResolvedPages()` and `fetchResolvedIndices()`. The index write reads
+only the resolve's per-slot cells, never a cell's bytes, so a caller that runs the copy on
+another stream has the indices while the copy is still in flight. Only what reads the cells
+waits for the copy. The next resolve of the life cycle must still follow the copy, since it
+reuses the miss list the copy walks.
+
+**Host reads** go one step further: the reader does not wait for the copy at all. A resolve
+with `hostReads` marks the slot of every unit it admits from history
+(`kSparseAdmittedSlotBit`), and an index write with `hostReads` turns a marked slot into the
+unit's host page instead of its cell, encoded below -1 (`kSparseHostIndexBase - u`, where
+`u` is the buffer's converted page index the copy itself reads). The host pages are
+device-accessible — pinned and mapped, or managed and advised as accessed by the GPU — so
+attention reads the unit in place while the copy fills the cell for later steps. Hits are
+unaffected: their cells already hold the bytes.
+
 The copy kernel needed no change for any of this. It consumes a work list plus a buffer
 range, and nothing in it depended on which layer produced the list. Neither did the
 write-back: `sparseResolveKernel` is the only writer of the lease's entry words, and

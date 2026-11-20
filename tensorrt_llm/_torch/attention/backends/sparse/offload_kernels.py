@@ -105,7 +105,9 @@ def sparse_arena_rows(
     ``in_width`` the lanes that hold a selection. A unit below the request's
     ``history_units`` takes its fetched row, from ``fetched_row_ptr`` at
     ``lane``; the in-flight unit takes ``write``; padding queries (``live``
-    false), invalid selections and units past ``length`` take -1.
+    false), invalid selections and units past ``length`` take -1. A fetch with
+    host reads may hand a history unit an entry below -1, which names its host
+    page; that counts as a row too.
 
     With ``CHECK_COVERAGE``, clears the int32 flag at ``coverage_ptr`` when a
     live, valid selection of a history or in-flight unit gets no row.
@@ -119,7 +121,7 @@ def sparse_arena_rows(
     rows = tl.where(valid & (unit == history_units), write, fetched)
     if CHECK_COVERAGE:
         required = valid & in_width & (unit <= history_units)
-        covered = tl.min((~required | (rows >= 0)).to(tl.int32), axis=0)
+        covered = tl.min((~required | (rows != -1)).to(tl.int32), axis=0)
         tl.atomic_and(coverage_ptr, covered, sem="relaxed")
     return rows
 

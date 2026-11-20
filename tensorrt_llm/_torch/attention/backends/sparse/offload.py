@@ -163,6 +163,10 @@ class SparseOffloadState:
     ``coverage`` is an int32 [1] diagnostic flag the merges of fetched rows
     assert on (``offload_kernels.merge_sparse_arena_indices``), allocated only
     with ``SPARSE_OFFLOAD_DEBUG_ASSERT``.
+
+    ``uncopied_layer`` is the layer whose host-read fetch has enqueued its
+    indices but not yet the copy that fills its cells (see
+    ``SparseOffloadCacheMixin.fetch_sparse_indices``).
     """
 
     layers: dict[int, SparseOffloadLayerDescriptor]
@@ -183,6 +187,7 @@ class SparseOffloadState:
     history_lengths: torch.Tensor | None = None
     prepared: bool = False
     write_layer: int | None = None
+    uncopied_layer: int | None = None
 
     @staticmethod
     def device_bytes(
@@ -349,12 +354,16 @@ class SparseOffloadCacheMixin:
     """
 
     _enable_kv_cache_offload: bool = False
+    _sparse_host_reads: bool = False
     _sparse_offload_topk: int | None = None
     _sparse_batch: Batch | None = None
     _sparse_batch_prepared: bool = False
 
-    def _init_sparse_offload(self, *, enabled: bool, topk: int | None) -> None:
+    def _init_sparse_offload(
+        self, *, enabled: bool, topk: int | None, host_reads: bool = False
+    ) -> None:
         self._enable_kv_cache_offload = enabled
+        self._sparse_host_reads = enabled and host_reads
         self._sparse_offload_topk = topk
         self._sparse_batch = None
         self._sparse_batch_members: dict[int, _SparseBatchMember] = {}
@@ -999,6 +1008,10 @@ class SparseOffloadCacheMixin:
                     "Sparse Batch allocation must remain stable across graph replays"
                 )
             torch.cuda.current_stream().wait_stream(self._stream)
+            if state.uncopied_layer is not None:
+                # A forward that stopped between a host-read fetch and its copy left
+                # admitted cells unfilled; fill them before anything can hit them.
+                self.copy_sparse_misses(state, state.uncopied_layer)
             if state.batch is None:
                 state.history_lengths = torch.from_dlpack(batch.history_lengths())
                 state.batch = batch
@@ -1065,6 +1078,8 @@ class SparseOffloadCacheMixin:
         topk_indices: torch.Tensor,
         request_indices: torch.Tensor,
         unit_lengths: torch.Tensor,
+        *,
+        host_reads: bool = False,
     ) -> torch.Tensor:
         """Fetch one layer's history into compact per-buffer arena indices.
 
@@ -1083,6 +1098,14 @@ class SparseOffloadCacheMixin:
         The caller joins selection producers and write reservation before this
         call, and joins the fetch before consuming its output on another stream.
         Output storage is reused by subsequent layers after attention consumes it.
+
+        With ``host_reads`` (the manager must enable them), a unit missing from
+        the arena is not copied before the indices are written: its index names
+        its host page instead, encoded as ``-2 - page`` for the page's converted
+        index in the buffer's host table (``Batch.pool_spec_for``), and attention
+        reads it there. The caller then issues ``copy_sparse_misses`` once
+        attention is enqueued, which fills the admitted cells for later steps;
+        the next fetch refuses to start before it.
         """
         if (
             not self._enable_kv_cache_offload
@@ -1092,6 +1115,13 @@ class SparseOffloadCacheMixin:
         ):
             raise RuntimeError("Sparse fetch requires prepared decode metadata")
         descriptor = state.layers[layer_idx]
+        if host_reads and not self._sparse_host_reads:
+            raise RuntimeError("Sparse host reads are not enabled for this cache manager")
+        if state.uncopied_layer is not None:
+            raise RuntimeError(
+                f"Layer {state.uncopied_layer}'s host-read fetch has not issued its copy; "
+                "the next resolve would overwrite its miss list"
+            )
         with torch.cuda.device(state.selected_history_units.device):
             select_sparse_history_units(
                 topk_indices,
@@ -1112,7 +1142,26 @@ class SparseOffloadCacheMixin:
             # on graph replay. Native Batch supplies page tables and watermarks.
             stream = CudaStream(torch.cuda.current_stream().cuda_stream)
             owner = descriptor.selection_owner
-            if owner is None:
+            if host_reads:
+                if owner is not None:
+                    raise NotImplementedError(
+                        "Sparse host reads need a layer that resolves its own selection"
+                    )
+                state.batch.resolve_sparse_selection(
+                    buffers=descriptor.buffer_ids,
+                    selected=state.selected_history_units,
+                    stream=stream,
+                    host_reads=True,
+                )
+                state.batch.fetch_resolved_indices(
+                    buffers=descriptor.buffer_ids,
+                    selected=state.selected_history_units,
+                    out=out,
+                    stream=stream,
+                    host_reads=True,
+                )
+                state.uncopied_layer = layer_idx
+            elif owner is None:
                 state.batch.fetch_sparse_pages(
                     buffers=descriptor.buffer_ids,
                     selected=state.selected_history_units,
@@ -1138,3 +1187,21 @@ class SparseOffloadCacheMixin:
                     stream=stream,
                 )
         return out
+
+    @nvtx_range_debug("copy_sparse_misses")
+    def copy_sparse_misses(self, state: SparseOffloadState, layer_idx: int) -> None:
+        """Fill the cells a host-read fetch of ``layer_idx`` admitted, on the current stream.
+
+        The copy reads the same host pages attention read in place, so the units
+        hit in the arena from the next step on. It must precede the next fetch,
+        whose resolve reuses the miss list this copy walks.
+        """
+        if state.uncopied_layer != layer_idx:
+            raise RuntimeError(f"Layer {layer_idx} has no host-read fetch awaiting its copy")
+        descriptor = state.layers[layer_idx]
+        with torch.cuda.device(state.selected_history_units.device):
+            state.batch.copy_resolved_pages(
+                buffers=descriptor.buffer_ids,
+                stream=CudaStream(torch.cuda.current_stream().cuda_stream),
+            )
+        state.uncopied_layer = None

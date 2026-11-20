@@ -475,8 +475,12 @@ with one additional block reserved for writing. `host_history_size` optionally
 bounds the host history budget in bytes; when unset, sizing follows the shared
 sparse offload memory planner. `host_history_memory: managed` holds the history
 in CUDA managed (unified) memory kept in host memory instead of pinned memory;
-the GPU reads it in place through its own mapping. CUDA graphs reuse the same
-arena and page-table allocations across batch changes.
+the GPU reads it in place through its own mapping. With
+`read_misses_from_host: true`, decode attention reads the selected blocks that
+are not in the GPU cache directly from host memory instead of waiting for them
+to be copied in, and the copy into the GPU cache runs beside attention for later
+steps. CUDA graphs reuse the same arena and page-table allocations across batch
+changes.
 
 KV cache manager V2 supports reuse of received prompt blocks on MSA generation
 workers, including with offload enabled. Repeated prompts reuse sparse K/V and

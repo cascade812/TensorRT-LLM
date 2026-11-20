@@ -480,8 +480,10 @@ public:
     //! stream gives that ordering; across streams it takes an event. A model gets it by
     //! running a group's layers together, as the SWA scratch already assumes of the
     //! currently executing layer.
+    //! With `hostReads`, the slot of every unit admitted from history is marked, for a
+    //! fetchResolvedIndices() with `hostReads` to name the unit's host page.
     void resolveSparseSelection(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
-        std::optional<CUstream> stream = std::nullopt);
+        std::optional<CUstream> stream = std::nullopt, bool hostReads = false);
 
     //! Copy one layer's share of a resolved selection into its cells, and write its indices.
     //!
@@ -490,6 +492,24 @@ public:
     //! as fetchSparsePages describes it, for this layer's buffers alone.
     void fetchResolvedPages(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
         int32_t* out, std::optional<CUstream> stream = std::nullopt);
+
+    //! The copy half of fetchResolvedPages(): fill one layer's cells with the resolved misses.
+    //!
+    //! With fetchResolvedIndices() it does what fetchResolvedPages() does, in two calls that
+    //! may run on different streams: the indices come from the resolve's slots alone and never
+    //! wait for a cell. Both must be ordered after the matching resolveSparseSelection(), and
+    //! the next resolve of the life cycle after both, since it reuses the miss list this copy
+    //! walks. Whatever reads the cells, sparse attention included, must follow this copy.
+    void copyResolvedPages(std::vector<BufferId> const& buffers, std::optional<CUstream> stream = std::nullopt);
+
+    //! The index half of fetchResolvedPages(): write one layer's indices for `selected`.
+    //!
+    //! `selected` and `out` are as fetchResolvedPages() takes them. With `hostReads`, after
+    //! a resolve that also had it, a unit the resolve admitted this step is written as its
+    //! host page's index (kSparseHostIndexBase - u), so a reader can take it from host
+    //! memory without waiting for copyResolvedPages(); every other unit gets its cell.
+    void fetchResolvedIndices(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
+        int32_t* out, std::optional<CUstream> stream = std::nullopt, bool hostReads = false);
 
     //! Give the in-flight unit of each request a cell, and report where to write it.
     //!

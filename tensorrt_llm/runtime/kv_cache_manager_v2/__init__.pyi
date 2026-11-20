@@ -1646,6 +1646,7 @@ class Batch:
         buffers: Sequence[BufferId],
         selected: DeviceArray,  # int32[batch, topk]
         stream: CudaStream | None = None,
+        host_reads: bool = False,
     ) -> None:
         """Resolve one selection, admitting what it names and listing what to copy.
 
@@ -1664,6 +1665,9 @@ class Batch:
         overwrites them. Fetch every member layer before resolving another selection there,
         or those fetches copy the later selection's units. Both run on ``stream``, so that
         ordering is the caller's only across streams.
+
+        With ``host_reads``, the units it admits from history are marked, so a
+        :meth:`fetch_resolved_indices` with ``host_reads`` can name their host pages.
         """
 
     def fetch_resolved_pages(
@@ -1682,6 +1686,41 @@ class Batch:
 
         Every layer of the selection copies the same units, each into its own cells: the
         entry index is shared, the bytes behind it are not.
+        """
+
+    def copy_resolved_pages(
+        self,
+        buffers: Sequence[BufferId],
+        stream: CudaStream | None = None,
+    ) -> None:
+        """The copy half of :meth:`fetch_resolved_pages`: fill one layer's cells.
+
+        With :meth:`fetch_resolved_indices` it does what :meth:`fetch_resolved_pages` does,
+        in two calls that may run on different streams, since the indices come from the
+        resolve's slots alone. Order both after the matching
+        :meth:`resolve_sparse_selection`, and the next resolve of the life cycle after both,
+        since it reuses the miss list this copy walks. Whatever reads the cells, sparse
+        attention included, must wait for this copy.
+        """
+
+    def fetch_resolved_indices(
+        self,
+        buffers: Sequence[BufferId],
+        selected: DeviceArray,  # int32[batch, topk]
+        out: DeviceArray,  # int32[batch, len(buffers), topk]
+        stream: CudaStream | None = None,
+        host_reads: bool = False,
+    ) -> None:
+        """The index half of :meth:`fetch_resolved_pages`: write one layer's indices.
+
+        ``selected`` and ``out`` are as :meth:`fetch_resolved_pages` takes them. It reads
+        only the resolve's slots, so it need not wait for :meth:`copy_resolved_pages`.
+
+        With ``host_reads``, after a :meth:`resolve_sparse_selection` that had it too, a
+        unit that resolve admitted is written as ``-2 - u`` for its host page ``u``: the
+        buffer's converted page index, which :meth:`pool_spec_for`'s ``base + u *
+        page_stride`` addresses. A reader can take the unit from host memory there before
+        the copy fills its cell. Every other unit gets its cell as usual.
         """
 
     def sparse_out_slots(self, buffers: Sequence[BufferId]) -> list[int]:
