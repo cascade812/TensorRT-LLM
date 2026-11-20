@@ -282,28 +282,61 @@ __device__ __forceinline__ uint32_t convertGloballyScaledResidualE2m1x4ToE4m3(ui
     return convertFloat4ToE4m3(mainValues);
 }
 
-__device__ __forceinline__ void prefetchMlaRow(uint8_t* stagingRow, uint8_t const* dataPool,
-    __nv_fp8_e4m3 const* scalePool, int32_t globalIdx, int32_t lane, bool compactLayout, int32_t residualDim)
+//! The packed data and block scales of one gather row: pool row globalIdx when it is
+//! nonnegative, otherwise host row -2 - globalIdx. A caller passes only valid indices.
+__device__ __forceinline__ void resolveRow(uint8_t const* dataPool, __nv_fp8_e4m3 const* scalePool,
+    NvFp4MlaHostRows const& hostRows, int32_t globalIdx, int32_t packedHeadDim, int32_t scalesPerToken,
+    uint8_t const*& packedRow, __nv_fp8_e4m3 const*& scaleRow)
 {
-    bool const valid = globalIdx >= 0;
+    if (globalIdx >= 0)
+    {
+        packedRow = dataPool + static_cast<int64_t>(globalIdx) * packedHeadDim;
+        scaleRow = scalePool + static_cast<int64_t>(globalIdx) * scalesPerToken;
+        return;
+    }
+    int64_t const hostRow = -2 - static_cast<int64_t>(globalIdx);
+    int64_t const page = hostRow / hostRows.rowsPerPage;
+    int64_t const rowInPage = hostRow - page * hostRows.rowsPerPage;
+    packedRow = hostRows.data + page * hostRows.dataPageStride + rowInPage * packedHeadDim;
+    scaleRow = hostRows.scales + page * hostRows.scalePageStride + rowInPage * scalesPerToken;
+}
+
+//! A global index the gather reads: a pool row below numPoolTokens, or a host row when
+//! the gather has host rows. Anything else reads as -1.
+__device__ __forceinline__ bool isGatherRow(int32_t globalIdx, int64_t numPoolTokens, NvFp4MlaHostRows const& hostRows)
+{
+    return (globalIdx >= 0 && static_cast<int64_t>(globalIdx) < numPoolTokens)
+        || (globalIdx < -1 && hostRows.data != nullptr);
+}
+
+__device__ __forceinline__ void prefetchMlaRow(uint8_t* stagingRow, uint8_t const* dataPool,
+    __nv_fp8_e4m3 const* scalePool, int32_t globalIdx, int32_t lane, bool compactLayout, int32_t residualDim,
+    NvFp4MlaHostRows const& hostRows)
+{
+    bool const valid = globalIdx != -1;
     int32_t const packedHeadDim = kMlaPackedHeadDim + residualDim / 2;
     int32_t const scalesPerToken = kMlaScalesPerToken + residualDim / 16;
     if (compactLayout)
     {
         int32_t const compactRowBytes
             = (packedHeadDim + scalesPerToken + kAsyncCopyBytes - 1) / kAsyncCopyBytes * kAsyncCopyBytes;
-        auto const* compactRow = valid ? dataPool + static_cast<int64_t>(globalIdx) * compactRowBytes : dataPool;
+        auto const* compactRow
+            = globalIdx >= 0 ? dataPool + static_cast<int64_t>(globalIdx) * compactRowBytes : dataPool;
         if (lane < compactRowBytes / kAsyncCopyBytes)
         {
-            copyAsync16(
-                stagingRow + lane * kAsyncCopyBytes, compactRow + lane * kAsyncCopyBytes, valid ? kAsyncCopyBytes : 0U);
+            copyAsync16(stagingRow + lane * kAsyncCopyBytes, compactRow + lane * kAsyncCopyBytes,
+                globalIdx >= 0 ? kAsyncCopyBytes : 0U);
         }
         commitAsyncCopies();
         return;
     }
 
-    auto const* packedRow = valid ? dataPool + static_cast<int64_t>(globalIdx) * packedHeadDim : dataPool;
-    auto const* scaleRow = valid ? scalePool + static_cast<int64_t>(globalIdx) * scalesPerToken : scalePool;
+    uint8_t const* packedRow = dataPool;
+    __nv_fp8_e4m3 const* scaleRow = scalePool;
+    if (valid)
+    {
+        resolveRow(dataPool, scalePool, hostRows, globalIdx, packedHeadDim, scalesPerToken, packedRow, scaleRow);
+    }
     uint32_t const dataBytes = valid ? kAsyncCopyBytes : 0U;
     int32_t const dataCopyLanes = packedHeadDim / kAsyncCopyBytes;
     int32_t const scaleCopyLanes = (scalesPerToken + kScaleCopyBytes - 1) / kScaleCopyBytes;
@@ -323,29 +356,35 @@ __device__ __forceinline__ void prefetchMlaRow(uint8_t* stagingRow, uint8_t cons
 }
 
 __device__ __forceinline__ void prefetchMlaRowNarrowScales(uint8_t* stagingRow, uint8_t const* dataPool,
-    __nv_fp8_e4m3 const* scalePool, int32_t globalIdx, int32_t lane, bool compactLayout, int32_t residualDim)
+    __nv_fp8_e4m3 const* scalePool, int32_t globalIdx, int32_t lane, bool compactLayout, int32_t residualDim,
+    NvFp4MlaHostRows const& hostRows)
 {
     // Without residual scales the 36-byte row stride only guarantees 4-byte
     // alignment, so odd rows cannot safely use the 8-byte copy path.
-    bool const valid = globalIdx >= 0;
+    bool const valid = globalIdx != -1;
     int32_t const packedHeadDim = kMlaPackedHeadDim + residualDim / 2;
     int32_t const scalesPerToken = kMlaScalesPerToken + residualDim / 16;
     if (compactLayout)
     {
         int32_t const compactRowBytes
             = (packedHeadDim + scalesPerToken + kAsyncCopyBytes - 1) / kAsyncCopyBytes * kAsyncCopyBytes;
-        auto const* compactRow = valid ? dataPool + static_cast<int64_t>(globalIdx) * compactRowBytes : dataPool;
+        auto const* compactRow
+            = globalIdx >= 0 ? dataPool + static_cast<int64_t>(globalIdx) * compactRowBytes : dataPool;
         if (lane < compactRowBytes / kAsyncCopyBytes)
         {
-            copyAsync16(
-                stagingRow + lane * kAsyncCopyBytes, compactRow + lane * kAsyncCopyBytes, valid ? kAsyncCopyBytes : 0U);
+            copyAsync16(stagingRow + lane * kAsyncCopyBytes, compactRow + lane * kAsyncCopyBytes,
+                globalIdx >= 0 ? kAsyncCopyBytes : 0U);
         }
         commitAsyncCopies();
         return;
     }
 
-    auto const* packedRow = valid ? dataPool + static_cast<int64_t>(globalIdx) * packedHeadDim : dataPool;
-    auto const* scaleRow = valid ? scalePool + static_cast<int64_t>(globalIdx) * scalesPerToken : scalePool;
+    uint8_t const* packedRow = dataPool;
+    __nv_fp8_e4m3 const* scaleRow = scalePool;
+    if (valid)
+    {
+        resolveRow(dataPool, scalePool, hostRows, globalIdx, packedHeadDim, scalesPerToken, packedRow, scaleRow);
+    }
     uint32_t const dataBytes = valid ? kAsyncCopyBytes : 0U;
     uint32_t const scaleBytes = valid ? kNarrowScaleCopyBytes : 0U;
     int32_t const dataCopyLanes = packedHeadDim / kAsyncCopyBytes;
@@ -365,26 +404,28 @@ __device__ __forceinline__ void prefetchMlaRowNarrowScales(uint8_t* stagingRow, 
 
 template <int32_t kResidualDim>
 __device__ __forceinline__ void prefetchMlaRowForResidual(uint8_t* stagingRow, uint8_t const* dataPool,
-    __nv_fp8_e4m3 const* scalePool, int32_t globalIdx, int32_t lane, bool compactLayout)
+    __nv_fp8_e4m3 const* scalePool, int32_t globalIdx, int32_t lane, bool compactLayout,
+    NvFp4MlaHostRows const& hostRows)
 {
     if constexpr (kResidualDim == kMlaResidualDim)
     {
-        prefetchMlaRow(stagingRow, dataPool, scalePool, globalIdx, lane, compactLayout, kResidualDim);
+        prefetchMlaRow(stagingRow, dataPool, scalePool, globalIdx, lane, compactLayout, kResidualDim, hostRows);
     }
     else
     {
-        prefetchMlaRowNarrowScales(stagingRow, dataPool, scalePool, globalIdx, lane, compactLayout, kResidualDim);
+        prefetchMlaRowNarrowScales(
+            stagingRow, dataPool, scalePool, globalIdx, lane, compactLayout, kResidualDim, hostRows);
     }
 }
 
-__device__ __forceinline__ int32_t fetchGlobalIndex(
-    int32_t const* globalIndices, int32_t* compactIndices, int64_t pair, int64_t numPoolTokens, int32_t lane)
+__device__ __forceinline__ int32_t fetchGlobalIndex(int32_t const* globalIndices, int32_t* compactIndices, int64_t pair,
+    int64_t numPoolTokens, NvFp4MlaHostRows const& hostRows, int32_t lane)
 {
     int32_t globalIdx = -1;
     if (lane == 0)
     {
         globalIdx = globalIndices[pair];
-        bool const valid = globalIdx >= 0 && static_cast<int64_t>(globalIdx) < numPoolTokens;
+        bool const valid = isGatherRow(globalIdx, numPoolTokens, hostRows);
         compactIndices[pair] = valid ? static_cast<int32_t>(pair) : -1;
         globalIdx = valid ? globalIdx : -1;
     }
@@ -481,7 +522,7 @@ template <int32_t kResidualDim, bool kCompactLayout>
 __global__ __launch_bounds__(kThreadsPerBlock, kGenerationBlocksPerSm) void nvFp4MlaKvCacheGatherKernel(
     uint8_t const* __restrict__ dataPool, __nv_fp8_e4m3 const* __restrict__ scalePool,
     int32_t const* __restrict__ globalIndices, __nv_fp8_e4m3* __restrict__ output, int32_t* __restrict__ compactIndices,
-    float const* __restrict__ globalDequantScale, int64_t numPairs, int64_t numPoolTokens)
+    float const* __restrict__ globalDequantScale, int64_t numPairs, int64_t numPoolTokens, NvFp4MlaHostRows hostRows)
 {
     constexpr int32_t kPackedHeadDim = kMlaPackedHeadDim + kResidualDim / 2;
     constexpr int32_t kScalesPerToken = kMlaScalesPerToken + kResidualDim / 16;
@@ -498,17 +539,18 @@ __global__ __launch_bounds__(kThreadsPerBlock, kGenerationBlocksPerSm) void nvFp
         return;
     }
 
-    int32_t globalIdx = fetchGlobalIndex(globalIndices, compactIndices, pair, numPoolTokens, lane);
+    int32_t globalIdx = fetchGlobalIndex(globalIndices, compactIndices, pair, numPoolTokens, hostRows, lane);
     int32_t stage = 0;
-    prefetchMlaRowForResidual<kResidualDim>(staging[stage][warp], dataPool, scalePool, globalIdx, lane, kCompactLayout);
+    prefetchMlaRowForResidual<kResidualDim>(
+        staging[stage][warp], dataPool, scalePool, globalIdx, lane, kCompactLayout, hostRows);
     int64_t nextPair = pair + pairStride;
     bool hasNext = nextPair < numPairs;
     int32_t nextGlobalIdx = -1;
     if (hasNext)
     {
-        nextGlobalIdx = fetchGlobalIndex(globalIndices, compactIndices, nextPair, numPoolTokens, lane);
+        nextGlobalIdx = fetchGlobalIndex(globalIndices, compactIndices, nextPair, numPoolTokens, hostRows, lane);
         prefetchMlaRowForResidual<kResidualDim>(
-            staging[1][warp], dataPool, scalePool, nextGlobalIdx, lane, kCompactLayout);
+            staging[1][warp], dataPool, scalePool, nextGlobalIdx, lane, kCompactLayout, hostRows);
     }
     while (true)
     {
@@ -527,13 +569,36 @@ __global__ __launch_bounds__(kThreadsPerBlock, kGenerationBlocksPerSm) void nvFp
         int32_t followingGlobalIdx = -1;
         if (hasFollowing)
         {
-            followingGlobalIdx = fetchGlobalIndex(globalIndices, compactIndices, followingPair, numPoolTokens, lane);
+            followingGlobalIdx
+                = fetchGlobalIndex(globalIndices, compactIndices, followingPair, numPoolTokens, hostRows, lane);
             int32_t const prefetchStage = stage == 0 ? 2 : stage - 1;
             prefetchMlaRowForResidual<kResidualDim>(
-                staging[prefetchStage][warp], dataPool, scalePool, followingGlobalIdx, lane, kCompactLayout);
+                staging[prefetchStage][warp], dataPool, scalePool, followingGlobalIdx, lane, kCompactLayout, hostRows);
         }
 
-        if (globalIdx >= 0)
+        if (globalIdx < -1 && hostRows.fillRows != nullptr)
+        {
+            // The host row is staged as it is stored: data, then scales. Its pool row was
+            // admitted for it, and nothing reads that row before a later gather.
+            int32_t const fillRow = hostRows.fillRows[pair];
+            if (fillRow >= 0)
+            {
+                auto const* staged = staging[stage][warp];
+                auto* dataRow = hostRows.fillData + static_cast<int64_t>(fillRow) * kPackedHeadDim;
+                for (int32_t chunk = lane; chunk < kPackedHeadDim / kAsyncCopyBytes; chunk += kWarpSize)
+                {
+                    reinterpret_cast<uint4*>(dataRow)[chunk] = reinterpret_cast<uint4 const*>(staged)[chunk];
+                }
+                auto* scaleRow
+                    = reinterpret_cast<uint8_t*>(hostRows.fillScales) + static_cast<int64_t>(fillRow) * kScalesPerToken;
+                for (int32_t word = lane; word < kScalesPerToken / 4; word += kWarpSize)
+                {
+                    reinterpret_cast<uint32_t*>(scaleRow)[word]
+                        = reinterpret_cast<uint32_t const*>(staged + kPackedHeadDim)[word];
+                }
+            }
+        }
+        if (globalIdx != -1)
         {
             auto const* stagedScales = reinterpret_cast<__nv_fp8_e4m3 const*>(staging[stage][warp] + kPackedHeadDim);
             if (dequantScale == 1.F)
@@ -564,8 +629,10 @@ __global__ void nvFp4MlaKvCacheGatherGenericKernel(uint8_t const* __restrict__ d
     __nv_fp8_e4m3 const* __restrict__ scalePool, int32_t const* __restrict__ globalIndices,
     __nv_fp8_e4m3* __restrict__ output, int32_t* __restrict__ compactIndices,
     float const* __restrict__ globalDequantScale, int64_t numPairs, int32_t headDim, int32_t residualDim,
-    int64_t numPoolTokens)
+    int64_t numPoolTokens, NvFp4MlaHostRows hostRows)
 {
+    int32_t const packedHeadDim = (headDim + residualDim) / 2;
+    int32_t const scalesPerToken = (headDim + residualDim) / 16;
     int32_t const warp = threadIdx.x / kWarpSize;
     int32_t const lane = threadIdx.x % kWarpSize;
     float const dequantScale = globalDequantScale == nullptr ? 1.F : globalDequantScale[0];
@@ -573,25 +640,21 @@ __global__ void nvFp4MlaKvCacheGatherGenericKernel(uint8_t const* __restrict__ d
     int64_t const pairStride = static_cast<int64_t>(gridDim.x) * kWarpsPerBlock;
     for (; pair < numPairs; pair += pairStride)
     {
-        int32_t globalIdx = 0;
-        if (lane == 0)
+        int32_t globalIdx = fetchGlobalIndex(globalIndices, compactIndices, pair, numPoolTokens, hostRows, lane);
+        if (globalIdx != -1)
         {
-            globalIdx = globalIndices[pair];
-            compactIndices[pair]
-                = globalIdx >= 0 && static_cast<int64_t>(globalIdx) < numPoolTokens ? static_cast<int32_t>(pair) : -1;
-        }
-        globalIdx = __shfl_sync(0xFFFFFFFFU, globalIdx, 0);
-        if (globalIdx >= 0 && static_cast<int64_t>(globalIdx) < numPoolTokens)
-        {
+            uint8_t const* packedRow = nullptr;
+            __nv_fp8_e4m3 const* scaleRow = nullptr;
+            resolveRow(dataPool, scalePool, hostRows, globalIdx, packedHeadDim, scalesPerToken, packedRow, scaleRow);
             if (dequantScale == 1.F)
             {
-                dequantizeRow<true>(dataPool, scalePool, output, globalIdx, static_cast<int32_t>(pair), headDim,
-                    residualDim, dequantScale, lane);
+                dequantizeRow<true>(packedRow, scaleRow, output, 0, static_cast<int32_t>(pair), headDim, residualDim,
+                    dequantScale, lane);
             }
             else
             {
-                dequantizeRow<false>(dataPool, scalePool, output, globalIdx, static_cast<int32_t>(pair), headDim,
-                    residualDim, dequantScale, lane);
+                dequantizeRow<false>(packedRow, scaleRow, output, 0, static_cast<int32_t>(pair), headDim, residualDim,
+                    dequantScale, lane);
             }
         }
     }
@@ -601,8 +664,10 @@ template <int32_t kResidualDim>
 __global__ __launch_bounds__(kThreadsPerBlock, kDirectBlocksPerSm) void nvFp4MlaKvCacheGatherDirectKernel(
     uint8_t const* __restrict__ dataPool, __nv_fp8_e4m3 const* __restrict__ scalePool, int32_t const* globalIndices,
     __nv_fp8_e4m3* __restrict__ output, int32_t* compactIndices, float const* __restrict__ globalDequantScale,
-    int32_t numPairs, int64_t numPoolTokens)
+    int32_t numPairs, int64_t numPoolTokens, NvFp4MlaHostRows hostRows)
 {
+    constexpr int32_t kPackedHeadDim = (kDsv4HeadDim + kResidualDim) / 2;
+    constexpr int32_t kScalesPerToken = (kDsv4HeadDim + kResidualDim) / 16;
     int32_t const warp = threadIdx.x / kWarpSize;
     int32_t const lane = threadIdx.x % kWarpSize;
     float const dequantScale = globalDequantScale == nullptr ? 1.F : globalDequantScale[0];
@@ -610,26 +675,20 @@ __global__ __launch_bounds__(kThreadsPerBlock, kDirectBlocksPerSm) void nvFp4Mla
     int32_t const pairStride = static_cast<int32_t>(gridDim.x) * kWarpsPerBlock;
     for (; pair < numPairs; pair += pairStride)
     {
-        int32_t globalIdx = -1;
-        if (lane == 0)
+        int32_t const globalIdx = fetchGlobalIndex(globalIndices, compactIndices, pair, numPoolTokens, hostRows, lane);
+        if (globalIdx != -1)
         {
-            globalIdx = globalIndices[pair];
-            bool const valid = globalIdx >= 0 && static_cast<int64_t>(globalIdx) < numPoolTokens;
-            compactIndices[pair] = valid ? pair : -1;
-            globalIdx = valid ? globalIdx : -1;
-        }
-        globalIdx = __shfl_sync(0xFFFFFFFFU, globalIdx, 0);
-        if (globalIdx >= 0)
-        {
+            uint8_t const* packedRow = nullptr;
+            __nv_fp8_e4m3 const* scaleRow = nullptr;
+            resolveRow(dataPool, scalePool, hostRows, globalIdx, kPackedHeadDim, kScalesPerToken, packedRow, scaleRow);
             if (dequantScale == 1.F)
             {
-                dequantizeRow<true>(
-                    dataPool, scalePool, output, globalIdx, pair, kDsv4HeadDim, kResidualDim, 1.F, lane);
+                dequantizeRow<true>(packedRow, scaleRow, output, 0, pair, kDsv4HeadDim, kResidualDim, 1.F, lane);
             }
             else
             {
                 dequantizeRow<false>(
-                    dataPool, scalePool, output, globalIdx, pair, kDsv4HeadDim, kResidualDim, dequantScale, lane);
+                    packedRow, scaleRow, output, 0, pair, kDsv4HeadDim, kResidualDim, dequantScale, lane);
             }
         }
     }
@@ -830,7 +889,7 @@ int32_t getPersistentBlockCount(int64_t workItems, int32_t blocksPerSm = kBlocks
 
 void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* scalePool, int32_t const* globalIndices,
     __nv_fp8_e4m3* output, int32_t* compactIndices, float const* globalDequantScale, int32_t numRows, int32_t topK,
-    int32_t headDim, int32_t residualDim, int64_t numPoolTokens, cudaStream_t stream)
+    int32_t headDim, int32_t residualDim, int64_t numPoolTokens, cudaStream_t stream, NvFp4MlaHostRows const& hostRows)
 {
     if (numRows == 0 || topK == 0)
     {
@@ -846,6 +905,17 @@ void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* s
         numPairs <= std::numeric_limits<int32_t>::max(), "NVFP4 MLA gather compact indices exceed int32 capacity");
     int32_t const packedHeadDim = (headDim + residualDim) / 2;
     bool const compactLayout = reinterpret_cast<uint8_t const*>(scalePool) == dataPool + packedHeadDim;
+    if (hostRows.data != nullptr)
+    {
+        TLLM_CHECK_WITH_INFO(!compactLayout && hostRows.scales != nullptr && hostRows.rowsPerPage > 0,
+            "NVFP4 MLA gather reads host rows only from separate data and scale pools");
+    }
+    if (hostRows.fillRows != nullptr)
+    {
+        TLLM_CHECK_WITH_INFO(hostRows.data != nullptr && hostRows.fillData != nullptr && hostRows.fillScales != nullptr
+                && headDim == kMlaHeadDim && (residualDim == 0 || residualDim == kMlaResidualDim),
+            "NVFP4 MLA gather fills pool rows only for host rows of the 576-wide MLA layout");
+    }
     if (headDim == kDsv4HeadDim && (residualDim == 0 || residualDim == kMlaResidualDim))
     {
         int32_t const blocks = getPersistentBlockCount(numPairs, kDirectBlocksPerSm);
@@ -853,13 +923,13 @@ void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* s
         {
             nvFp4MlaKvCacheGatherDirectKernel<kMlaResidualDim><<<blocks, kThreadsPerBlock, 0, stream>>>(dataPool,
                 scalePool, globalIndices, output, compactIndices, globalDequantScale, static_cast<int32_t>(numPairs),
-                numPoolTokens);
+                numPoolTokens, hostRows);
         }
         else
         {
             nvFp4MlaKvCacheGatherDirectKernel<0><<<blocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool,
                 globalIndices, output, compactIndices, globalDequantScale, static_cast<int32_t>(numPairs),
-                numPoolTokens);
+                numPoolTokens, hostRows);
         }
     }
     else if (headDim == kMlaHeadDim && residualDim == 0)
@@ -868,12 +938,12 @@ void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* s
         if (compactLayout)
         {
             nvFp4MlaKvCacheGatherKernel<0, true><<<blocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool,
-                globalIndices, output, compactIndices, globalDequantScale, numPairs, numPoolTokens);
+                globalIndices, output, compactIndices, globalDequantScale, numPairs, numPoolTokens, hostRows);
         }
         else
         {
             nvFp4MlaKvCacheGatherKernel<0, false><<<blocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool,
-                globalIndices, output, compactIndices, globalDequantScale, numPairs, numPoolTokens);
+                globalIndices, output, compactIndices, globalDequantScale, numPairs, numPoolTokens, hostRows);
         }
     }
     else if (headDim == kMlaHeadDim && residualDim == kMlaResidualDim)
@@ -882,19 +952,21 @@ void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* s
         if (compactLayout)
         {
             nvFp4MlaKvCacheGatherKernel<kMlaResidualDim, true><<<blocks, kThreadsPerBlock, 0, stream>>>(dataPool,
-                scalePool, globalIndices, output, compactIndices, globalDequantScale, numPairs, numPoolTokens);
+                scalePool, globalIndices, output, compactIndices, globalDequantScale, numPairs, numPoolTokens,
+                hostRows);
         }
         else
         {
             nvFp4MlaKvCacheGatherKernel<kMlaResidualDim, false><<<blocks, kThreadsPerBlock, 0, stream>>>(dataPool,
-                scalePool, globalIndices, output, compactIndices, globalDequantScale, numPairs, numPoolTokens);
+                scalePool, globalIndices, output, compactIndices, globalDequantScale, numPairs, numPoolTokens,
+                hostRows);
         }
     }
     else
     {
         int32_t const blocks = getPersistentBlockCount(numPairs, kGenerationBlocksPerSm);
         nvFp4MlaKvCacheGatherGenericKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool, globalIndices,
-            output, compactIndices, globalDequantScale, numPairs, headDim, residualDim, numPoolTokens);
+            output, compactIndices, globalDequantScale, numPairs, headDim, residualDim, numPoolTokens, hostRows);
     }
     TLLM_CUDA_CHECK(cudaGetLastError());
 }

@@ -146,6 +146,171 @@ def test_nvfp4_mla_kv_cache_gather_direct():
 
 
 @skip_pre_blackwell
+@pytest.mark.parametrize(
+    "head_dim,residual_dim",
+    [(576, 0), (576, 64), (512, 0), (512, 64), (448, 0)],
+    ids=["mla", "mla_residual", "dsv4", "dsv4_residual", "generic"],
+)
+@pytest.mark.parametrize("dequant_scale", [1.0, 0.25])
+def test_nvfp4_mla_kv_cache_gather_direct_reads_host_rows(head_dim, residual_dim, dequant_scale):
+    """An index below -1 reads host row -2 - index in place, as if it were a pool row."""
+    packed = (head_dim + residual_dim) // 2
+    scales = (head_dim + residual_dim) // 16
+    pool_rows, host_pages, rows_per_page = 6, 3, 4
+    generator = torch.Generator(device="cuda").manual_seed(7)
+
+    def random_rows(count):
+        data = torch.randint(
+            0, 256, (count, packed), dtype=torch.uint8, device="cuda", generator=generator
+        )
+        scale = torch.randint(
+            0, 0x70, (count, scales), dtype=torch.uint8, device="cuda", generator=generator
+        )
+        return data, scale.view(torch.float8_e4m3fn)
+
+    pool_data, pool_scales = random_rows(pool_rows)
+    host_data_rows, host_scale_rows = random_rows(host_pages * rows_per_page)
+    # Host pages hold their rows first and padding after, so the page stride is not the
+    # rows' extent and a wrong stride reads the padding.
+    data_page = (rows_per_page * packed + 96 + 15) // 16 * 16
+    scale_page = (rows_per_page * scales + 40 + 15) // 16 * 16
+    host_data = torch.full((host_pages, data_page), 0xFF, dtype=torch.uint8, pin_memory=True)
+    host_scales = torch.full((host_pages, scale_page), 0x7E, dtype=torch.uint8, pin_memory=True)
+    for page in range(host_pages):
+        rows = slice(page * rows_per_page, (page + 1) * rows_per_page)
+        host_data[page, : rows_per_page * packed] = host_data_rows[rows].flatten().cpu()
+        host_scales[page, : rows_per_page * scales] = (
+            host_scale_rows[rows].view(torch.uint8).flatten().cpu()
+        )
+
+    # Every host row once and a few pool rows, padding included.
+    host_ids = list(range(host_pages * rows_per_page))
+    indices = [-2 - row for row in host_ids] + [0, 5, -1, 3]
+    global_indices = torch.tensor(indices, dtype=torch.int32, device="cuda").view(2, -1)
+    # The reference reads the same rows from one device pool: host row u at pool_rows + u.
+    reference_indices = torch.tensor(
+        [index if index >= -1 else pool_rows + (-2 - index) for index in indices],
+        dtype=torch.int32,
+        device="cuda",
+    ).view(2, -1)
+    reference_data = torch.cat([pool_data, host_data_rows])
+    reference_scales = torch.cat([pool_scales, host_scale_rows])
+
+    scale = torch.tensor([dequant_scale], dtype=torch.float32, device="cuda")
+    output = torch.empty(
+        (*global_indices.shape, head_dim), dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    expected = torch.empty_like(output)
+    torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
+        reference_data,
+        reference_scales,
+        reference_indices,
+        expected,
+        scale,
+        residual_dim,
+        reference_data.shape[0],
+    )
+    torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
+        pool_data,
+        pool_scales,
+        global_indices,
+        output,
+        scale,
+        residual_dim,
+        pool_rows,
+        host_data.data_ptr(),
+        host_scales.data_ptr(),
+        data_page,
+        scale_page,
+        rows_per_page,
+    )
+    torch.cuda.synchronize()
+    # Both calls compact their indices the same way: every valid entry keeps its position.
+    assert torch.equal(global_indices, reference_indices)
+    valid = global_indices >= 0
+    assert torch.equal(output[valid].view(torch.uint8), expected[valid].view(torch.uint8))
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("residual_dim", [0, 64])
+def test_nvfp4_mla_kv_cache_gather_direct_fills_pool_rows_from_host_rows(residual_dim):
+    """With fill_rows, each host row read is also stored as it is into its pool row."""
+    head_dim = 576
+    packed = (head_dim + residual_dim) // 2
+    scales = (head_dim + residual_dim) // 16
+    rows_per_page = 8
+    generator = torch.Generator(device="cuda").manual_seed(11)
+    pool_data = torch.randint(
+        0, 256, (16, packed), dtype=torch.uint8, device="cuda", generator=generator
+    )
+    pool_scales = torch.randint(
+        0, 0x70, (16, scales), dtype=torch.uint8, device="cuda", generator=generator
+    )
+    host_data = torch.randint(
+        0, 256, (2, rows_per_page * packed), dtype=torch.uint8, generator=None
+    ).pin_memory()
+    host_scales = torch.randint(
+        0, 0x70, (2, rows_per_page * scales), dtype=torch.uint8
+    ).pin_memory()
+    # Host rows 3 and 12 fill pool rows 9 and 14; pool rows 1 and 2 are hits; host row 5 is
+    # read without a fill row.
+    indices = torch.tensor([[1, -2 - 3, 2, -2 - 12, -2 - 5, -1]], dtype=torch.int32, device="cuda")
+    fill_rows = torch.tensor([[-1, 9, -1, 14, -1, -1]], dtype=torch.int32, device="cuda")
+    untouched = pool_data.clone(), pool_scales.clone()
+    output = torch.empty((1, 6, head_dim), dtype=torch.float8_e4m3fn, device="cuda")
+    torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
+        pool_data,
+        pool_scales.view(torch.float8_e4m3fn),
+        indices,
+        output,
+        torch.ones(1, dtype=torch.float32, device="cuda"),
+        residual_dim,
+        pool_data.shape[0],
+        host_data.data_ptr(),
+        host_scales.data_ptr(),
+        rows_per_page * packed,
+        rows_per_page * scales,
+        rows_per_page,
+        fill_rows,
+    )
+    torch.cuda.synchronize()
+    assert indices.tolist() == [[0, 1, 2, 3, 4, -1]]
+
+    def host_row(row):
+        page, offset = divmod(row, rows_per_page)
+        return (
+            host_data[page, offset * packed : (offset + 1) * packed].cuda(),
+            host_scales[page, offset * scales : (offset + 1) * scales].cuda(),
+        )
+
+    expected_data, expected_scales = untouched
+    for pool_row, row in ((9, 3), (14, 12)):
+        expected_data[pool_row], expected_scales[pool_row] = host_row(row)
+    assert torch.equal(pool_data, expected_data)
+    assert torch.equal(pool_scales, expected_scales)
+
+
+@skip_pre_blackwell
+def test_nvfp4_mla_kv_cache_gather_direct_rejects_host_rows_without_host_pages():
+    """Without host pages an index below -1 is padding, as before."""
+    head_dim = 576
+    pool_data = torch.zeros((2, head_dim // 2), dtype=torch.uint8, device="cuda")
+    pool_scales = torch.zeros((2, head_dim // 16), dtype=torch.float8_e4m3fn, device="cuda")
+    global_indices = torch.tensor([[1, -2, -7, 0]], dtype=torch.int32, device="cuda")
+    output = torch.empty((1, 4, head_dim), dtype=torch.float8_e4m3fn, device="cuda")
+    torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
+        pool_data,
+        pool_scales,
+        global_indices,
+        output,
+        torch.ones(1, dtype=torch.float32, device="cuda"),
+        0,
+        2,
+    )
+    assert global_indices.tolist() == [[0, -1, -1, 3]]
+
+
+@skip_pre_blackwell
 def test_nvfp4_mla_context_kv_cache_gather():
     """Gather residual-quantized prefix/chunk rows through a paged table."""
     num_pool_tokens = 10

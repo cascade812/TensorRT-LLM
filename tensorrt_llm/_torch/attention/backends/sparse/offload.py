@@ -1119,7 +1119,9 @@ class SparseOffloadCacheMixin:
         The fetch also writes ``state.fetched_cells``, the same indices with each
         host entry's arena index: the cell the resolve admitted the unit to. The
         reader stores the unit there as it reads it, so later steps hit it, and
-        nothing else fills the cell.
+        nothing else fills the cell. A layer that shares another layer's
+        selection reads that layer's resolve; every layer of the group fills its
+        own cells.
         """
         if (
             not self._enable_kv_cache_offload
@@ -1152,16 +1154,15 @@ class SparseOffloadCacheMixin:
             stream = CudaStream(torch.cuda.current_stream().cuda_stream)
             owner = descriptor.selection_owner
             if host_reads:
-                if owner is not None:
-                    raise NotImplementedError(
-                        "Sparse host reads need a layer that resolves its own selection"
+                # A layer sharing another's selection reads that resolve's slots: the
+                # admitted units it marked are misses in every layer of the group.
+                if owner is None or owner == layer_idx:
+                    state.batch.resolve_sparse_selection(
+                        buffers=descriptor.buffer_ids,
+                        selected=state.selected_history_units,
+                        stream=stream,
+                        host_reads=True,
                     )
-                state.batch.resolve_sparse_selection(
-                    buffers=descriptor.buffer_ids,
-                    selected=state.selected_history_units,
-                    stream=stream,
-                    host_reads=True,
-                )
                 state.batch.fetch_resolved_indices(
                     buffers=descriptor.buffer_ids,
                     selected=state.selected_history_units,

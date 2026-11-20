@@ -1079,7 +1079,7 @@ class SparseKvCacheOffloadConfig(StrictBaseModel):
         "host memory, instead of waiting for them to be copied in first. The "
         "kernel that reads such a unit also stores it into its GPU cache slot, "
         "so later steps find it on the GPU and no separate copy runs. Supported "
-        "by MiniMax-M3.")
+        "by MiniMax-M3, and by DSA models with an NVFP4 KV cache.")
 
 
 class BaseSparseAttentionConfig(StrictBaseModel):
@@ -1552,6 +1552,7 @@ class RocketSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
 class DeepSeekSparseAttentionConfig(_SparseKvCacheOffloadConfigMixin,
                                     SeqLenAwareSparseAttentionConfig):
     """Configuration for DeepSeek Sparse Attention."""
+    supports_reading_misses_from_host: ClassVar[bool] = True
     algorithm: Literal["dsa"] = Field(default="dsa")
     index_n_heads: Optional[int] = Field(
         default=None, description="The number of heads for the indexer.")
@@ -1826,6 +1827,7 @@ class DeepSeekSparseAttentionConfig(_SparseKvCacheOffloadConfigMixin,
 
 class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
     """Configuration for DeepSeek-V4 Sparse Attention."""
+    supports_reading_misses_from_host: ClassVar[bool] = False
     algorithm: Literal["deepseek_v4"] = "deepseek_v4"
     index_head_dim: Optional[int] = Field(
         default=128,

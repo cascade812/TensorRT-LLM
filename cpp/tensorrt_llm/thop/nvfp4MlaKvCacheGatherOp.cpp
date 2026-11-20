@@ -18,6 +18,7 @@
 #include "tensorrt_llm/runtime/torchUtils.h"
 
 #include <limits>
+#include <optional>
 
 namespace th = torch;
 namespace tk = tensorrt_llm::kernels;
@@ -156,7 +157,9 @@ void nvFp4MlaContextKvCacheGather(th::Tensor const& hostPoolPointers, th::Tensor
 }
 
 void nvFp4MlaKvCacheGatherDirect(th::Tensor const& dataPool, th::Tensor const& scalePool, th::Tensor& globalIndices,
-    th::Tensor& output, th::Tensor const& globalDequantScale, int64_t residualDim, int64_t numPoolTokens)
+    th::Tensor& output, th::Tensor const& globalDequantScale, int64_t residualDim, int64_t numPoolTokens,
+    int64_t hostData, int64_t hostScales, int64_t hostDataPageStride, int64_t hostScalePageStride,
+    int64_t hostRowsPerPage, std::optional<th::Tensor> const& fillRows)
 {
     TORCH_CHECK(dataPool.is_cuda() && scalePool.is_cuda() && globalIndices.is_cuda() && output.is_cuda()
             && globalDequantScale.is_cuda(),
@@ -188,13 +191,37 @@ void nvFp4MlaKvCacheGatherDirect(th::Tensor const& dataPool, th::Tensor const& s
     TORCH_CHECK(scalePool.numel() >= numPoolTokens * scalesPerToken,
         "NVFP4 scale pool is smaller than num_pool_tokens * scales_per_token");
 
+    tk::NvFp4MlaHostRows hostRows;
+    if (hostData != 0)
+    {
+        TORCH_CHECK(hostScales != 0 && hostDataPageStride > 0 && hostScalePageStride > 0 && hostRowsPerPage > 0
+                && hostRowsPerPage <= std::numeric_limits<int32_t>::max(),
+            "host rows need scales, positive page strides and a positive row count per page");
+        hostRows.data = reinterpret_cast<uint8_t const*>(hostData);
+        hostRows.scales = reinterpret_cast<__nv_fp8_e4m3 const*>(hostScales);
+        hostRows.dataPageStride = hostDataPageStride;
+        hostRows.scalePageStride = hostScalePageStride;
+        hostRows.rowsPerPage = static_cast<int32_t>(hostRowsPerPage);
+    }
+    if (fillRows.has_value())
+    {
+        TORCH_CHECK(hostData != 0, "fill_rows requires host rows");
+        TORCH_CHECK(fillRows->is_cuda() && fillRows->device() == device && fillRows->scalar_type() == th::kInt32
+                && fillRows->is_contiguous() && fillRows->sizes() == globalIndices.sizes(),
+            "fill_rows must be contiguous int32 on the indices' device with their shape");
+        hostRows.fillRows = fillRows->data_ptr<int32_t>();
+        // The gather stores the host rows it reads into the pools it was given.
+        hostRows.fillData = const_cast<uint8_t*>(dataPool.data_ptr<uint8_t>());
+        hostRows.fillScales = reinterpret_cast<__nv_fp8_e4m3*>(const_cast<void*>(scalePool.data_ptr()));
+    }
+
     auto stream = at::cuda::getCurrentCUDAStream(globalIndices.get_device()).stream();
     tk::invokeNvFp4MlaKvCacheGather(dataPool.data_ptr<uint8_t>(),
         reinterpret_cast<__nv_fp8_e4m3 const*>(scalePool.data_ptr()), globalIndices.data_ptr<int32_t>(),
         reinterpret_cast<__nv_fp8_e4m3*>(output.data_ptr()), globalIndices.data_ptr<int32_t>(),
         globalDequantScale.data_ptr<float>(), static_cast<int32_t>(globalIndices.size(0)),
         static_cast<int32_t>(globalIndices.size(1)), static_cast<int32_t>(output.size(2)),
-        static_cast<int32_t>(residualDim), numPoolTokens, stream);
+        static_cast<int32_t>(residualDim), numPoolTokens, stream, hostRows);
 }
 
 void nvFp4MlaContextKvCacheGatherDirect(th::Tensor const& dataPool, th::Tensor const& scalePool,
@@ -280,7 +307,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "nvfp4_mla_kv_cache_gather_direct(Tensor data_pool, Tensor scale_pool, Tensor(a!) global_indices, "
         "Tensor(b!) output, Tensor global_dequant_scale, int residual_dim, "
-        "int num_pool_tokens) -> ()");
+        "int num_pool_tokens, int host_data=0, int host_scales=0, int host_data_page_stride=0, "
+        "int host_scale_page_stride=0, int host_rows_per_page=1, Tensor? fill_rows=None) -> ()");
     m.def(
         "nvfp4_mla_context_kv_cache_gather_direct(Tensor data_pool, Tensor scale_pool, Tensor local_topk_indices, "
         "Tensor query_req_indices, Tensor compressed_kv_lengths, Tensor(a!) global_indices, Tensor(b!) output, "

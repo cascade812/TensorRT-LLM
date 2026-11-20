@@ -77,15 +77,17 @@ def _manager(
     pretrained_config: SimpleNamespace | None = None,
     kv_cache_config: KvCacheConfig | None = None,
     max_batch_size: int = MAX_BATCH_SIZE,
+    host_reads: bool = False,
 ) -> DSACacheManagerV2:
+    offload_config = {"gpu_cache_factor": 2.0, "host_history_size": 1 << 30}
+    if host_reads:
+        offload_config["read_misses_from_host"] = True
     sparse_config = DeepSeekSparseAttentionConfig(
         index_head_dim=128,
         index_n_heads=32,
         index_topk=TOPK,
         enable_kv_cache_offload=offload,
-        kv_cache_offload_config=(
-            {"gpu_cache_factor": 2.0, "host_history_size": 1 << 30} if offload else {}
-        ),
+        kv_cache_offload_config=offload_config if offload else {},
     )
     if kv_cache_config is None:
         kv_cache_config = KvCacheConfig(
@@ -469,6 +471,165 @@ def test_fetched_rows_hold_written_history_across_evictions(seed, num_layers, nu
             manager.free_resources(request)
     finally:
         manager.shutdown()
+
+
+def _host_row_words(address: int) -> torch.Tensor:
+    """The first three int32 words of a row in host memory, through its device mapping."""
+    return convert_to_torch_tensor(TensorWrapper(address, torch.int32, (3,)))
+
+
+@pytest.mark.parametrize("num_requests", [1, 3])
+@pytest.mark.parametrize(
+    "pretrained",
+    [_pretrained_config, _pretrained_config_all_full],
+    ids=["shared-topk", "own-topk"],
+)
+def test_host_reads_name_host_rows_that_the_gather_stores_into_the_gpu_cache(
+    num_requests, pretrained
+):
+    """Units missing from the GPU cache are read in their host rows, then are hits.
+
+    Every step writes each request's token row tagged (position, layer, request). A fetch
+    with host reads names each missing unit's host row: its data and block scales there
+    carry the unit's tag. The NVFP4 gather reads those rows and stores them into the GPU
+    cache rows the fetch admitted, the only writer of those rows, so a later step that
+    selects the unit again finds it on the GPU with the same tag. Layers that reuse another layer's top-k
+    read the leader's resolve and fill their own rows.
+    """
+    generator = torch.Generator().manual_seed(5)
+    manager = _manager(dtype=DataType.NVFP4, host_reads=True, pretrained_config=pretrained())
+    try:
+        assert manager.sparse_host_reads
+        requests = [_request(9 + index, 1) for index in range(num_requests)]
+        join_step = {request.py_request_id: 40 * index for index, request in enumerate(requests)}
+        descriptors = manager.get_sparse_offload_descriptors()
+        arenas = {
+            layer: [
+                _arena_rows(descriptor, descriptor.data_buffer_index, NVFP4_DATA_BYTES),
+                _arena_rows(descriptor, descriptor.scale_buffer_index, NVFP4_SCALE_BYTES),
+            ]
+            for layer, descriptor in descriptors.items()
+        }
+        state = allocate_sparse_offload_state(
+            lambda name, shape, dtype: torch.empty(shape, dtype=dtype, device="cuda"),
+            descriptors,
+            max_batch_size=MAX_BATCH_SIZE,
+            topk=TOPK,
+            host_reads=True,
+        )
+        scale = torch.ones(1, dtype=torch.float32, device="cuda")
+        active: list[LlmRequest] = []
+        host_entries = refetched_hits = 0
+        previously_on_host: dict[tuple[int, int], set[int]] = {}
+        for step in range(6 * TOKENS_PER_BLOCK):
+            for request in requests:
+                if join_step[request.py_request_id] == step:
+                    assert manager.prepare_disagg_gen_init(request)
+                    active.append(request)
+            for request in active:
+                assert manager.try_allocate_generation(request)
+            scheduled = SimpleNamespace(context_requests=[], generation_requests=active[::-1])
+            manager.prepare_resources(scheduled)
+            request_ids = [request.py_request_id for request in scheduled.generation_requests]
+            manager.prepare_sparse_offload(state, request_ids, beam_width=1)
+            batch_rows = state.batch_rows.tolist()[: len(active)]
+            histories = [manager.kv_cache_map[rid].history_length for rid in request_ids]
+            topk = torch.full((len(active), TOPK), -1, dtype=torch.int32)
+            for position, history in enumerate(histories):
+                candidates = torch.randperm(history, generator=generator)[: TOPK - 1]
+                candidates = candidates[candidates > 0][: TOPK - 1].to(torch.int32)
+                topk[position, : candidates.numel()] = candidates
+                topk[position, -1] = history
+            topk = topk.cuda()
+            request_indices = torch.arange(len(active), dtype=torch.int32, device="cuda")
+            kv_lengths = torch.tensor([h + 1 for h in histories], dtype=torch.int32, device="cuda")
+            out = torch.empty((len(active), TOPK), dtype=torch.int32, device="cuda")
+            fill_rows = torch.empty_like(out)
+            for layer in range(NUM_LAYERS):
+                descriptor = descriptors[layer]
+                writes = manager.prepare_sparse_write_indices(state, layer)
+                data = state.out_slots[layer][descriptor.data_buffer_index]
+                for row, rid, history in zip(batch_rows, request_ids, histories):
+                    write_row = writes[row, data].item()
+                    for arena in arenas[layer]:
+                        arena[write_row, :3] = torch.tensor(
+                            [history, layer, rid], dtype=torch.int32, device="cuda"
+                        )
+                fetched = manager.fetch_sparse_indices(
+                    state, layer, topk, request_indices, kv_lengths, host_reads=True
+                )
+                count = len(descriptor.buffer_ids)
+                for source, target in ((fetched, out), (state.fetched_cells[count], fill_rows)):
+                    merge_sparse_arena_indices(
+                        topk,
+                        request_indices,
+                        state.batch_rows,
+                        state.active_request_count,
+                        kv_lengths,
+                        state.history_lengths,
+                        source[:, data, :],
+                        writes[:, data],
+                        target,
+                        unit_tokens=1,
+                    )
+                host = manager.dsa_sparse_host_rows(layer)
+                for position, rid in enumerate(request_ids):
+                    valid = topk[position] >= 0
+                    units = topk[position][valid].tolist()
+                    rows = out[position][valid].tolist()
+                    on_host = set()
+                    for unit, row in zip(units, rows):
+                        expected = [unit, layer, rid]
+                        if row < -1:
+                            on_host.add(unit)
+                            host_entries += 1
+                            page, offset = divmod(-2 - row, host.rows_per_page)
+                            got = [
+                                _host_row_words(
+                                    host.data
+                                    + page * host.data_page_stride
+                                    + offset * NVFP4_DATA_BYTES
+                                ).tolist(),
+                                _host_row_words(
+                                    host.scales
+                                    + page * host.scale_page_stride
+                                    + offset * NVFP4_SCALE_BYTES
+                                ).tolist(),
+                            ]
+                        else:
+                            assert row >= 0, (rid, layer, unit)
+                            got = [arena[row, :3].tolist() for arena in arenas[layer]]
+                            refetched_hits += unit in previously_on_host.get((rid, layer), ())
+                        assert got == [expected, expected], (step, rid, layer, unit, row, got)
+                    previously_on_host[(rid, layer)] = (
+                        previously_on_host.get((rid, layer), set()) | on_host
+                    )
+                data_rows, scale_rows = manager.get_sparse_latent_nvfp4_arenas(layer)
+                scratch = torch.empty(
+                    (*out.shape, HEAD_DIM), dtype=torch.float8_e4m3fn, device="cuda"
+                )
+                torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
+                    data_rows,
+                    scale_rows,
+                    out.clone(),
+                    scratch,
+                    scale,
+                    NVFP4_RESIDUAL_DIM,
+                    data_rows.shape[0],
+                    *host,
+                    fill_rows,
+                )
+            manager.update_forward_resources(scheduled, wait_for_input_copy=lambda: None)
+        assert host_entries > 0 and refetched_hits > 0, (host_entries, refetched_hits)
+        for request in active:
+            manager.free_resources(request)
+    finally:
+        manager.shutdown()
+
+
+def test_dsa_host_reads_require_an_nvfp4_latent():
+    with pytest.raises(NotImplementedError, match="read_misses_from_host requires an NVFP4"):
+        _manager(dtype=DataType.FP8, host_reads=True)
 
 
 def test_suspended_request_keeps_its_history_through_demotion():

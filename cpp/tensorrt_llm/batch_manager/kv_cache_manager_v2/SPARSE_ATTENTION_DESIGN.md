@@ -670,7 +670,8 @@ device-accessible — pinned and mapped, or managed and advised as accessed by t
 the reader takes the unit in place. No copy runs: a second index write, without `hostReads`,
 gives each marked slot's cell, and the reader stores the unit there as it reads it, so later
 steps hit it. Every unit crosses the host link once. Hits are unaffected: their cells already
-hold the bytes.
+hold the bytes. Layers tied to one selection each run both index writes against the one
+resolve, and each fills its own cells.
 
 The copy kernel needed no change for any of this. It consumes a work list plus a buffer
 range, and nothing in it depended on which layer produced the list. Neither did the

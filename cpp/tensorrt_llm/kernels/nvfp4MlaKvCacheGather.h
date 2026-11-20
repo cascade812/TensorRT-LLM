@@ -28,9 +28,32 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
+//! Rows of host pages a gather may read in place of pool rows.
+//!
+//! A global index below -1 names host row u = -2 - index: its packed data at
+//! data + (u / rowsPerPage) * dataPageStride + (u % rowsPerPage) * packedHeadDim and its block
+//! scales at scales + (u / rowsPerPage) * scalePageStride + (u % rowsPerPage) * scalesPerToken,
+//! with the pools' row layout. Strides are in bytes. Without data, such an index is invalid.
+//!
+//! With fillRows, aligned with the global indices, the gather also stores each host row it
+//! reads, as it is, into pool row fillRows[pair] of fillData and fillScales, the writable
+//! pools; a negative entry stores nothing. Only the 576-wide MLA layout fills.
+struct NvFp4MlaHostRows
+{
+    uint8_t const* data = nullptr;
+    __nv_fp8_e4m3 const* scales = nullptr;
+    int64_t dataPageStride = 0;
+    int64_t scalePageStride = 0;
+    int32_t rowsPerPage = 1;
+    int32_t const* fillRows = nullptr;
+    uint8_t* fillData = nullptr;
+    __nv_fp8_e4m3* fillScales = nullptr;
+};
+
 void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* scalePool, int32_t const* globalIndices,
     __nv_fp8_e4m3* output, int32_t* compactIndices, float const* globalDequantScale, int32_t numRows, int32_t topK,
-    int32_t headDim, int32_t residualDim, int64_t numPoolTokens, cudaStream_t stream = 0);
+    int32_t headDim, int32_t residualDim, int64_t numPoolTokens, cudaStream_t stream = 0,
+    NvFp4MlaHostRows const& hostRows = {});
 
 size_t getNvFp4MlaContextKvCacheGatherDirectWorkspaceSize(
     int32_t numRequests, int32_t maxKvTokens, cudaStream_t stream = 0);

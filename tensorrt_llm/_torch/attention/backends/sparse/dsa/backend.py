@@ -333,6 +333,10 @@ class DSATrtllmAttention(TrtllmAttention):
         write row, and attention reads both through the layer's arena base. An
         NVFP4 latent is first dequantized to FP8 scratch rows, and attention reads
         those instead, as it does from the GPU-resident NVFP4 cache.
+
+        With host reads, a token missing from the GPU cache keeps its host row: the
+        NVFP4 gather reads it there and stores it into the cache row the fetch
+        admitted it to, so later steps find it on the GPU.
         """
         state = metadata.sparse_offload_state
         if state is None or state.write_layer != self.layer_idx:
@@ -351,7 +355,12 @@ class DSATrtllmAttention(TrtllmAttention):
             metadata.sparse_offload_fetch_pending = None
         else:
             fetched = metadata.kv_cache_manager.fetch_sparse_indices(
-                state, self.layer_idx, topk_indices, request_indices, kv_lengths
+                state,
+                self.layer_idx,
+                topk_indices,
+                request_indices,
+                kv_lengths,
+                host_reads=metadata.kv_cache_manager.sparse_host_reads,
             )
         data_index = descriptor.data_buffer_index
         # Both paths resolve buffers whose arena indices coincide once, into one slice, so
@@ -377,18 +386,34 @@ class DSATrtllmAttention(TrtllmAttention):
             return indices
         # The data and scale arenas share their rows, so one index reads both. The
         # gather replaces each arena row with its FP8 scratch row, -1 staying -1.
-        data_rows, scale_rows = metadata.kv_cache_manager.get_sparse_latent_nvfp4_arenas(
-            self.layer_idx
-        )
+        manager = metadata.kv_cache_manager
+        data_rows, scale_rows = manager.get_sparse_latent_nvfp4_arenas(self.layer_idx)
         scratch = state.nvfp4_scratch[:num_tokens]
+        host_rows = manager.dsa_sparse_host_rows(self.layer_idx)
+        host_args = ()
+        if host_rows is not None:
+            fill_rows = merge_sparse_arena_indices(
+                topk_indices,
+                request_indices,
+                state.batch_rows,
+                state.active_request_count,
+                kv_lengths,
+                state.history_lengths,
+                state.fetched_cells[len(descriptor.buffer_ids)][:, data_slot, :],
+                state.write_indices[len(descriptor.buffer_ids)][:, data_slot],
+                metadata.sparse_offload_fill_rows[:num_tokens],
+                unit_tokens=descriptor.unit_tokens,
+            )
+            host_args = (*host_rows, fill_rows)
         torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
             data_rows,
             scale_rows,
             indices,
             scratch,
             self._nvfp4_mla_kv_scale_quant_orig,
-            metadata.kv_cache_manager.mla_kv_cache_residual_dim,
+            manager.mla_kv_cache_residual_dim,
             data_rows.shape[0],
+            *host_args,
         )
         forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
         return indices
@@ -441,6 +466,7 @@ class DSATrtllmAttention(TrtllmAttention):
                 metadata.shared_topk_indices[: metadata.num_tokens, : metadata.sparse_mla_topk],
                 metadata.req_idx_per_token[: metadata.num_tokens],
                 metadata.kv_lens_cuda[: metadata.num_seqs],
+                host_reads=metadata.kv_cache_manager.sparse_host_reads,
             )
             metadata.sparse_offload_fetch_event.record()
         metadata.sparse_offload_write_pending = layer_idx
