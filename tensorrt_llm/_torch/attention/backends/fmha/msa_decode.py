@@ -167,9 +167,8 @@ class MsaDecodeFmha(PhasedFmha):
             offloaded = metadata.sparse_offload_state is not None
             if offloaded:
                 block_table = metadata.fetch_sparse_blocks(params.attn.layer_idx, kv_block_indexes)
-            self._run_sparse(params, kv_block_indexes, block_table, seq_lens)
-            if offloaded:
-                metadata.finish_sparse_fetch(params.attn.layer_idx)
+            cell_table = metadata.sparse_cell_table(block_table.shape[0]) if offloaded else None
+            self._run_sparse(params, kv_block_indexes, block_table, seq_lens, cell_table)
         else:
             self._run_dense(params, block_table, seq_lens)
 
@@ -179,6 +178,7 @@ class MsaDecodeFmha(PhasedFmha):
         kv_block_indexes: torch.Tensor,
         block_table: torch.Tensor,
         seq_lens: torch.Tensor,
+        cell_table: Optional[torch.Tensor] = None,
     ) -> None:
         # This kernel also pulls in Triton, a second reason to keep it out of
         # module scope.
@@ -224,6 +224,7 @@ class MsaDecodeFmha(PhasedFmha):
             output=params.output.view(num_tokens, attn.num_heads, head_dim),
             decode_query_len=params.input_seq_length,
             host_pages=host_pages,
+            cell_table=cell_table,
             **nvfp4_args,
         )
 

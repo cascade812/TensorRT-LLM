@@ -665,10 +665,12 @@ reuses the miss list the copy walks.
 with `hostReads` marks the slot of every unit it admits from history
 (`kSparseAdmittedSlotBit`), and an index write with `hostReads` turns a marked slot into the
 unit's host page instead of its cell, encoded below -1 (`kSparseHostIndexBase - u`, where
-`u` is the buffer's converted page index the copy itself reads). The host pages are
+`u` is the buffer's converted page index the copy would read). The host pages are
 device-accessible — pinned and mapped, or managed and advised as accessed by the GPU — so
-attention reads the unit in place while the copy fills the cell for later steps. Hits are
-unaffected: their cells already hold the bytes.
+the reader takes the unit in place. No copy runs: a second index write, without `hostReads`,
+gives each marked slot's cell, and the reader stores the unit there as it reads it, so later
+steps hit it. Every unit crosses the host link once. Hits are unaffected: their cells already
+hold the bytes.
 
 The copy kernel needed no change for any of this. It consumes a work list plus a buffer
 range, and nothing in it depended on which layer produced the list. Neither did the

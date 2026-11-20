@@ -154,12 +154,22 @@ def _block_table_kernel(
 
 
 def build_block_table(
-    state: SparseOffloadState, layer_idx: int, selected: torch.Tensor, out: torch.Tensor
+    state: SparseOffloadState,
+    layer_idx: int,
+    selected: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    cells: bool = False,
 ) -> None:
-    """Publish fetched K pages and the growing block by original block ordinal."""
+    """Publish fetched K pages and the growing block by original block ordinal.
+
+    With ``cells``, publish ``state.fetched_cells`` instead: every entry's arena
+    page, including the cell each host entry's block was admitted to.
+    """
     descriptor = state.layers[layer_idx]
     count = len(descriptor.buffer_ids)
-    fetched, writes = state.fetched_indices[count], state.write_indices[count]
+    fetched = (state.fetched_cells if cells else state.fetched_indices)[count]
+    writes = state.write_indices[count]
     if state.coverage is not None:
         state.coverage.fill_(1)
     _block_table_kernel[(selected.shape[0],)](

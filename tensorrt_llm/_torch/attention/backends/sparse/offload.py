@@ -164,10 +164,9 @@ class SparseOffloadState:
     assert on (``offload_kernels.merge_sparse_arena_indices``), allocated only
     with ``SPARSE_OFFLOAD_DEBUG_ASSERT``.
 
-    ``copy_issued`` and ``copy_done`` order a host-read fetch's copy, which
-    runs on the manager's copy stream, after its resolve and before whatever
-    joins it; ``copy_outstanding`` says a copy was issued that the calling
-    stream has not joined yet (see ``SparseOffloadCacheMixin.fetch_sparse_indices``).
+    ``fetched_cells`` mirrors ``fetched_indices`` with every entry's arena index,
+    host entries included, for a manager with host reads: the reader of a unit
+    in host memory stores it there. It is empty otherwise.
     """
 
     layers: dict[int, SparseOffloadLayerDescriptor]
@@ -188,9 +187,7 @@ class SparseOffloadState:
     history_lengths: torch.Tensor | None = None
     prepared: bool = False
     write_layer: int | None = None
-    copy_issued: torch.cuda.Event | None = None
-    copy_done: torch.cuda.Event | None = None
-    copy_outstanding: bool = False
+    fetched_cells: dict[int, torch.Tensor] = field(default_factory=dict)
 
     @staticmethod
     def device_bytes(
@@ -199,6 +196,7 @@ class SparseOffloadState:
         topk: int,
         buffer_counts: Collection[int],
         nvfp4_head_dim: int | None,
+        host_reads: bool = False,
     ) -> int:
         """Return the device bytes one instance allocates.
 
@@ -209,6 +207,7 @@ class SparseOffloadState:
             topk: Units one row selects, K.
             buffer_counts: The distinct sparse buffer counts F of the layers.
             nvfp4_head_dim: Head dim of the dequantized rows with NVFP4, else None.
+            host_reads: Whether fetches read missing units from host memory.
         """
         # The active count, the selections, the scatter start positions, the
         # Batch row map and any coverage flag, then the fetch outputs and write
@@ -216,6 +215,8 @@ class SparseOffloadState:
         index_entries = 1 + max_batch_size * topk + 2 * max_batch_size
         index_entries += int(SPARSE_OFFLOAD_DEBUG_ASSERT)
         index_entries += sum(max_batch_size * count * (topk + 1) for count in buffer_counts)
+        if host_reads:
+            index_entries += sum(max_batch_size * count * topk for count in buffer_counts)
         nvfp4_bytes = 0
         if nvfp4_head_dim is not None:
             nvfp4_rows = max_batch_size * topk + NVFP4_SCRATCH_TAIL_ROWS
@@ -230,6 +231,7 @@ def allocate_sparse_offload_state(
     max_batch_size: int,
     topk: int,
     nvfp4_head_dim: int | None = None,
+    host_reads: bool = False,
 ) -> SparseOffloadState:
     """Allocate an attention metadata's persistent offload state.
 
@@ -240,6 +242,7 @@ def allocate_sparse_offload_state(
         max_batch_size: Rows B, the native Batch capacity.
         topk: Units one row selects.
         nvfp4_head_dim: Head dim of the NVFP4 gather's dequantized rows, else None.
+        host_reads: Allocate ``fetched_cells`` for a manager with host reads.
     """
 
     def index_tensor(name: str, shape: tuple[int, ...], value: int) -> torch.Tensor:
@@ -276,6 +279,14 @@ def allocate_sparse_offload_state(
         scatter_start_positions=index_tensor("scatter_start_positions", (max_batch_size,), 0),
         nvfp4_scratch=nvfp4_scratch(nvfp4_head_dim) if nvfp4_head_dim is not None else None,
         coverage=index_tensor("coverage", (1,), 1) if SPARSE_OFFLOAD_DEBUG_ASSERT else None,
+        fetched_cells={
+            count: index_tensor(
+                f"fetched_cells_{count}", (max_batch_size, count, topk), BAD_PAGE_INDEX
+            )
+            for count in buffer_counts
+        }
+        if host_reads
+        else {},
     )
 
 
@@ -358,7 +369,6 @@ class SparseOffloadCacheMixin:
 
     _enable_kv_cache_offload: bool = False
     _sparse_host_reads: bool = False
-    _sparse_copy_stream: torch.cuda.Stream | None = None
     _sparse_offload_topk: int | None = None
     _sparse_batch: Batch | None = None
     _sparse_batch_prepared: bool = False
@@ -397,6 +407,7 @@ class SparseOffloadCacheMixin:
             topk=self._sparse_offload_topk,
             buffer_counts=buffer_counts,
             nvfp4_head_dim=self._sparse_offload_nvfp4_head_dim(),
+            host_reads=self._sparse_host_reads,
         )
 
     def _has_sparse_offload_layers(self) -> bool:
@@ -1012,16 +1023,6 @@ class SparseOffloadCacheMixin:
                     "Sparse Batch allocation must remain stable across graph replays"
                 )
             torch.cuda.current_stream().wait_stream(self._stream)
-            # A forward that stopped before its last offloaded layer left a copy
-            # unjoined; nothing may read the cells, or reuse the miss list, before it.
-            self.join_sparse_copies(state)
-            if self._sparse_host_reads:
-                # Created here, outside any capture, for the forward's host-read copies.
-                if self._sparse_copy_stream is None:
-                    self._sparse_copy_stream = torch.cuda.Stream()
-                if state.copy_issued is None:
-                    state.copy_issued = torch.cuda.Event()
-                    state.copy_done = torch.cuda.Event()
             if state.batch is None:
                 state.history_lengths = torch.from_dlpack(batch.history_lengths())
                 state.batch = batch
@@ -1036,6 +1037,8 @@ class SparseOffloadCacheMixin:
             state.active_request_count.fill_(live)
             state.selected_history_units.fill_(BAD_PAGE_INDEX)
             for out in state.fetched_indices.values():
+                out.fill_(BAD_PAGE_INDEX)
+            for out in state.fetched_cells.values():
                 out.fill_(BAD_PAGE_INDEX)
             for out in state.write_indices.values():
                 out.fill_(BAD_PAGE_INDEX)
@@ -1110,14 +1113,13 @@ class SparseOffloadCacheMixin:
         Output storage is reused by subsequent layers after attention consumes it.
 
         With ``host_reads`` (the manager must enable them), a unit missing from
-        the arena is not copied before the indices are written: its index names
-        its host page instead, encoded as ``-2 - page`` for the page's converted
-        index in the buffer's host table (``Batch.pool_spec_for``), and attention
-        reads it there. The copy that fills the admitted cells for later steps
-        runs on the manager's copy stream, beside attention and whatever follows
-        it. The next host-read fetch joins it before resolving, since the
-        resolve reuses the miss list the copy walks, and the caller joins it
-        with ``join_sparse_copies`` before the forward ends.
+        the arena is not copied in: its index names its host page instead,
+        encoded as ``-2 - page`` for the page's converted index in the buffer's
+        host table (``Batch.pool_spec_for``), and the reader takes it from there.
+        The fetch also writes ``state.fetched_cells``, the same indices with each
+        host entry's arena index: the cell the resolve admitted the unit to. The
+        reader stores the unit there as it reads it, so later steps hit it, and
+        nothing else fills the cell.
         """
         if (
             not self._enable_kv_cache_offload
@@ -1129,10 +1131,6 @@ class SparseOffloadCacheMixin:
         descriptor = state.layers[layer_idx]
         if host_reads and not self._sparse_host_reads:
             raise RuntimeError("Sparse host reads are not enabled for this cache manager")
-        # The previous layer's copy may still be walking the miss list this resolve
-        # reuses. It had the previous layer's attention and everything up to here to
-        # finish, so this rarely waits.
-        self.join_sparse_copies(state)
         with torch.cuda.device(state.selected_history_units.device):
             select_sparse_history_units(
                 topk_indices,
@@ -1171,7 +1169,15 @@ class SparseOffloadCacheMixin:
                     stream=stream,
                     host_reads=True,
                 )
-                self._issue_sparse_copy(state, descriptor)
+                # The same resolve's slots, without host reads, name each admitted
+                # unit's cell.
+                state.batch.fetch_resolved_indices(
+                    buffers=descriptor.buffer_ids,
+                    selected=state.selected_history_units,
+                    out=state.fetched_cells[len(descriptor.buffer_ids)],
+                    stream=stream,
+                    host_reads=False,
+                )
             elif owner is None:
                 state.batch.fetch_sparse_pages(
                     buffers=descriptor.buffer_ids,
@@ -1199,44 +1205,7 @@ class SparseOffloadCacheMixin:
                 )
         return out
 
-    def _issue_sparse_copy(
-        self, state: SparseOffloadState, descriptor: SparseOffloadLayerDescriptor
-    ) -> None:
-        """Fill the cells the resolve just admitted, on the copy stream.
-
-        The copy reads the same host pages attention reads in place, so the
-        units hit in the arena from the next step on. It is ordered after the
-        resolve, which is all it reads; attention does not wait for it.
-        """
-        current = torch.cuda.current_stream()
-        copy_stream = self._sparse_copy_stream
-        if copy_stream is None or state.copy_issued is None:
-            raise RuntimeError("Sparse host reads require prepared decode metadata")
-        state.copy_issued.record(current)
-        copy_stream.wait_event(state.copy_issued)
-        with torch.cuda.stream(copy_stream):
-            self._copy_sparse_misses(state, descriptor, copy_stream)
-        state.copy_done.record(copy_stream)
-        state.copy_outstanding = True
-
-    @nvtx_range_debug("copy_sparse_misses")
-    def _copy_sparse_misses(
-        self,
-        state: SparseOffloadState,
-        descriptor: SparseOffloadLayerDescriptor,
-        stream: torch.cuda.Stream,
-    ) -> None:
-        state.batch.copy_resolved_pages(
-            buffers=descriptor.buffer_ids, stream=CudaStream(stream.cuda_stream)
-        )
-
-    def join_sparse_copies(self, state: SparseOffloadState) -> None:
-        """Order the current stream after every copy a host-read fetch has issued.
-
-        The copy stream is serial, so its last copy covers the earlier ones. A
-        forward joins before it ends, which a captured graph requires and which
-        keeps a cell from being hit, or its lease released, before it is filled.
-        """
-        if state.copy_outstanding:
-            torch.cuda.current_stream().wait_event(state.copy_done)
-            state.copy_outstanding = False
+    @property
+    def sparse_host_reads(self) -> bool:
+        """Whether fetches name units missing from the GPU cache by their host pages."""
+        return self._sparse_host_reads

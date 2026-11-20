@@ -172,7 +172,7 @@ def _write(data, scales, slots, k, v, quant):
         )
 
 
-def _attention(q, data, scales, topk, table, lengths, out, quant, host_pages=None):
+def _attention(q, data, scales, topk, table, lengths, out, quant, host_pages=None, cell_table=None):
     extra = (
         {}
         if scales is None
@@ -194,6 +194,7 @@ def _attention(q, data, scales, topk, table, lengths, out, quant, host_pages=Non
         output=out,
         decode_query_len=1,
         host_pages=host_pages,
+        cell_table=cell_table,
         **extra,
     )
 
@@ -410,6 +411,7 @@ def test_m3_offload_reuses_received_prompt(dtype, heads, shorter_prefix):
         (DataType.NVFP4, 1, False, "managed", True),
         (DataType.NVFP4, 2, True, "managed", True),
         (DataType.NVFP4, 2, False, "pinned", True),
+        (DataType.NVFP4, 4, False, "pinned", True),
     ],
 )
 def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseating(
@@ -426,13 +428,15 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
     Per-head selections rotate, a request leaves and rejoins inside a growing block, and
     requests cross page boundaries at different steps. Padded graph queries
     must never write into another request's arena or become native Batch members.
-    With host reads, blocks missing from the arena are attended in host memory while
-    a held-back copy fills their cells, and must be hits on the steps that select them again.
+    With host reads, blocks missing from the arena are attended in host memory, and
+    attention stores them, every KV head of them, into the cells the fetch admitted them to:
+    they must be hits, with the same bytes, on the steps that select them again.
     """
     history_blocks = 2 * TOPK * heads + 7
     max_blocks = history_blocks + 4
     max_seq_len = max_blocks * PAGE
     manager = _manager(dtype, heads, max_seq_len, host_memory=host_memory, host_reads=host_reads)
+    assert manager.sparse_host_reads == host_reads
     generator = torch.Generator(device="cuda").manual_seed(437)
     nvfp4 = dtype == DataType.NVFP4
     requests = [
@@ -469,17 +473,6 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
             return get_subpage_pool(layer_idx, kv_layout)
 
         monkeypatch.setattr(manager, "get_kv_subpage_pool", resident_subpage_pool)
-        if host_reads:
-            # Hold every miss copy back on its stream, so attention running ahead of it, a
-            # resolve reusing its miss list, or a later hit on its cells would read stale
-            # bytes unless the joins order them.
-            copy_misses = manager._copy_sparse_misses
-
-            def delayed_copy(state, descriptor, stream):
-                torch.cuda._sleep(2_000_000)
-                copy_misses(state, descriptor, stream)
-
-            monkeypatch.setattr(manager, "_copy_sparse_misses", delayed_copy)
         metadata = MiniMaxM3MsaSparseAttentionMetadata(
             max_num_requests=BATCH,
             max_num_tokens=BATCH,
@@ -620,8 +613,8 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                     outputs[layer],
                     quant,
                     host_pages=host_pages,
+                    cell_table=metadata.sparse_cell_table(table.shape[0]),
                 )
-                metadata.finish_sparse_fetch(layer)
 
         captured = None
         permuted = False

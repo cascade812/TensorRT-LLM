@@ -194,6 +194,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     msa_sparse_unit_lengths: Optional[torch.Tensor] = None
     msa_sparse_request_indices: Optional[torch.Tensor] = None
     msa_sparse_block_table: Optional[torch.Tensor] = None
+    msa_sparse_cell_table: Optional[torch.Tensor] = None
     # Zero-copy pool views prepared outside Dynamo; PCG passes these explicitly
     # to its mutable producer instead of hiding writes behind runtime metadata.
     msa_layer_cache_tensors: Optional[
@@ -308,11 +309,13 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 capture_graph=self.is_cuda_graph,
             )
 
+        host_reads = manager.sparse_host_reads
         self.sparse_offload_state = allocate_sparse_offload_state(
             allocate,
             layers,
             max_batch_size=batch,
             topk=width,
+            host_reads=host_reads,
         )
         self.msa_sparse_write_slots = allocate("write_slots", (batch,), torch.int32)
         self.msa_sparse_selected = allocate("selected", (batch, width), torch.int32)
@@ -327,13 +330,21 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             torch.int32,
         )
         self.msa_sparse_block_table.fill_(-1)
+        if host_reads:
+            self.msa_sparse_cell_table = allocate(
+                "cell_table",
+                (batch, manager.max_blocks_per_seq),
+                torch.int32,
+            )
+            self.msa_sparse_cell_table.fill_(-1)
 
     def fetch_sparse_blocks(self, layer_idx: int, topk: torch.Tensor) -> torch.Tensor:
         """Fetch the union of per-head blocks and return their arena page table.
 
         With host reads (``kv_cache_manager.m3_sparse_host_pages``), a block not
         yet in the arena takes an entry below -1 naming its host page, which
-        attention reads in place while its cell is filled beside it.
+        attention reads in place and stores into the cell ``sparse_cell_table``
+        names, so later steps hit it.
         """
         from .kernels.offload import build_block_table, prepare_selection
 
@@ -351,22 +362,21 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             self.msa_sparse_unit_lengths,
             host_reads=self.kv_cache_manager.m3_sparse_host_pages(layer_idx) is not None,
         )
-        build_block_table(
-            state, layer_idx, self.msa_sparse_selected[: topk.shape[0]], self.msa_sparse_block_table
-        )
+        selected = self.msa_sparse_selected[: topk.shape[0]]
+        build_block_table(state, layer_idx, selected, self.msa_sparse_block_table)
+        if self.msa_sparse_cell_table is not None:
+            build_block_table(state, layer_idx, selected, self.msa_sparse_cell_table, cells=True)
         return self.msa_sparse_block_table[: topk.shape[0]]
 
-    def finish_sparse_fetch(self, layer_idx: int) -> None:
-        """Join the host-read copies after the last offloaded layer's attention.
+    def sparse_cell_table(self, rows: int) -> Optional[torch.Tensor]:
+        """The arena page of each block of the last ``fetch_sparse_blocks``, by ordinal.
 
-        Each host-read fetch fills its admitted cells on the copy stream, beside
-        attention; the next fetch joins the previous copy. The last offloaded
-        layer joins its own once its attention is enqueued, so the forward, and
-        a captured graph, ends with every cell filled. A no-op otherwise.
+        Attention stores each block it reads from host memory into that page.
+        None without host reads.
         """
-        state = self.sparse_offload_state
-        if state is not None and layer_idx == max(state.layers, default=None):
-            self.kv_cache_manager.join_sparse_copies(state)
+        if self.msa_sparse_cell_table is None:
+            return None
+        return self.msa_sparse_cell_table[:rows]
 
     @property
     def msa_qo_lens_cpu(self) -> Optional[torch.Tensor]:

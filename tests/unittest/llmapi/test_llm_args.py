@@ -6259,7 +6259,9 @@ class TestDeepSeekV4SparseAttentionConfig:
             DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True,
                                             kv_cache_offload_config=offload)
         config = llm_args_mod.MiniMaxM3SparseAttentionConfig(
-            enable_kv_cache_offload=True, kv_cache_offload_config=offload)
+            implementation="msa",
+            enable_kv_cache_offload=True,
+            kv_cache_offload_config=offload)
         assert config.get_kv_cache_offload_config().read_misses_from_host
 
     def test_only_offloading_configs_report_kv_cache_offload(self):

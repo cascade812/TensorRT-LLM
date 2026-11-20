@@ -32,6 +32,9 @@ Differences from upstream:
 * The merge kernel zeroes rows whose chunks are all empty instead of letting
   them produce NaN, since CUDA-graph padding rows flow on into the rest of the
   network here.
+* With KV cache offload, a block-table entry may name a page in host memory.
+  The kernel reads it there and, given a cell table, stores the page into its
+  GPU cache page as it reads it.
 """
 
 from __future__ import annotations
@@ -184,6 +187,103 @@ def _page_offset(page, stride_blk, host_off, host_stride, HOST_READS: tl.constex
     return page * stride_blk
 
 
+@triton.jit
+def _copy_tile(ptr, src, dst, rows, row_stride, cols, col_stride, row_mask, col_mask):
+    """Copy one [rows, cols] tile between two element offsets from ``ptr``."""
+    offsets = rows[:, None] * row_stride + cols[None, :] * col_stride
+    mask = row_mask[:, None] & col_mask[None, :]
+    tl.store(ptr + dst + offsets, tl.load(ptr + src + offsets, mask=mask), mask=mask)
+
+
+@triton.jit
+def _fill_other_heads(
+    k_ptr,
+    v_ptr,
+    k_sc_ptr,
+    v_sc_ptr,
+    k_off,
+    v_off,
+    ksc_off,
+    vsc_off,
+    cell,
+    pid_kh,
+    num_kv_heads,
+    stride_k_blk,
+    stride_k_h,
+    stride_k_pos,
+    stride_k_d,
+    stride_v_blk,
+    stride_v_h,
+    stride_v_pos,
+    stride_v_d,
+    stride_ksc_blk,
+    stride_ksc_h,
+    stride_vsc_blk,
+    stride_vsc_h,
+    off_n,
+    row_mask,
+    cols,
+    col_mask,
+    off_s,
+    KV_NVFP4: tl.constexpr,
+    SCALE_COLS: tl.constexpr,
+):
+    """Copy every other KV head's slice of a host page into its arena cell.
+
+    A cell holds all of the page's KV heads, and a head that did not select
+    the block reads it from the cell once it is a hit. Block scales are copied
+    as their whole per-head region, whatever order their tokens use.
+    """
+    scale_mask = off_s < SCALE_COLS
+    for other in tl.range(0, num_kv_heads):
+        if other != pid_kh:
+            _copy_tile(
+                k_ptr,
+                k_off + other * stride_k_h,
+                cell * stride_k_blk + other * stride_k_h,
+                off_n,
+                stride_k_pos,
+                cols,
+                stride_k_d,
+                row_mask,
+                col_mask,
+            )
+            _copy_tile(
+                v_ptr,
+                v_off + other * stride_v_h,
+                cell * stride_v_blk + other * stride_v_h,
+                off_n,
+                stride_v_pos,
+                cols,
+                stride_v_d,
+                row_mask,
+                col_mask,
+            )
+            if KV_NVFP4:
+                _copy_tile(
+                    k_sc_ptr,
+                    ksc_off + other * stride_ksc_h,
+                    cell * stride_ksc_blk + other * stride_ksc_h,
+                    off_n,
+                    SCALE_COLS,
+                    off_s,
+                    1,
+                    row_mask,
+                    scale_mask,
+                )
+                _copy_tile(
+                    v_sc_ptr,
+                    vsc_off + other * stride_vsc_h,
+                    cell * stride_vsc_blk + other * stride_vsc_h,
+                    off_n,
+                    SCALE_COLS,
+                    off_s,
+                    1,
+                    row_mask,
+                    scale_mask,
+                )
+
+
 @triton.heuristics(
     {
         "BLOCK_SIZE_H": lambda args: max(16, triton.next_power_of_2(args["gqa_group_size"])),
@@ -243,6 +343,8 @@ def _gqa_sparse_decode_kernel(
     host_vsc_off,
     host_stride,  # elements between host K/V pages
     host_sc_stride,  # elements between host block-scale pages
+    cell_table_ptr,  # [num_reqs, max_blocks] arena page of each host entry, FILL_CELLS only
+    num_kv_heads,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
@@ -256,6 +358,7 @@ def _gqa_sparse_decode_kernel(
     SCALE_COLS: tl.constexpr,  # head_dim // NVFP4_SF_VEC_SIZE, NVFP4 only
     DIRECT_OUTPUT: tl.constexpr,  # one chunk needs neither FP32 scratch nor a merge
     HOST_READS: tl.constexpr,  # block-table entries below -1 name host pages
+    FILL_CELLS: tl.constexpr,  # store each host page read into its arena cell
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     if KV_NVFP4:
@@ -328,6 +431,14 @@ def _gqa_sparse_decode_kernel(
     if WIDEN_Q:
         q = q.to(COMPUTE_DTYPE)
     kv_scale = tl.load(kv_scale_ptr) if USE_SCALE else 1.0
+    if FILL_CELLS:
+        cell_row = cell_table_ptr + req_id * stride_bt_b
+        if KV_NVFP4:
+            fill_cols = off_dp
+            fill_col_mask = off_dp < BLOCK_SIZE_D // 2
+        else:
+            fill_cols = off_d
+            fill_col_mask = d_mask
 
     cur_idx_ptr = t_ptr + pid_kh * stride_th + pid_b * stride_tn + chunk_start * stride_tk
     for _ in tl.range(chunk_start, chunk_end):
@@ -341,28 +452,39 @@ def _gqa_sparse_decode_kernel(
         ksc_off = _page_offset(page, stride_ksc_blk, host_ksc_off, host_sc_stride, HOST_READS)
         vsc_off = _page_offset(page, stride_vsc_blk, host_vsc_off, host_sc_stride, HOST_READS)
         pos_mask = blk * BLOCK_SIZE_K + off_n < kv_len
+        if FILL_CELLS:
+            # A host entry's cell was admitted by this step's resolve, and nothing
+            # reads it before a later step: the tiles read here are stored into it
+            # as they are, so the block is read from host memory once.
+            cell = tl.load(cell_row + blk).to(tl.int64)
+            fill_rows = pos_mask & (page < -1)
         if KV_NVFP4:
             # K block scales are token-major linear within the page-head region;
             # see _fused_nvfp4_paged_scatter_kernel in msa_scatter.
+            k_rows = off_n[:, None] * stride_k_pos + off_dp[None, :] * stride_k_d
+            k_scale_rows = off_n[:, None] * SCALE_COLS + off_s[None, :]
+            k_bytes = tl.load(
+                k_ptr + k_off + pid_kh * stride_k_h + k_rows, mask=pos_mask[:, None], other=0
+            )
+            k_scale_bytes = tl.load(
+                k_sc_ptr + ksc_off + pid_kh * stride_ksc_h + k_scale_rows,
+                mask=pos_mask[:, None],
+                other=0,
+            )
+            if FILL_CELLS:
+                tl.store(
+                    k_ptr + cell * stride_k_blk + pid_kh * stride_k_h + k_rows,
+                    k_bytes,
+                    mask=fill_rows[:, None],
+                )
+                tl.store(
+                    k_sc_ptr + cell * stride_ksc_blk + pid_kh * stride_ksc_h + k_scale_rows,
+                    k_scale_bytes,
+                    mask=fill_rows[:, None],
+                )
             k_deq = _dequant_nvfp4_rows(
-                tl.load(
-                    k_ptr
-                    + k_off
-                    + pid_kh * stride_k_h
-                    + off_n[:, None] * stride_k_pos
-                    + off_dp[None, :] * stride_k_d,
-                    mask=pos_mask[:, None],
-                    other=0,
-                ),
-                tl.load(
-                    k_sc_ptr
-                    + ksc_off
-                    + pid_kh * stride_ksc_h
-                    + off_n[:, None] * SCALE_COLS
-                    + off_s[None, :],
-                    mask=pos_mask[:, None],
-                    other=0,
-                ),
+                k_bytes,
+                k_scale_bytes,
                 BLOCK_N=BLOCK_SIZE_K,
                 D=BLOCK_SIZE_D,
                 SCALE_COLS=SCALE_COLS,
@@ -370,15 +492,19 @@ def _gqa_sparse_decode_kernel(
             )
             k = tl.trans(k_deq).to(q.dtype)
         else:
-            k = tl.load(
-                k_ptr
-                + k_off
-                + pid_kh * stride_k_h
-                + off_n[None, :] * stride_k_pos
-                + off_d[:, None] * stride_k_d,
+            k_cols = off_n[None, :] * stride_k_pos + off_d[:, None] * stride_k_d
+            k_raw = tl.load(
+                k_ptr + k_off + pid_kh * stride_k_h + k_cols,
                 mask=d_mask[:, None] & pos_mask[None, :],
                 other=0.0,
-            ).to(q.dtype)
+            )
+            if FILL_CELLS:
+                tl.store(
+                    k_ptr + cell * stride_k_blk + pid_kh * stride_k_h + k_cols,
+                    k_raw,
+                    mask=d_mask[:, None] & fill_rows[None, :],
+                )
+            k = k_raw.to(q.dtype)
             if USE_SCALE:
                 k = (k * kv_scale).to(q.dtype)
         qk = tl.where(pos_mask[None, :], 0.0, float("-inf"))
@@ -394,41 +520,51 @@ def _gqa_sparse_decode_kernel(
         if KV_NVFP4:
             # V block scales use vLLM's 4x4 token-quad order rather than K's
             # linear one: [token // 4, scale_col, token % 4].
+            v_rows = off_n[:, None] * stride_v_pos + off_dp[None, :] * stride_v_d
+            v_scale_rows = (
+                (off_n[:, None] // 4) * (4 * SCALE_COLS) + 4 * off_s[None, :] + (off_n[:, None] % 4)
+            )
+            v_bytes = tl.load(
+                v_ptr + v_off + pid_kh * stride_v_h + v_rows, mask=pos_mask[:, None], other=0
+            )
+            v_scale_bytes = tl.load(
+                v_sc_ptr + vsc_off + pid_kh * stride_vsc_h + v_scale_rows,
+                mask=pos_mask[:, None],
+                other=0,
+            )
+            if FILL_CELLS:
+                tl.store(
+                    v_ptr + cell * stride_v_blk + pid_kh * stride_v_h + v_rows,
+                    v_bytes,
+                    mask=fill_rows[:, None],
+                )
+                tl.store(
+                    v_sc_ptr + cell * stride_vsc_blk + pid_kh * stride_vsc_h + v_scale_rows,
+                    v_scale_bytes,
+                    mask=fill_rows[:, None],
+                )
             v = _dequant_nvfp4_rows(
-                tl.load(
-                    v_ptr
-                    + v_off
-                    + pid_kh * stride_v_h
-                    + off_n[:, None] * stride_v_pos
-                    + off_dp[None, :] * stride_v_d,
-                    mask=pos_mask[:, None],
-                    other=0,
-                ),
-                tl.load(
-                    v_sc_ptr
-                    + vsc_off
-                    + pid_kh * stride_vsc_h
-                    + (off_n[:, None] // 4) * (4 * SCALE_COLS)
-                    + 4 * off_s[None, :]
-                    + (off_n[:, None] % 4),
-                    mask=pos_mask[:, None],
-                    other=0,
-                ),
+                v_bytes,
+                v_scale_bytes,
                 BLOCK_N=BLOCK_SIZE_K,
                 D=BLOCK_SIZE_D,
                 SCALE_COLS=SCALE_COLS,
                 SF_VEC=BLOCK_SIZE_D // SCALE_COLS,
             ).to(q.dtype)
         else:
-            v = tl.load(
-                v_ptr
-                + v_off
-                + pid_kh * stride_v_h
-                + off_n[:, None] * stride_v_pos
-                + off_d[None, :] * stride_v_d,
+            v_cols = off_n[:, None] * stride_v_pos + off_d[None, :] * stride_v_d
+            v_raw = tl.load(
+                v_ptr + v_off + pid_kh * stride_v_h + v_cols,
                 mask=pos_mask[:, None] & d_mask[None, :],
                 other=0.0,
-            ).to(q.dtype)
+            )
+            if FILL_CELLS:
+                tl.store(
+                    v_ptr + cell * stride_v_blk + pid_kh * stride_v_h + v_cols,
+                    v_raw,
+                    mask=fill_rows[:, None] & d_mask[None, :],
+                )
+            v = v_raw.to(q.dtype)
             if USE_SCALE:
                 v = (v * kv_scale).to(q.dtype)
         acc_o += tl.dot(p.to(v.dtype), v)
@@ -437,6 +573,40 @@ def _gqa_sparse_decode_kernel(
         else:
             lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
         m_i = m_ij
+        if FILL_CELLS:
+            if page < -1:
+                _fill_other_heads(
+                    k_ptr,
+                    v_ptr,
+                    k_sc_ptr,
+                    v_sc_ptr,
+                    k_off,
+                    v_off,
+                    ksc_off,
+                    vsc_off,
+                    cell,
+                    pid_kh,
+                    num_kv_heads,
+                    stride_k_blk,
+                    stride_k_h,
+                    stride_k_pos,
+                    stride_k_d,
+                    stride_v_blk,
+                    stride_v_h,
+                    stride_v_pos,
+                    stride_v_d,
+                    stride_ksc_blk,
+                    stride_ksc_h,
+                    stride_vsc_blk,
+                    stride_vsc_h,
+                    off_n,
+                    off_n < BLOCK_SIZE_K,
+                    fill_cols,
+                    fill_col_mask,
+                    off_s if KV_NVFP4 else off_n,
+                    KV_NVFP4=KV_NVFP4,
+                    SCALE_COLS=SCALE_COLS,
+                )
 
     # An empty chunk of an active row must store zero, or the merge hits 0 * NaN.
     if USE_LINEAR_SOFTMAX:
@@ -528,6 +698,8 @@ def _gqa_sparse_decode_pair_kernel(
     host_vsc_off,
     host_stride,  # elements between host K/V pages
     host_sc_stride,  # elements between host block-scale pages
+    cell_table_ptr,  # unused: the pair path never fills cells
+    num_kv_heads,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
@@ -543,7 +715,9 @@ def _gqa_sparse_decode_pair_kernel(
     SCALE_COLS: tl.constexpr,  # head_dim // NVFP4_SF_VEC_SIZE, NVFP4 only
     DIRECT_OUTPUT: tl.constexpr,  # one chunk needs neither FP32 scratch nor a merge
     HOST_READS: tl.constexpr,  # block-table entries below -1 name host pages
+    FILL_CELLS: tl.constexpr,  # must be False: offload decodes one query per request
 ):
+    tl.static_assert(not FILL_CELLS, "The pair path does not fill arena cells")
     sm_scale_log2e = sm_scale * 1.4426950409
     if KV_NVFP4:
         # Both per-tensor dequant scales factor out of the inner loop: QK is
@@ -1109,6 +1283,7 @@ def minimax_m3_sparse_attn_decode(
     v_global_scale: Optional[torch.Tensor] = None,
     num_topk_chunks: Optional[int] = None,
     host_pages: Optional[HostKVPages] = None,
+    cell_table: Optional[torch.Tensor] = None,  # [num_reqs, max_blocks], like block_table
 ) -> None:
     """Block-sparse GQA decode attention, written into output in place.
 
@@ -1132,6 +1307,11 @@ def minimax_m3_sparse_attn_decode(
     below -1 is read from the host page it encodes (see HostKVPages), in place,
     through the GPU's mapping of that memory. Without it, every entry the kernel
     reads must be a page of the views.
+
+    cell_table comes with host_pages and names the arena page each host entry's
+    block was admitted to, at the host entry's position. The kernel stores every
+    host page it reads there, all KV heads of it, so the block needs no separate
+    copy into the arena. Host reads require one query per request.
     """
     total_q, num_heads, head_dim = q.shape
     num_kv_heads = int(k_paged.shape[1])
@@ -1297,6 +1477,16 @@ def minimax_m3_sparse_attn_decode(
             f"query group {query_group_size} must divide total_q={total_q} and "
             f"decode_query_len={decode_query_len}."
         )
+    fill_cells = cell_table is not None
+    if (host_pages is None) != (cell_table is None):
+        # A fetch with host reads admits every block it names on the host to a cell that
+        # nothing but this kernel fills.
+        raise ValueError("host_pages and cell_table go together")
+    if fill_cells:
+        if decode_query_len != 1 or query_group_size != 1:
+            raise ValueError("Filling arena cells in attention requires one query per request")
+        if cell_table.shape != block_table.shape or cell_table.stride() != block_table.stride():
+            raise ValueError("cell_table must have block_table's shape and strides")
 
     producer_kernel = (
         _gqa_sparse_decode_pair_kernel if query_group_size == 2 else _gqa_sparse_decode_kernel
@@ -1351,6 +1541,8 @@ def minimax_m3_sparse_attn_decode(
         *lse_strides,
         block_table.stride(0),
         *host_args,
+        cell_table if fill_cells else block_table,
+        num_kv_heads,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         NUM_TOPK_CHUNKS=num_topk_chunks,
         USE_SCALE=use_scale,
@@ -1362,6 +1554,7 @@ def minimax_m3_sparse_attn_decode(
         SCALE_COLS=scale_cols,
         DIRECT_OUTPUT=direct_output,
         HOST_READS=host_pages is not None,
+        FILL_CELLS=fill_cells,
         **pair_kernel_options,
         **pdl_launch,
         **launch_options,

@@ -235,8 +235,10 @@ class MiniMaxM3SparseOffloadMixin(SparseOffloadCacheMixin):
         if not shared:
             return 0
         # Deduplicated per-head selections, write slots, request IDs, unit lengths,
-        # and the logical-block to arena-page table, for eager and graph metadata.
+        # and the logical-block to arena-page table, plus its cell table with host
+        # reads, for eager and graph metadata.
+        tables = 2 if self._sparse_host_reads else 1
         entries = self.max_batch_size * (
-            self._sparse_offload_topk + 3 + self._get_max_blocks_per_seq(self.max_seq_len)
+            self._sparse_offload_topk + 3 + tables * self._get_max_blocks_per_seq(self.max_seq_len)
         )
         return shared + SPARSE_OFFLOAD_STATE_COPIES * entries * torch.int32.itemsize
