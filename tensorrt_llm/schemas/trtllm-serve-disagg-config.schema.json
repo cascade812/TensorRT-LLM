@@ -1746,6 +1746,9 @@
                   "gpu_cache_factor": {
                     "const": 2.0
                   },
+                  "host_history_memory": {
+                    "const": "pinned"
+                  },
                   "host_history_size": {
                     "const": null
                   }
@@ -1942,6 +1945,9 @@
                 "properties": {
                   "gpu_cache_factor": {
                     "const": 2.0
+                  },
+                  "host_history_memory": {
+                    "const": "pinned"
                   },
                   "host_history_size": {
                     "const": null
@@ -7025,6 +7031,9 @@
                   "gpu_cache_factor": {
                     "const": 2.0
                   },
+                  "host_history_memory": {
+                    "const": "pinned"
+                  },
                   "host_history_size": {
                     "const": null
                   }
@@ -10078,6 +10087,17 @@
           "status": "prototype",
           "title": "Gpu Cache Factor",
           "type": "number"
+        },
+        "host_history_memory": {
+          "default": "pinned",
+          "description": "Kind of host memory that holds the offloaded attention history. 'pinned' is page-locked host memory. 'managed' is CUDA managed (unified) memory kept in host memory: the GPU reads and writes it in place through its own mapping, without page faults, and the driver does not migrate it into GPU memory. Either kind counts against host_history_size.",
+          "enum": [
+            "pinned",
+            "managed"
+          ],
+          "status": "prototype",
+          "title": "Host History Memory",
+          "type": "string"
         },
         "host_history_size": {
           "anyOf": [

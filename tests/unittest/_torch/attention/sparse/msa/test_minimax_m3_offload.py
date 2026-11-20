@@ -62,6 +62,7 @@ def _manager(
     *,
     offload: bool = True,
     block_reuse: bool = False,
+    host_memory: str = "pinned",
 ) -> MiniMaxM3KVCacheManagerV2:
     return MiniMaxM3KVCacheManagerV2(
         kv_cache_config=KvCacheConfig(
@@ -81,7 +82,11 @@ def _manager(
             implementation="msa",
             indexer_kv_dtype="fp8",
             enable_kv_cache_offload=offload,
-            kv_cache_offload_config={"gpu_cache_factor": 1.0, "host_history_size": 512 << 20}
+            kv_cache_offload_config={
+                "gpu_cache_factor": 1.0,
+                "host_history_size": 512 << 20,
+                "host_history_memory": host_memory,
+            }
             if offload
             else {},
         ),
@@ -375,18 +380,20 @@ def test_m3_offload_reuses_received_prompt(dtype, heads, shorter_prefix):
 
 
 @pytest.mark.parametrize(
-    "dtype,heads,graph",
+    "dtype,heads,graph,host_memory",
     [
-        (DataType.BF16, 2, False),
-        (DataType.HALF, 1, False),
-        (DataType.FP8, 1, False),
-        (DataType.FP8, 4, True),
-        (DataType.NVFP4, 1, False),
-        (DataType.NVFP4, 2, True),
+        (DataType.BF16, 2, False, "pinned"),
+        (DataType.HALF, 1, False, "pinned"),
+        (DataType.FP8, 1, False, "pinned"),
+        (DataType.FP8, 4, True, "pinned"),
+        (DataType.NVFP4, 1, False, "pinned"),
+        (DataType.NVFP4, 2, True, "pinned"),
+        (DataType.FP8, 1, False, "managed"),
+        (DataType.NVFP4, 2, True, "managed"),
     ],
 )
 def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseating(
-    dtype: DataType, heads: int, graph: bool, monkeypatch: pytest.MonkeyPatch
+    dtype: DataType, heads: int, graph: bool, host_memory: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Bitwise data/scale and attention parity, including replay with changing batch rows.
 
@@ -398,7 +405,7 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
     history_blocks = 2 * TOPK * heads + 7
     max_blocks = history_blocks + 4
     max_seq_len = max_blocks * PAGE
-    manager = _manager(dtype, heads, max_seq_len)
+    manager = _manager(dtype, heads, max_seq_len, host_memory=host_memory)
     generator = torch.Generator(device="cuda").manual_seed(437)
     nvfp4 = dtype == DataType.NVFP4
     requests = [

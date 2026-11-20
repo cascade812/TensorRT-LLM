@@ -498,7 +498,8 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         gpuGranularity, _secondaryBudget(sparsePools, hostMemSizeGranularity(), mHostSparsePoolQuota), mFixedSlots,
         mNumLocalityDomains);
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
-        gpuSlotCounts, mGpuPhysMemAllocator.get(), HostMemBackingOptions{}, mHostSparsePoolQuota);
+        gpuSlotCounts, mGpuPhysMemAllocator.get(), HostMemBackingOptions{.managed = config.hostSparsePoolManaged},
+        mHostSparsePoolQuota);
     for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(); ++pgIdx)
     {
         if (mFixedSlots[pgIdx])

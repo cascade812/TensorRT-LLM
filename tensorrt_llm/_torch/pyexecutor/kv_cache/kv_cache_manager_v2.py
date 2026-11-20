@@ -5184,6 +5184,11 @@ class KVCacheManagerV2(BaseResourceManager):
             # host-backed pools inside it rather than being handed a quota already lowered.
             # It splits both by the decode-only typical step, host-backed pools included.
             config = replace(config, host_sparse_pool_quota=self._host_history_budget)
+        if self._sparse_kv_offload is not None:
+            config = replace(
+                config,
+                host_sparse_pool_managed=self._sparse_kv_offload.host_history_memory == "managed",
+            )
         return config
 
     def _get_offload_sizing_config(

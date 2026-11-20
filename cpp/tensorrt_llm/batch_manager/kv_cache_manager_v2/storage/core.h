@@ -459,6 +459,62 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// ManagedSlotPool — CUDA managed memory kept in host memory.
+// ---------------------------------------------------------------------------
+//! A host-backed pool of a GPU tier whose pages are CUDA managed memory instead of pinned
+//! host memory.
+//!
+//! The whole reservation is one managed allocation, so the base address is fixed as it is
+//! for HostSlotPool. The range prefers the host NUMA node the GPU attaches to and is advised
+//! as accessed by the GPU: the GPU reads and writes the host-resident pages in place through
+//! its own mapping, without page faults, and the driver does not migrate them into device
+//! memory. Kernels address a slot exactly as they address a pinned one.
+//!
+//! Slots are placed on that node when they are created, by a prefetch that also populates
+//! them, so a slot is usable as soon as the constructor or resize() returns. A shrink only
+//! lowers the slot count: part of a managed allocation cannot be released.
+class ManagedSlotPool : public SlotPoolBase
+{
+public:
+    //! vmSize is the reservation, as for HostSlotPool. `options.numaNode` overrides the node
+    //! the pages prefer; `options.allowRemoteNumaFallback` is not consulted, since a managed
+    //! range has no memory policy to make strict.
+    ManagedSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, HostMemBackingOptions const& options);
+    ~ManagedSlotPool() override;
+
+    ManagedSlotPool(ManagedSlotPool const&) = delete;
+    ManagedSlotPool& operator=(ManagedSlotPool const&) = delete;
+
+    SlotCount numSlots() const noexcept override;
+    void destroy() override;
+    void resize(SlotCount newNumSlots) override;
+    Address slotAddress(SlotId slot) const override;
+
+    [[nodiscard]] size_t sizeGranularity() const noexcept override
+    {
+        return mUnit;
+    }
+
+    [[nodiscard]] CacheTier medium() const noexcept override
+    {
+        return CacheTier::HOST_MEM;
+    }
+
+private:
+    //! Populate [begin, end) of the reservation on the preferred host location.
+    void _place(size_t begin, size_t end);
+
+    size_t mUnit;
+    size_t mReserved = 0;
+    //! Bytes the slot count covers.
+    size_t mBytes = 0;
+    //! Bytes populated so far, from the base: the high-water mark of mBytes.
+    size_t mPlaced = 0;
+    CUdeviceptr mBase = 0;
+    CUmemLocation mHost{};
+};
+
+// ---------------------------------------------------------------------------
 // DiskSlotPool — temp-file backed disk pool.
 // ---------------------------------------------------------------------------
 class DiskSlotPool : public SlotPoolBase
@@ -735,7 +791,8 @@ public:
     //! mixed group needs no second tier.
     //!
     //! `hostOptions` backs the sparse pools. One object for the whole level, so every
-    //! host-backed pool commits in the same unit.
+    //! host-backed pool commits in the same unit. With `hostOptions.managed` they are
+    //! ManagedSlotPools rather than pinned HostSlotPools.
     //!
     //! `sparseReservation`, when given, caps the host address space each sparse pool
     //! reserves; a pool never reserves less than its initial slots. Unset reserves for the

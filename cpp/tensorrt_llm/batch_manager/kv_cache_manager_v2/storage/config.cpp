@@ -232,6 +232,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     StorageConfig out;
     out.cacheTiers = TypedVec<CacheLevel, CacheTierConfig>{config.cacheTiers};
     out.hostSparsePoolQuota = config.hostSparsePoolQuota;
+    out.hostSparsePoolManaged = config.hostSparsePoolManaged;
     out.hostMemBacking = config.hostMemBacking;
     out.expansion = expansionMap;
 

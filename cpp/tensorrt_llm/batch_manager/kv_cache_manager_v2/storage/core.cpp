@@ -21,6 +21,8 @@
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/runtime/moeLoadBalancer/topologyDetector.h"
 #include <algorithm>
 #include <cerrno>
 #include <climits>
@@ -547,6 +549,150 @@ Address HostSlotPool::slotAddress(SlotId slot) const
 }
 
 // ---------------------------------------------------------------------------
+// ManagedSlotPool
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+CUresult adviseManaged(CUdeviceptr ptr, size_t bytes, CUmem_advise advice, CUmemLocation location)
+{
+#if CUDA_VERSION >= 13000
+    return cuMemAdvise(ptr, bytes, advice, location);
+#else
+    return cuMemAdvise_v2(ptr, bytes, advice, location);
+#endif
+}
+
+CUresult prefetchManaged(CUdeviceptr ptr, size_t bytes, CUmemLocation location, CUstream stream)
+{
+#if CUDA_VERSION >= 13000
+    return cuMemPrefetchAsync(ptr, bytes, location, 0, stream);
+#else
+    return cuMemPrefetchAsync_v2(ptr, bytes, location, 0, stream);
+#endif
+}
+
+} // namespace
+
+ManagedSlotPool::ManagedSlotPool(
+    size_t slotSize, SlotCount numSlots, size_t vmSize, HostMemBackingOptions const& options)
+    : SlotPoolBase(slotSize)
+    , mUnit(hostMemSizeGranularity())
+{
+    mBytes = roundUp(slotCountToSizeT(numSlots) * slotSize, mUnit);
+    mReserved = std::max(roundUp(vmSize, mUnit), mBytes);
+    CUdevice device{};
+    cuCheck(cuCtxGetDevice(&device));
+    cuCheck(cuMemAllocManaged(&mBase, mReserved, CU_MEM_ATTACH_GLOBAL));
+    try
+    {
+        // The pages stay in host memory: a host preference also keeps the driver's access
+        // counters from migrating them into device memory, which would take device memory
+        // the tier's quota does not count. The GPU then reaches them through a mapping the
+        // accessed-by advice keeps in place, rather than by faulting.
+        int const node = options.numaNode.value_or(runtime::TopologyDetector::getInstance().getCurrentGpuNumaId());
+        mHost.type = node >= 0 ? CU_MEM_LOCATION_TYPE_HOST_NUMA : CU_MEM_LOCATION_TYPE_HOST;
+        mHost.id = node >= 0 ? node : 0;
+        if (node >= 0 && adviseManaged(mBase, mReserved, CU_MEM_ADVISE_SET_PREFERRED_LOCATION, mHost) != CUDA_SUCCESS)
+        {
+            TLLM_LOG_WARNING(
+                "KVCM2 managed pool: the driver rejects host NUMA node %d as a preferred location; preferring host "
+                "memory without a node",
+                node);
+            mHost.type = CU_MEM_LOCATION_TYPE_HOST;
+            mHost.id = 0;
+        }
+        if (mHost.type == CU_MEM_LOCATION_TYPE_HOST)
+        {
+            cuCheck(adviseManaged(mBase, mReserved, CU_MEM_ADVISE_SET_PREFERRED_LOCATION, mHost));
+        }
+        CUmemLocation gpu{};
+        gpu.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        gpu.id = static_cast<int>(device);
+        cuCheck(adviseManaged(mBase, mReserved, CU_MEM_ADVISE_SET_ACCESSED_BY, gpu));
+        _place(0, mBytes);
+    }
+    catch (...)
+    {
+        cuMemFree(mBase);
+        mBase = 0;
+        throw;
+    }
+    TLLM_LOG_INFO("KVCM2 managed pool: %zu of %zu reserved bytes placed in host memory, NUMA node %d", mBytes,
+        mReserved, mHost.type == CU_MEM_LOCATION_TYPE_HOST_NUMA ? mHost.id : -1);
+}
+
+ManagedSlotPool::~ManagedSlotPool()
+{
+    if (mBase != 0)
+    {
+        cuMemFree(mBase);
+    }
+}
+
+void ManagedSlotPool::_place(size_t begin, size_t end)
+{
+    if (end <= begin)
+    {
+        return;
+    }
+    // A stream of its own, so the prefetch neither waits for nor holds up work the caller
+    // has queued elsewhere. Prefetching never-touched pages to host memory is what creates
+    // them, on the preferred node.
+    CUstream stream{};
+    cuCheck(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
+    CUresult result = prefetchManaged(mBase + begin, end - begin, mHost, stream);
+    if (result == CUDA_SUCCESS)
+    {
+        result = cuStreamSynchronize(stream);
+    }
+    cuStreamDestroy(stream);
+    if (result != CUDA_SUCCESS)
+    {
+        throw HostOOMError("ManagedSlotPool: placing " + std::to_string(end - begin)
+            + " bytes in host memory failed with CUDA error " + std::to_string(static_cast<int>(result)));
+    }
+    mPlaced = std::max(mPlaced, end);
+}
+
+SlotCount ManagedSlotPool::numSlots() const noexcept
+{
+    return slotCountValueFromSize(mBytes / mSlotSize);
+}
+
+void ManagedSlotPool::destroy()
+{
+    if (mBase != 0)
+    {
+        cuCheck(cuMemFree(mBase));
+        mBase = 0;
+    }
+    mBytes = 0;
+    mPlaced = 0;
+}
+
+void ManagedSlotPool::resize(SlotCount newNumSlots)
+{
+    size_t const bytes = roundUp(slotCountToSizeT(newNumSlots) * mSlotSize, mUnit);
+    if (bytes > mReserved)
+    {
+        throw HostOOMError("ManagedSlotPool: resize to " + std::to_string(bytes) + " bytes exceeds the reservation of "
+            + std::to_string(mReserved) + " bytes");
+    }
+    // Only bytes never placed need placing: a shrink keeps its pages, so regrowing over
+    // them is free.
+    _place(mPlaced, bytes);
+    mBytes = bytes;
+}
+
+Address ManagedSlotPool::slotAddress(SlotId slot) const
+{
+    TLLM_CHECK_DEBUG_WITH_INFO(isValidSlotId(slot), "ManagedSlotPool::slotAddress: slot index out of bounds");
+    return MemAddress(mBase + mSlotSize * toSizeT(slot));
+}
+
+// ---------------------------------------------------------------------------
 // DiskSlotPool
 // ---------------------------------------------------------------------------
 
@@ -874,6 +1020,11 @@ GpuPoolGroup::GpuPoolGroup(TypedVec<LocalityDomainId, SlotCount> const& numSlots
                 // which is large, long-lived and read in bulk.
                 HostMemBackingOptions sparseOptions = hostOptions;
                 sparseOptions.useThp = true;
+                if (hostOptions.managed)
+                {
+                    mPools.push_back(std::make_unique<ManagedSlotPool>(sz, initialSlots, vmSize, sparseOptions));
+                    continue;
+                }
                 mPools.push_back(std::make_unique<HostSlotPool>(sz, initialSlots, vmSize, sparseOptions));
                 continue;
             }

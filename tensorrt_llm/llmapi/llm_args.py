@@ -1061,6 +1061,16 @@ class SparseKvCacheOffloadConfig(StrictBaseModel):
         "GPU KV cache pools, so they pin only what the GPU quota's slots pair "
         "with. When unset, the automatic host tier takes the host memory they "
         "leave, up to the GPU KV cache quota.")
+    host_history_memory: Literal["pinned", "managed"] = Field(
+        default="pinned",
+        status="prototype",
+        description=
+        "Kind of host memory that holds the offloaded attention history. "
+        "'pinned' is page-locked host memory. 'managed' is CUDA managed "
+        "(unified) memory kept in host memory: the GPU reads and writes it in "
+        "place through its own mapping, without page faults, and the driver "
+        "does not migrate it into GPU memory. Either kind counts against "
+        "host_history_size.")
 
 
 class BaseSparseAttentionConfig(StrictBaseModel):

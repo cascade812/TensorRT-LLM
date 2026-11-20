@@ -67,6 +67,11 @@ struct HostMemBackingOptions
     //! The NUMA node to place the pages on instead of the one the GPU attaches
     //! to. allowRemoteNumaFallback still decides the policy.
     std::optional<int> numaNode;
+
+    //! Whether the range is CUDA managed memory kept in host memory rather than pinned
+    //! host memory. Only a GPU tier's host-backed pools honor it (see ManagedSlotPool);
+    //! HostMemBacking itself always pins.
+    bool managed = false;
 };
 
 //! Physical backing for the host tier: an address range reserved on

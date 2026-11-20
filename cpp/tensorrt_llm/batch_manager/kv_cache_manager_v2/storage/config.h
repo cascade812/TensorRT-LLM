@@ -247,6 +247,9 @@ struct StorageConfig
     //! Host bytes the GPU tier's host-backed pools may take, or unset for unbounded.
     std::optional<size_t> hostSparsePoolQuota;
 
+    //! Whether the GPU tier's host-backed pools are CUDA managed memory rather than pinned.
+    bool hostSparsePoolManaged = false;
+
     HostMemBackingConfig hostMemBacking;
 
     // Expansion factor per buffer (for heterogeneous tokens_per_block).

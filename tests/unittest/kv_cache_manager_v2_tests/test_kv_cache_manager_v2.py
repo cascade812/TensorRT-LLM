@@ -4102,11 +4102,13 @@ class TestSparseDataPath(unittest.TestCase):
         chunks: int = 1,
         buffer_bytes: int | None = None,
         write_back_granularity: int = 1,
+        managed: bool = False,
     ) -> KVCacheManager:
         return KVCacheManager(
             KVCacheManagerConfig(
                 tokens_per_block=cls.TPB,
                 cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
+                host_sparse_pool_managed=managed,
                 constraints=[
                     BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=0)] * 2)
                 ],
@@ -4224,9 +4226,9 @@ class TestSparseDataPath(unittest.TestCase):
     def _pattern(size: int, seed: int) -> bytes:
         return bytes((i * seed + 13) % 251 for i in range(size))
 
-    def test_a_fetched_cell_holds_the_bytes_of_its_hot_page(self):
+    def test_a_fetched_cell_holds_the_bytes_of_its_hot_page(self, managed: bool = False):
         ctypes, cudart, torch = self._deps()
-        manager = self._manager()
+        manager = self._manager(managed=managed)
         cache = None
         try:
             lg = manager.get_layer_group_id(0)
@@ -4281,9 +4283,9 @@ class TestSparseDataPath(unittest.TestCase):
                 cache.close()
             manager.shutdown()
 
-    def test_a_flushed_cell_lands_in_its_hot_page(self):
+    def test_a_flushed_cell_lands_in_its_hot_page(self, managed: bool = False):
         ctypes, cudart, torch = self._deps()
-        manager = self._manager()
+        manager = self._manager(managed=managed)
         cache = None
         try:
             lg = manager.get_layer_group_id(0)
@@ -4341,6 +4343,28 @@ class TestSparseDataPath(unittest.TestCase):
             if cache is not None:
                 cache.close()
             manager.shutdown()
+
+    def test_managed_hot_pages_move_their_bytes_like_pinned_ones(self):
+        """Managed host-backed pools are managed memory that fetch and write-back reach in place.
+
+        The data path is the same as for pinned pages.
+        """
+        _, cudart, _ = self._deps()
+        for managed, expected in (
+            (False, cudart.cudaMemoryType.cudaMemoryTypeHost),
+            (True, cudart.cudaMemoryType.cudaMemoryTypeManaged),
+        ):
+            with self.subTest(managed=managed):
+                manager = self._manager(managed=managed)
+                try:
+                    pool = int(manager.get_mem_pool_base_address(LayerId(0), "key"))
+                    err, attributes = cudart.cudaPointerGetAttributes(pool)
+                    self.assertEqual(int(err), 0)
+                    self.assertEqual(attributes.type, expected)
+                finally:
+                    manager.shutdown()
+        self.test_a_fetched_cell_holds_the_bytes_of_its_hot_page(managed=True)
+        self.test_a_flushed_cell_lands_in_its_hot_page(managed=True)
 
 
 class TestSparseWriteIndices(unittest.TestCase):

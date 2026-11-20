@@ -617,6 +617,10 @@ class KVCacheManagerConfig:
     # Typical step that sizes the cold (host / disk) tiers' pool groups. None keeps the hot tier's
     # per-layer-group slot-count proportions at cold page sizes.
     cold_typical_step: BatchDesc | None = None
+    # Back the GPU tier's host-backed pools with CUDA managed memory kept in host memory instead
+    # of pinned host memory. The GPU reads and writes their pages in place through its own
+    # mapping, and the bytes count against host_sparse_pool_quota the same way.
+    host_sparse_pool_managed: bool = False
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

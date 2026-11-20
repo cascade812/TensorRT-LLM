@@ -1878,6 +1878,15 @@
       "path": "sparse_attention_config.kv_cache_offload_config.gpu_cache_factor"
     },
     {
+      "allowed_values": [
+        "pinned",
+        "managed"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "sparse_attention_config.kv_cache_offload_config.host_history_memory"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "sparse_attention_config.kv_cache_offload_config.host_history_size"

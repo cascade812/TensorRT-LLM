@@ -2027,7 +2027,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance,
                 kv::Priority coldTierOffloadMinPriority, std::optional<size_t> hostSparsePoolQuota,
                 std::vector<kv::RegionConfig> regions, kv::HostMemBackingConfig hostMemBacking,
-                std::optional<kv::BatchDesc> coldTypicalStep)
+                std::optional<kv::BatchDesc> coldTypicalStep, bool hostSparsePoolManaged)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -2054,6 +2054,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->poolRebalance = std::move(poolRebalance);
                 cfg->coldTierOffloadMinPriority = coldTierOffloadMinPriority;
                 cfg->hostSparsePoolQuota = hostSparsePoolQuota;
+                cfg->hostSparsePoolManaged = hostSparsePoolManaged;
                 cfg->regions = std::move(regions);
                 cfg->hostMemBacking = std::move(hostMemBacking);
                 cfg->coldTypicalStep = std::move(coldTypicalStep);
@@ -2072,7 +2073,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("host_sparse_pool_quota").none() = std::nullopt,
             nb::arg("regions") = std::vector<kv::RegionConfig>{},
             nb::arg("host_mem_backing") = kv::HostMemBackingConfig{},
-            nb::arg("cold_typical_step").none() = std::nullopt)
+            nb::arg("cold_typical_step").none() = std::nullopt, nb::arg("host_sparse_pool_managed") = false)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -2101,6 +2102,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "Kept exactly, as is the feasibility floor `constraints` implies; the ratio is what gives "
             "way between them. The two can only conflict if the floors alone exceed this budget, "
             "which construction rejects.")
+        .def_rw("host_sparse_pool_managed", &kv::KVCacheManagerConfig::hostSparsePoolManaged,
+            "Back the GPU tier's host-backed pools with CUDA managed memory kept in host memory instead "
+            "of pinned host memory. The GPU reads and writes their pages in place through its own "
+            "mapping, and the bytes count against host_sparse_pool_quota the same way.")
         .def_rw("initial_pool_ratio", &kv::KVCacheManagerConfig::initialPoolRatio,
             "One positive, normalized cache-tier quota weight per layer group.")
         .def_rw("swa_scratch_reuse", &kv::KVCacheManagerConfig::swaScratchReuse)

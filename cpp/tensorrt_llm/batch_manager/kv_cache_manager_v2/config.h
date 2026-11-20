@@ -757,6 +757,12 @@ struct KVCacheManagerConfig
     // budget, which construction rejects.
     std::optional<size_t> hostSparsePoolQuota;
 
+    // Back the GPU tier's host-backed pools with CUDA managed memory kept in host memory
+    // instead of pinned host memory. The GPU reads and writes their pages in place through
+    // its own mapping, as it does pinned pages, and the bytes count against
+    // hostSparsePoolQuota the same way. Default false.
+    bool hostSparsePoolManaged = false;
+
     // Publish a finalized partial block for reuse when committing stops.
     // Beam search disables this while retaining full-block reuse.
     bool enablePartialCommit = true;
