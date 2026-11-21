@@ -693,10 +693,49 @@ void ManagedSlotPool::resize(SlotCount newNumSlots)
         throw HostOOMError("ManagedSlotPool: resize to " + std::to_string(bytes) + " bytes exceeds the reservation of "
             + std::to_string(mReserved) + " bytes");
     }
-    // Only bytes never placed need placing: a shrink keeps its pages, so regrowing over
-    // them is free.
-    _place(mPlaced, bytes);
+    if (bytes < mPlaced)
+    {
+        // A shrink gives the pages past the new size back, as a pinned pool does; growing
+        // back places them again.
+        if (_discard(bytes, mPlaced))
+        {
+            mPlaced = bytes;
+        }
+    }
+    else
+    {
+        _place(mPlaced, bytes);
+    }
     mBytes = bytes;
+}
+
+bool ManagedSlotPool::_discard(size_t begin, size_t end)
+{
+#if CUDA_VERSION >= 12080
+    // Nothing may read or write a range while it is discarded, and the slots past the new
+    // size may still be named by work queued on other streams.
+    cuCheck(cuCtxSynchronize());
+    CUstream stream{};
+    cuCheck(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
+    CUdeviceptr ptr = mBase + begin;
+    size_t size = end - begin;
+    CUresult result = cuMemDiscardBatchAsync(&ptr, &size, 1, 0, stream);
+    if (result == CUDA_SUCCESS)
+    {
+        result = cuStreamSynchronize(stream);
+    }
+    cuStreamDestroy(stream);
+    if (result == CUDA_SUCCESS)
+    {
+        return true;
+    }
+    TLLM_LOG_WARNING("KVCM2 managed pool: discarding %zu bytes on shrink failed with CUDA error %d; keeping them",
+        end - begin, static_cast<int>(result));
+#else
+    (void) begin;
+    (void) end;
+#endif
+    return false;
 }
 
 Address ManagedSlotPool::slotAddress(SlotId slot) const

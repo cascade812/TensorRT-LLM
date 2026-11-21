@@ -4226,11 +4226,20 @@ class TestSparseDataPath(unittest.TestCase):
     def _pattern(size: int, seed: int) -> bytes:
         return bytes((i * seed + 13) % 251 for i in range(size))
 
-    def test_a_fetched_cell_holds_the_bytes_of_its_hot_page(self, managed: bool = False):
+    def test_a_fetched_cell_holds_the_bytes_of_its_hot_page(
+        self, managed: bool = False, shrink_first: bool = False
+    ):
         ctypes, cudart, torch = self._deps()
         manager = self._manager(managed=managed)
         cache = None
         try:
+            if shrink_first:
+                # A shrink gives the host pages past the new size back; growing back places
+                # them again, and the data path must not tell the difference.
+                quota = manager.get_quota(GPU_LEVEL)
+                self.assertTrue(manager.resize(GPU_LEVEL, quota // 4))
+                self.assertLess(manager.get_quota(GPU_LEVEL), quota)
+                self.assertTrue(manager.resize(GPU_LEVEL, quota))
             lg = manager.get_layer_group_id(0)
             pool = int(manager.get_mem_pool_base_address(LayerId(0), "key"))
             stride = manager.get_page_stride(LayerId(0), "key")
@@ -4283,11 +4292,17 @@ class TestSparseDataPath(unittest.TestCase):
                 cache.close()
             manager.shutdown()
 
-    def test_a_flushed_cell_lands_in_its_hot_page(self, managed: bool = False):
+    def test_a_flushed_cell_lands_in_its_hot_page(
+        self, managed: bool = False, shrink_first: bool = False
+    ):
         ctypes, cudart, torch = self._deps()
         manager = self._manager(managed=managed)
         cache = None
         try:
+            if shrink_first:
+                quota = manager.get_quota(GPU_LEVEL)
+                self.assertTrue(manager.resize(GPU_LEVEL, quota // 4))
+                self.assertTrue(manager.resize(GPU_LEVEL, quota))
             lg = manager.get_layer_group_id(0)
             pool = int(manager.get_mem_pool_base_address(LayerId(0), "key"))
             stride = manager.get_page_stride(LayerId(0), "key")
@@ -4448,6 +4463,15 @@ class TestSparseDataPath(unittest.TestCase):
                     manager.shutdown()
         self.test_a_fetched_cell_holds_the_bytes_of_its_hot_page(managed=True)
         self.test_a_flushed_cell_lands_in_its_hot_page(managed=True)
+
+    def test_a_managed_pool_that_shrank_and_grew_back_moves_bytes_like_before(self):
+        """Shrinking discards the managed host pages past the new size; regrowth places them."""
+        for managed in (False, True):
+            with self.subTest(managed=managed):
+                self.test_a_fetched_cell_holds_the_bytes_of_its_hot_page(
+                    managed=managed, shrink_first=True
+                )
+                self.test_a_flushed_cell_lands_in_its_hot_page(managed=managed, shrink_first=True)
 
 
 class TestSparseWriteIndices(unittest.TestCase):

@@ -503,12 +503,15 @@ public:
 private:
     //! Populate [begin, end) of the reservation on the preferred host location.
     void _place(size_t begin, size_t end);
+    //! Give [begin, end) back to the driver, which may reclaim its pages; placing it again
+    //! makes it usable. Returns false, keeping the pages, where the driver cannot discard.
+    bool _discard(size_t begin, size_t end);
 
     size_t mUnit;
     size_t mReserved = 0;
     //! Bytes the slot count covers.
     size_t mBytes = 0;
-    //! Bytes populated so far, from the base: the high-water mark of mBytes.
+    //! Bytes populated, from the base: mBytes, or more when a shrink could not discard.
     size_t mPlaced = 0;
     CUdeviceptr mBase = 0;
     CUmemLocation mHost{};
