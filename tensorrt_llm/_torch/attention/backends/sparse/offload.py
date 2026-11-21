@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Collection, Iterable
+from typing import TYPE_CHECKING, Callable, Collection, Iterable, NamedTuple
 
 import torch
 
@@ -166,7 +166,10 @@ class SparseOffloadState:
 
     ``fetched_cells`` mirrors ``fetched_indices`` with every entry's arena index,
     host entries included, for a manager with host reads: the reader of a unit
-    in host memory stores it there. It is empty otherwise.
+    in host memory stores it there. It is empty otherwise. ``fill_rows`` is int32
+    [B, K] scratch, by query, for readers that merge those cells as they merge
+    their indices (``offload_kernels.merge_sparse_arena_indices``); None without
+    host reads.
     """
 
     layers: dict[int, SparseOffloadLayerDescriptor]
@@ -188,6 +191,7 @@ class SparseOffloadState:
     prepared: bool = False
     write_layer: int | None = None
     fetched_cells: dict[int, torch.Tensor] = field(default_factory=dict)
+    fill_rows: torch.Tensor | None = None
 
     @staticmethod
     def device_bytes(
@@ -217,6 +221,7 @@ class SparseOffloadState:
         index_entries += sum(max_batch_size * count * (topk + 1) for count in buffer_counts)
         if host_reads:
             index_entries += sum(max_batch_size * count * topk for count in buffer_counts)
+            index_entries += max_batch_size * topk
         nvfp4_bytes = 0
         if nvfp4_head_dim is not None:
             nvfp4_rows = max_batch_size * topk + NVFP4_SCRATCH_TAIL_ROWS
@@ -287,6 +292,9 @@ def allocate_sparse_offload_state(
         }
         if host_reads
         else {},
+        fill_rows=index_tensor("fill_rows", (max_batch_size, topk), BAD_PAGE_INDEX)
+        if host_reads
+        else None,
     )
 
 
@@ -335,6 +343,22 @@ class _SparseArenaLayout:
     max_leases: int
 
 
+class SparseHostRows(NamedTuple):
+    """Where a reader finds a layer's units in host memory, for a row-per-unit layout.
+
+    A fetched index ``i < -1`` names host row ``u = -2 - i``: its data at
+    ``data + (u // rows_per_page) * data_page_stride + (u % rows_per_page)`` data
+    row bytes, and its block scales likewise from ``scales`` (0 without them).
+    Strides are bytes.
+    """
+
+    data: int
+    scales: int
+    data_page_stride: int
+    scale_page_stride: int
+    rows_per_page: int
+
+
 @dataclass(slots=True)
 class _SparseBatchMember:
     """A request seated in the native Batch."""
@@ -381,6 +405,7 @@ class SparseOffloadCacheMixin:
         self._sparse_offload_topk = topk
         self._sparse_batch = None
         self._sparse_batch_members: dict[int, _SparseBatchMember] = {}
+        self._sparse_host_rows: dict[int, SparseHostRows] = {}
         self._sparse_batch_prepared = False
 
     def _sparse_offload_nvfp4_head_dim(self) -> int | None:
@@ -1205,6 +1230,56 @@ class SparseOffloadCacheMixin:
                     stream=stream,
                 )
         return out
+
+    def sparse_host_rows(self, descriptor: SparseOffloadLayerDescriptor) -> SparseHostRows | None:
+        """Where a layer's data and block-scale units are in host memory, or None without host reads.
+
+        A fetch with host reads names a selected unit missing from the GPU cache by its
+        row in the data buffer's host pages: the page's converted index in that buffer's
+        table and the unit's row in the page. The block scales must share that table's
+        converted indices, under their own base and stride.
+        """
+        if not self._sparse_host_reads:
+            return None
+        data_id = descriptor.buffer_ids[descriptor.data_buffer_index]
+        rows = self._sparse_host_rows.get(int(data_id.layer_id))
+        if rows is not None:
+            return rows
+        batch = self._ensure_sparse_batch()
+        specs = self.impl.sparse_index_table_specs()
+
+        def spec_of(buffer) -> tuple[object, int]:
+            for spec in specs:
+                buffers = list(spec.buffers)
+                if buffer in buffers:
+                    return spec, buffers.index(buffer)
+            raise ValueError(f"Sparse buffer {buffer} has no index table spec")
+
+        data_spec, data_entry = spec_of(data_id)
+        if data_entry != 0:
+            raise ValueError("Sparse host reads require the data buffer first in its table spec")
+        data_base, data_stride = batch.pool_spec_for(data_spec)
+        scales = scale_stride = 0
+        if descriptor.scale_buffer_index is not None:
+            scale_spec, scale_entry = spec_of(descriptor.buffer_ids[descriptor.scale_buffer_index])
+            if (
+                batch.index_table_id(scale_spec) != batch.index_table_id(data_spec)
+                or scale_entry != data_entry
+            ):
+                raise ValueError(
+                    "Sparse host reads require the block scales to share the data's converted "
+                    "page indices"
+                )
+            scales, scale_stride = batch.pool_spec_for(scale_spec)
+        rows = SparseHostRows(
+            data=int(data_base),
+            scales=int(scales),
+            data_page_stride=int(data_stride),
+            scale_page_stride=int(scale_stride),
+            rows_per_page=self.impl.get_sparse_cache_units_per_page(data_id.layer_id),
+        )
+        self._sparse_host_rows[int(data_id.layer_id)] = rows
+        return rows
 
     @property
     def sparse_host_reads(self) -> bool:

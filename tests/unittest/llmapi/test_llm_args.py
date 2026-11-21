@@ -6252,20 +6252,29 @@ class TestDeepSeekV4SparseAttentionConfig:
             DeepSeekV4SparseAttentionConfig(
                 kv_cache_offload_config={field: value})
 
-    def test_minimax_m3_and_dsa_read_misses_from_host(self):
+    def test_offloading_configs_read_misses_from_host(self):
         offload = {"read_misses_from_host": True}
-        with pytest.raises(ValidationError,
-                           match="does not support .*read_misses_from_host"):
-            DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True,
-                                            kv_cache_offload_config=offload)
         for config in (llm_args_mod.MiniMaxM3SparseAttentionConfig(
                 implementation="msa",
                 enable_kv_cache_offload=True,
                 kv_cache_offload_config=offload),
                        llm_args_mod.DeepSeekSparseAttentionConfig(
                            enable_kv_cache_offload=True,
+                           kv_cache_offload_config=offload),
+                       DeepSeekV4SparseAttentionConfig(
+                           enable_kv_cache_offload=True,
                            kv_cache_offload_config=offload)):
             assert config.get_kv_cache_offload_config().read_misses_from_host
+
+    def test_read_misses_from_host_needs_backend_support(self):
+
+        class NoHostReads(llm_args_mod.DeepSeekSparseAttentionConfig):
+            supports_reading_misses_from_host: ClassVar[bool] = False
+
+        with pytest.raises(ValidationError,
+                           match="does not support .*read_misses_from_host"):
+            NoHostReads(enable_kv_cache_offload=True,
+                        kv_cache_offload_config={"read_misses_from_host": True})
 
     def test_only_offloading_configs_report_kv_cache_offload(self):
         assert llm_args_mod.DeepSeekSparseAttentionConfig(

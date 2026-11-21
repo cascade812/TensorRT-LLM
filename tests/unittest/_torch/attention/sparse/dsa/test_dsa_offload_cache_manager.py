@@ -572,7 +572,7 @@ def test_host_reads_name_host_rows_that_the_gather_stores_into_the_gpu_cache(
                         target,
                         unit_tokens=1,
                     )
-                host = manager.dsa_sparse_host_rows(layer)
+                host = manager.sparse_host_rows(descriptor)
                 for position, rid in enumerate(request_ids):
                     valid = topk[position] >= 0
                     units = topk[position][valid].tolist()

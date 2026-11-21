@@ -8,7 +8,7 @@ import math
 import os
 from collections import Counter
 from dataclasses import replace
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 
@@ -32,7 +32,6 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
-    BufferId,
     DataRole,
     PageIndexMode,
 )
@@ -47,21 +46,6 @@ from .params import DSAParams
 
 # A DSA selection names single tokens of the MLA latent.
 DSA_SPARSE_UNIT_TOKENS = 1
-
-
-class LatentHostRows(NamedTuple):
-    """Where the NVFP4 gather reads a layer's latent rows in host memory.
-
-    A fetched index ``i < -1`` names host row ``u = -2 - i``: its packed data at
-    ``data + (u // rows_per_page) * data_page_stride + (u % rows_per_page) * data
-    row bytes``, and its block scales likewise from ``scales``. Strides are bytes.
-    """
-
-    data: int
-    scales: int
-    data_page_stride: int
-    scale_page_stride: int
-    rows_per_page: int
 
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
@@ -524,7 +508,6 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
             topk=sparse_params.index_topk,
             host_reads=host_reads,
         )
-        self._dsa_host_rows: dict[int, LatentHostRows] = {}
         if sparse_kv_offload_config is not None:
             self._check_dsa_offload_support(dtype)
 
@@ -990,54 +973,6 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
         """Return a layer's NVFP4 latent data and block-scale arena views, indexed by arena row."""
         return self._sparse_latent_nvfp4_arenas[layer_idx]
 
-    def dsa_sparse_host_rows(self, layer_idx: int) -> Optional[LatentHostRows]:
-        """Where the gather reads this layer's latent rows in host memory, or None without host reads.
-
-        A fetch with host reads names a selected token that is not in the GPU cache by
-        its row in the latent's host pages: the converted page index of the data
-        buffer's table and the token's row in that page. The block scales share that
-        table's converted indices under their own base and stride.
-        """
-        if not self._sparse_host_reads or layer_idx not in self.layer_offsets:
-            return None
-        rows = self._dsa_host_rows.get(layer_idx)
-        if rows is not None:
-            return rows
-        batch = self._ensure_sparse_batch()
-        local = self.layer_offsets[layer_idx]
-        specs = self.impl.sparse_index_table_specs()
-
-        def spec_of(role) -> tuple[object, int]:
-            buffer = BufferId(local, role)
-            for spec in specs:
-                buffers = list(spec.buffers)
-                if buffer in buffers:
-                    return spec, buffers.index(buffer)
-            raise ValueError(f"DSA layer {layer_idx}'s {role} has no index table spec")
-
-        data_spec, data_entry = spec_of(Role.KEY)
-        scale_spec, scale_entry = spec_of(Role.KEY_BLOCK_SCALE)
-        if (
-            batch.index_table_id(scale_spec) != batch.index_table_id(data_spec)
-            or scale_entry != data_entry
-            or data_entry != 0
-        ):
-            raise ValueError(
-                "DSA host reads require the NVFP4 block scales to share the latent's converted "
-                "page indices"
-            )
-        data_base, data_stride = batch.pool_spec_for(data_spec)
-        scale_base, scale_stride = batch.pool_spec_for(scale_spec)
-        rows = LatentHostRows(
-            data=int(data_base),
-            scales=int(scale_base),
-            data_page_stride=int(data_stride),
-            scale_page_stride=int(scale_stride),
-            rows_per_page=self.impl.get_sparse_cache_units_per_page(local),
-        )
-        self._dsa_host_rows[layer_idx] = rows
-        return rows
-
     def _sparse_offload_nvfp4_head_dim(self) -> Optional[int]:
         return self.head_dim if self.dtype == DataType.NVFP4 else None
 
@@ -1052,12 +987,7 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
         scratch = super().get_sparse_offload_scratch_bytes(config)
         if scratch:
             writer_entries = 3 * self.max_batch_size
-            # Attention indices, and with host reads the GPU cache row each fills.
-            attn_index_entries = (
-                (2 if self._sparse_host_reads else 1)
-                * self.max_batch_size
-                * self._sparse_offload_topk
-            )
+            attn_index_entries = self.max_batch_size * self._sparse_offload_topk
             scratch += (
                 SPARSE_OFFLOAD_STATE_COPIES
                 * (writer_entries + attn_index_entries)

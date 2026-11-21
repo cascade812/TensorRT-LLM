@@ -369,12 +369,14 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
                 "for DeepseekV4CacheManager"
             )
 
+        # The base manager checks what offload can honor before it sizes anything.
+        sparse_kv_offload_config = sparse_attn_config.get_kv_cache_offload_config()
         self._init_sparse_offload(
             enabled=sparse_attn_config.enable_kv_cache_offload,
             topk=sparse_attn_config.index_topk,
+            host_reads=sparse_kv_offload_config is not None
+            and sparse_kv_offload_config.read_misses_from_host,
         )
-        # The base manager checks what offload can honor before it sizes anything.
-        sparse_kv_offload_config = sparse_attn_config.get_kv_cache_offload_config()
 
         # DeepSeek-V4 specific attributes initialization
         assert kv_cache_type == CacheTypeCpp.SELFKONLY, "DeepSeek-V4 only supports SELFKONLY"
@@ -419,6 +421,12 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         self._compressor_dtype = compressor_dtype
         self._use_nvfp4_compress = dtype == DataType.NVFP4
         self._nvfp4_residual_dim = get_nvfp4_compress_residual_dim()
+        if self._sparse_host_reads and not self._use_nvfp4_compress:
+            raise NotImplementedError(
+                "DeepSeek-V4 kv_cache_offload_config.read_misses_from_host requires an NVFP4 KV "
+                "cache: the NVFP4 gather reads host rows, and other caches go to attention in "
+                "place."
+            )
         cache_dtype = DataType.FP8 if self._use_nvfp4_compress else dtype
         # If MTP is enabled, append compress ratios for MTP virtual layers.
         # MTP adds (max_draft_len - 1) extra layers that mirror the last real

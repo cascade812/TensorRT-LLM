@@ -389,7 +389,7 @@ class DSATrtllmAttention(TrtllmAttention):
         manager = metadata.kv_cache_manager
         data_rows, scale_rows = manager.get_sparse_latent_nvfp4_arenas(self.layer_idx)
         scratch = state.nvfp4_scratch[:num_tokens]
-        host_rows = manager.dsa_sparse_host_rows(self.layer_idx)
+        host_rows = manager.sparse_host_rows(descriptor)
         host_args = ()
         if host_rows is not None:
             fill_rows = merge_sparse_arena_indices(
@@ -401,7 +401,7 @@ class DSATrtllmAttention(TrtllmAttention):
                 state.history_lengths,
                 state.fetched_cells[len(descriptor.buffer_ids)][:, data_slot, :],
                 state.write_indices[len(descriptor.buffer_ids)][:, data_slot],
-                metadata.sparse_offload_fill_rows[:num_tokens],
+                state.fill_rows[:num_tokens],
                 unit_tokens=descriptor.unit_tokens,
             )
             host_args = (*host_rows, fill_rows)

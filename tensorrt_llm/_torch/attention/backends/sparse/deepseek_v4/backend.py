@@ -38,6 +38,7 @@ from ..mixed_precision_high_rows import (
     overlay_mixed_precision_high_rows,
 )
 from ..offload import NVFP4_SCRATCH_TAIL_ROWS
+from ..offload_kernels import merge_sparse_arena_indices
 from .cache_manager import get_token_bytes
 from .compressor import Compressor
 from .indexer import DeepseekV4Indexer
@@ -343,7 +344,12 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                         : metadata.num_seqs
                     ]
                     fetched = kv_cache_manager.fetch_sparse_indices(
-                        sparse_state, layer_idx, topk_indices, req_id, compressed_lengths
+                        sparse_state,
+                        layer_idx,
+                        topk_indices,
+                        req_id,
+                        compressed_lengths,
+                        host_reads=kv_cache_manager.sparse_host_reads,
                     )
                     data_index = descriptor.data_buffer_index
                     # Read at the slot: buffers whose arena indices coincide share one
@@ -463,6 +469,27 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                     )
                 scratch = sparse_state.nvfp4_scratch[: compressed_indices.shape[0]]
                 data_pool, scale_pool = kv_cache_manager.get_sparse_compress_buffers(layer_idx)
+                # With host reads, a compressed row missing from the GPU cache keeps its
+                # host row: the gather reads it there and stores it into the cache row
+                # the fetch admitted it to, merged here as the indices were.
+                host_args = ()
+                host_rows = kv_cache_manager.sparse_host_rows(descriptor)
+                if host_rows is not None:
+                    data_slot = sparse_state.out_slots[layer_idx][descriptor.data_buffer_index]
+                    count = len(descriptor.buffer_ids)
+                    fill_rows = merge_sparse_arena_indices(
+                        compressed_local_indices,
+                        req_id,
+                        sparse_state.batch_rows,
+                        sparse_state.active_request_count,
+                        metadata.compressed_kv_lens_cuda[self.compress_ratio][: metadata.num_seqs],
+                        sparse_state.history_lengths,
+                        sparse_state.fetched_cells[count][:, data_slot, :],
+                        sparse_state.write_indices[count][:, data_slot],
+                        sparse_state.fill_rows[: compressed_indices.shape[0]],
+                        unit_tokens=descriptor.unit_tokens,
+                    )
+                    host_args = (*host_rows, fill_rows)
                 # Paired arena geometry gives data and scales the same row indices.
                 # The existing gather replaces those indices with FP8 scratch indices.
                 torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
@@ -473,6 +500,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                     self._nvfp4_compress_scale_quant_orig,
                     kv_cache_manager.nvfp4_residual_dim,
                     data_pool.shape[0],
+                    *host_args,
                 )
             else:
                 data_pool, scale_pool = kv_cache_manager.get_compress_pool_buffers(

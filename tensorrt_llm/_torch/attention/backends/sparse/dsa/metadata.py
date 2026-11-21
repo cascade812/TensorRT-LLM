@@ -418,7 +418,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.sparse_latent_block_offsets: Optional[torch.Tensor] = None
         self.sparse_latent_write_slots: Optional[torch.Tensor] = None
         self.sparse_offload_attn_indices: Optional[torch.Tensor] = None
-        self.sparse_offload_fill_rows: Optional[torch.Tensor] = None
         self.sparse_offload_stream: Optional[torch.cuda.Stream] = None
         self.sparse_offload_write_pending: Optional[int] = None
         self.sparse_offload_fetch_pending: Optional[int] = None
@@ -470,11 +469,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.sparse_offload_attn_indices = allocate(
             "attn_indices", (batch, self.sparse_mla_topk), torch.int32
         )
-        if manager.sparse_host_reads:
-            # The GPU cache row each attention index from host memory is stored into.
-            self.sparse_offload_fill_rows = allocate(
-                "fill_rows", (batch, self.sparse_mla_topk), torch.int32
-            )
 
     def _validate_dsa_sparse_offload_batch(self) -> None:
         """Reject batches offload cannot run, on the host before any model writes.

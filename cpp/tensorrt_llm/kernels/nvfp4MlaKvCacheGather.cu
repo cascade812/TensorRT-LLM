@@ -681,6 +681,27 @@ __global__ __launch_bounds__(kThreadsPerBlock, kDirectBlocksPerSm) void nvFp4Mla
             uint8_t const* packedRow = nullptr;
             __nv_fp8_e4m3 const* scaleRow = nullptr;
             resolveRow(dataPool, scalePool, hostRows, globalIdx, kPackedHeadDim, kScalesPerToken, packedRow, scaleRow);
+            int32_t const fillRow
+                = globalIdx < -1 && hostRows.fillRows != nullptr ? hostRows.fillRows[pair] : int32_t{-1};
+            if (fillRow >= 0)
+            {
+                // Store the host row into its pool row as it is, then dequantize from there,
+                // so the host row is read once.
+                auto* dataRow = hostRows.fillData + static_cast<int64_t>(fillRow) * kPackedHeadDim;
+                auto* fillScaleRow
+                    = reinterpret_cast<uint8_t*>(hostRows.fillScales) + static_cast<int64_t>(fillRow) * kScalesPerToken;
+                for (int32_t chunk = lane; chunk < kPackedHeadDim / kAsyncCopyBytes; chunk += kWarpSize)
+                {
+                    reinterpret_cast<uint4*>(dataRow)[chunk] = reinterpret_cast<uint4 const*>(packedRow)[chunk];
+                }
+                for (int32_t word = lane; word < kScalesPerToken / 4; word += kWarpSize)
+                {
+                    reinterpret_cast<uint32_t*>(fillScaleRow)[word] = reinterpret_cast<uint32_t const*>(scaleRow)[word];
+                }
+                __syncwarp();
+                packedRow = dataRow;
+                scaleRow = reinterpret_cast<__nv_fp8_e4m3 const*>(fillScaleRow);
+            }
             if (dequantScale == 1.F)
             {
                 dequantizeRow<true>(packedRow, scaleRow, output, 0, pair, kDsv4HeadDim, kResidualDim, 1.F, lane);
@@ -913,8 +934,9 @@ void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* s
     if (hostRows.fillRows != nullptr)
     {
         TLLM_CHECK_WITH_INFO(hostRows.data != nullptr && hostRows.fillData != nullptr && hostRows.fillScales != nullptr
-                && headDim == kMlaHeadDim && (residualDim == 0 || residualDim == kMlaResidualDim),
-            "NVFP4 MLA gather fills pool rows only for host rows of the 576-wide MLA layout");
+                && (headDim == kMlaHeadDim || headDim == kDsv4HeadDim)
+                && (residualDim == 0 || residualDim == kMlaResidualDim),
+            "NVFP4 MLA gather fills pool rows only for host rows of the 576- and 512-wide layouts");
     }
     if (headDim == kDsv4HeadDim && (residualDim == 0 || residualDim == kMlaResidualDim))
     {

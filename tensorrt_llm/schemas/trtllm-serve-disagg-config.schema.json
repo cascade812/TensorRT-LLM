@@ -10125,7 +10125,7 @@
         },
         "read_misses_from_host": {
           "default": false,
-          "description": "Read the selected units that are not in the GPU cache directly from host memory, instead of waiting for them to be copied in first. The kernel that reads such a unit also stores it into its GPU cache slot, so later steps find it on the GPU and no separate copy runs. Supported by MiniMax-M3, and by DSA models with an NVFP4 KV cache.",
+          "description": "Read the selected units that are not in the GPU cache directly from host memory, instead of waiting for them to be copied in first. The kernel that reads such a unit also stores it into its GPU cache slot, so later steps find it on the GPU and no separate copy runs. Supported by MiniMax-M3, and by DSA and DeepSeek-V4 with an NVFP4 KV cache.",
           "status": "prototype",
           "title": "Read Misses From Host",
           "type": "boolean"

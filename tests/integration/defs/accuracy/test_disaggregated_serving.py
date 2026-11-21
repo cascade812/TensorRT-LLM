@@ -3083,8 +3083,21 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
         """Repeated LongBench v2 prompts match and reuse the offloaded NVFP4 cache."""
         self._run_kv_cache_offload(kv_dtype="nvfp4", block_reuse=True)
 
-    def _run_kv_cache_offload(self, *, kv_dtype: str,
-                              block_reuse: bool) -> None:
+    @pytest.mark.timeout(1800)
+    @pytest.mark.skip_less_device(4)
+    def test_kv_cache_offload_host_reads(self) -> None:
+        """LongBench v2 tokens match when the NVFP4 gather reads uncached rows on the host."""
+        self._run_kv_cache_offload(
+            kv_dtype="nvfp4",
+            block_reuse=False,
+            kv_cache_offload_config={"read_misses_from_host": True})
+
+    def _run_kv_cache_offload(
+            self,
+            *,
+            kv_dtype: str,
+            block_reuse: bool,
+            kv_cache_offload_config: dict[str, Any] | None = None) -> None:
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
@@ -3125,14 +3138,16 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                 "num_instances": 1
             },
         }
-        _test_sparse_offload_long_context(disaggregated_server_config,
-                                          ctx_server_config,
-                                          gen_server_config,
-                                          self.MODEL_PATH,
-                                          model_name=self.MODEL_NAME,
-                                          index_topk=512,
-                                          unit_tokens=4,
-                                          block_reuse=block_reuse)
+        _test_sparse_offload_long_context(
+            disaggregated_server_config,
+            ctx_server_config,
+            gen_server_config,
+            self.MODEL_PATH,
+            model_name=self.MODEL_NAME,
+            index_topk=512,
+            unit_tokens=4,
+            block_reuse=block_reuse,
+            kv_cache_offload_config=kv_cache_offload_config)
 
 
 @pytest.mark.timeout(14400)

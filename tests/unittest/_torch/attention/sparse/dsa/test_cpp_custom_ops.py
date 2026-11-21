@@ -233,9 +233,9 @@ def test_nvfp4_mla_kv_cache_gather_direct_reads_host_rows(head_dim, residual_dim
 
 @skip_pre_blackwell
 @pytest.mark.parametrize("residual_dim", [0, 64])
-def test_nvfp4_mla_kv_cache_gather_direct_fills_pool_rows_from_host_rows(residual_dim):
+@pytest.mark.parametrize("head_dim", [576, 512], ids=["mla", "dsv4"])
+def test_nvfp4_mla_kv_cache_gather_direct_fills_pool_rows_from_host_rows(head_dim, residual_dim):
     """With fill_rows, each host row read is also stored as it is into its pool row."""
-    head_dim = 576
     packed = (head_dim + residual_dim) // 2
     scales = (head_dim + residual_dim) // 16
     rows_per_page = 8
@@ -288,6 +288,19 @@ def test_nvfp4_mla_kv_cache_gather_direct_fills_pool_rows_from_host_rows(residua
         expected_data[pool_row], expected_scales[pool_row] = host_row(row)
     assert torch.equal(pool_data, expected_data)
     assert torch.equal(pool_scales, expected_scales)
+    # The filled rows read back from the pool dequantize to what the host reads gave.
+    filled = torch.tensor([[9, 14]], dtype=torch.int32, device="cuda")
+    refetched = torch.empty((1, 2, head_dim), dtype=torch.float8_e4m3fn, device="cuda")
+    torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
+        pool_data,
+        pool_scales.view(torch.float8_e4m3fn),
+        filled,
+        refetched,
+        torch.ones(1, dtype=torch.float32, device="cuda"),
+        residual_dim,
+        pool_data.shape[0],
+    )
+    assert torch.equal(refetched[0].view(torch.uint8), output[0, [1, 3]].view(torch.uint8))
 
 
 @skip_pre_blackwell

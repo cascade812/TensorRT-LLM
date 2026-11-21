@@ -403,6 +403,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             topk=self.sparse_mla_topk,
             # The hook the device reservation counts the scratch by.
             nvfp4_head_dim=manager._sparse_offload_nvfp4_head_dim(),
+            host_reads=manager.sparse_host_reads,
         )
 
     def mla_prepare_fused_q_gen_cu_seqlens(self) -> Optional[torch.Tensor]:

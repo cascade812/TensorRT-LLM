@@ -37,7 +37,7 @@ namespace kernels
 //!
 //! With fillRows, aligned with the global indices, the gather also stores each host row it
 //! reads, as it is, into pool row fillRows[pair] of fillData and fillScales, the writable
-//! pools; a negative entry stores nothing. Only the 576-wide MLA layout fills.
+//! pools; a negative entry stores nothing. Only the 576-wide MLA and 512-wide layouts fill.
 struct NvFp4MlaHostRows
 {
     uint8_t const* data = nullptr;
