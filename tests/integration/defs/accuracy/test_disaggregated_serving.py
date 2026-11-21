@@ -2879,9 +2879,10 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
 
     @pytest.mark.timeout(1800)
     @pytest.mark.skip_less_device(4)
-    def test_kv_cache_offload_host_reads(self) -> None:
-        """LongBench v2 tokens match when the NVFP4 gather reads uncached tokens on the host."""
-        self._run_kv_cache_offload("nvfp4",
+    @parametrize_with_ids("kv_dtype", ["fp8", "nvfp4"])
+    def test_kv_cache_offload_host_reads(self, kv_dtype: str) -> None:
+        """LongBench v2 tokens match when the gather feeding attention reads uncached tokens on the host."""
+        self._run_kv_cache_offload(kv_dtype,
                                    kv_cache_offload_config={
                                        "read_misses_from_host": True,
                                    })
@@ -3085,10 +3086,11 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
 
     @pytest.mark.timeout(1800)
     @pytest.mark.skip_less_device(4)
-    def test_kv_cache_offload_host_reads(self) -> None:
-        """LongBench v2 tokens match when the NVFP4 gather reads uncached rows on the host."""
+    @parametrize_with_ids("kv_dtype", ["fp8", "nvfp4"])
+    def test_kv_cache_offload_host_reads(self, kv_dtype: str) -> None:
+        """LongBench v2 tokens match when the gather feeding attention reads uncached rows on the host."""
         self._run_kv_cache_offload(
-            kv_dtype="nvfp4",
+            kv_dtype=kv_dtype,
             block_reuse=False,
             kv_cache_offload_config={"read_misses_from_host": True})
 

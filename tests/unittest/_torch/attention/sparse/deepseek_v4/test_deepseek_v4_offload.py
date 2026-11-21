@@ -501,13 +501,17 @@ def test_prepare_writes_and_attention_merge_on_ordered_streams(rows):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "nvfp4,host_reads", [(False, False), (True, False), (True, True)], ids=["fp8", "nvfp4", "host"]
+    "nvfp4,host_reads",
+    [(False, False), (True, False), (True, True), (False, True)],
+    ids=["fp8", "nvfp4", "nvfp4-host", "fp8-host"],
 )
 def test_attention_uses_arena_base_and_physical_indices_without_host_pages(nvfp4, host_reads):
     """Attention reads fetched arena rows; with host reads the gather also gets host rows.
 
     A host entry stays below -1 through the merge, and the gather receives the layer's host
     rows and the cache rows the fetch admitted, merged from ``fetched_cells`` like the indices.
+    An FP8 cache with host reads goes through the row gather into the row scratch, which
+    attention then reads.
     """
     manager = _manager()
     manager.dtype = DataType.BF16
@@ -545,7 +549,10 @@ def test_attention_uses_arena_base_and_physical_indices_without_host_pages(nvfp4
         coverage=None,
         fetched_cells={physical.shape[1]: cells} if host_reads else {},
         fill_rows=torch.full((4, 8), -1, dtype=torch.int32) if host_reads else None,
+        row_scratch=torch.empty((32, 128), dtype=torch.int32) if host_reads and not nvfp4 else None,
     )
+    row_arena = torch.empty((16, 128), dtype=torch.int32)
+    manager.get_sparse_compress_row_arena = Mock(return_value=row_arena)
     descriptor = state.layers[2]
     if nvfp4:
         pool_rows = descriptor.arena_row_counts[descriptor.data_buffer_index]
@@ -586,12 +593,20 @@ def test_attention_uses_arena_base_and_physical_indices_without_host_pages(nvfp4
     )
     expected = (
         torch.tensor([[0, -1, 2, 3, -1, -1, -1, -1]], dtype=torch.int32)
-        if nvfp4
+        if nvfp4 or host_reads
         else physical[:1, 0]
     )
     prepared = torch.cat((torch.tensor([[10, 11, 12, 13]]), physical[:1, 0]), dim=1).int()
 
     fill = torch.tensor([[-1, 9, -1, -1, -1, -1, -1, -1]], dtype=torch.int32)
+
+    def gather_words(arena, indices, out, *, host_rows, fill_rows):
+        assert arena is row_arena and out is state.row_scratch
+        assert host_rows == host_rows_expected and fill_rows is fill
+        torch.testing.assert_close(indices, physical[:1, descriptor.data_buffer_index])
+        indices.copy_(expected)
+
+    host_rows_expected = SparseHostRows(1 << 40, 1 << 41, 4096, 512, 32)
 
     def gather_rows(
         data_pool, scale_pool, indices, output, global_scale, residual_dim, num_pool_tokens, *host
@@ -619,6 +634,7 @@ def test_attention_uses_arena_base_and_physical_indices_without_host_pages(nvfp4
             create=True,
         ) as gather,
         patch.object(deepseek_v4_backend, "merge_sparse_arena_indices", return_value=fill) as merge,
+        patch.object(deepseek_v4_backend, "gather_sparse_rows", side_effect=gather_words) as rows,
     ):
         result = deepseek_v4_backend.DeepseekV4TrtllmAttention.sparse_attn_predict(
             backend, None, None, metadata, args
@@ -634,8 +650,11 @@ def test_attention_uses_arena_base_and_physical_indices_without_host_pages(nvfp4
     assert args.sparse_runtime_params.aux_kv_cache_pool_ptr == (
         state.nvfp4_scratch.data_ptr()
         if nvfp4
+        else state.row_scratch.data_ptr()
+        if host_reads
         else descriptor.arena_base_addresses[descriptor.data_buffer_index]
     )
+    assert rows.call_count == int(host_reads and not nvfp4)
     converted = convert.call_args.kwargs
     torch.testing.assert_close(
         converted["compressed_fetched_indices"], physical[:, descriptor.data_buffer_index]

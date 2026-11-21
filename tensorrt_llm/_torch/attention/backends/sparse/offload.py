@@ -169,7 +169,10 @@ class SparseOffloadState:
     in host memory stores it there. It is empty otherwise. ``fill_rows`` is int32
     [B, K] scratch, by query, for readers that merge those cells as they merge
     their indices (``offload_kernels.merge_sparse_arena_indices``); None without
-    host reads.
+    host reads. ``row_scratch`` is int32 [B * K, row words]: with host reads on a
+    cache attention reads in place, ``offload_kernels.gather_sparse_rows`` copies
+    the selected rows there, from the arena or host memory, and attention reads
+    them from it instead. None otherwise.
     """
 
     layers: dict[int, SparseOffloadLayerDescriptor]
@@ -192,6 +195,7 @@ class SparseOffloadState:
     write_layer: int | None = None
     fetched_cells: dict[int, torch.Tensor] = field(default_factory=dict)
     fill_rows: torch.Tensor | None = None
+    row_scratch: torch.Tensor | None = None
 
     @staticmethod
     def device_bytes(
@@ -201,6 +205,7 @@ class SparseOffloadState:
         buffer_counts: Collection[int],
         nvfp4_head_dim: int | None,
         host_reads: bool = False,
+        row_bytes: int | None = None,
     ) -> int:
         """Return the device bytes one instance allocates.
 
@@ -212,6 +217,7 @@ class SparseOffloadState:
             buffer_counts: The distinct sparse buffer counts F of the layers.
             nvfp4_head_dim: Head dim of the dequantized rows with NVFP4, else None.
             host_reads: Whether fetches read missing units from host memory.
+            row_bytes: Bytes of one row the row gather copies, else None.
         """
         # The active count, the selections, the scatter start positions, the
         # Batch row map and any coverage flag, then the fetch outputs and write
@@ -226,7 +232,8 @@ class SparseOffloadState:
         if nvfp4_head_dim is not None:
             nvfp4_rows = max_batch_size * topk + NVFP4_SCRATCH_TAIL_ROWS
             nvfp4_bytes = nvfp4_rows * nvfp4_head_dim * torch.float8_e4m3fn.itemsize
-        return index_entries * torch.int32.itemsize + nvfp4_bytes
+        row_scratch_bytes = max_batch_size * topk * row_bytes if row_bytes else 0
+        return index_entries * torch.int32.itemsize + nvfp4_bytes + row_scratch_bytes
 
 
 def allocate_sparse_offload_state(
@@ -237,6 +244,7 @@ def allocate_sparse_offload_state(
     topk: int,
     nvfp4_head_dim: int | None = None,
     host_reads: bool = False,
+    row_bytes: int | None = None,
 ) -> SparseOffloadState:
     """Allocate an attention metadata's persistent offload state.
 
@@ -248,6 +256,7 @@ def allocate_sparse_offload_state(
         topk: Units one row selects.
         nvfp4_head_dim: Head dim of the NVFP4 gather's dequantized rows, else None.
         host_reads: Allocate ``fetched_cells`` for a manager with host reads.
+        row_bytes: Bytes of one row the row gather copies, to allocate ``row_scratch``.
     """
 
     def index_tensor(name: str, shape: tuple[int, ...], value: int) -> torch.Tensor:
@@ -294,6 +303,9 @@ def allocate_sparse_offload_state(
         else {},
         fill_rows=index_tensor("fill_rows", (max_batch_size, topk), BAD_PAGE_INDEX)
         if host_reads
+        else None,
+        row_scratch=allocate("row_scratch", (max_batch_size * topk, row_bytes // 4), torch.int32)
+        if row_bytes
         else None,
     )
 
@@ -415,6 +427,14 @@ class SparseOffloadCacheMixin:
         """
         return None
 
+    def _sparse_offload_row_bytes(self) -> int | None:
+        """Bytes of one row the row gather copies for attention, or None without one.
+
+        A manager with host reads on a cache attention reads in place returns its
+        row size, a multiple of four bytes.
+        """
+        return None
+
     def get_sparse_offload_scratch_bytes(self, config: KVCacheManagerConfig) -> int:
         """Return the device bytes of the attention metadata's sparse offload state.
 
@@ -433,6 +453,7 @@ class SparseOffloadCacheMixin:
             buffer_counts=buffer_counts,
             nvfp4_head_dim=self._sparse_offload_nvfp4_head_dim(),
             host_reads=self._sparse_host_reads,
+            row_bytes=self._sparse_offload_row_bytes(),
         )
 
     def _has_sparse_offload_layers(self) -> bool:

@@ -38,7 +38,7 @@ from ..mixed_precision_high_rows import (
     overlay_mixed_precision_high_rows,
 )
 from ..offload import NVFP4_SCRATCH_TAIL_ROWS
-from ..offload_kernels import merge_sparse_arena_indices
+from ..offload_kernels import gather_sparse_rows, merge_sparse_arena_indices
 from .cache_manager import get_token_bytes
 from .compressor import Compressor
 from .indexer import DeepseekV4Indexer
@@ -459,6 +459,46 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             )
             return global_indices, None
 
+        host_rows = (
+            kv_cache_manager.sparse_host_rows(descriptor) if sparse_state is not None else None
+        )
+        fill_rows = None
+        if host_rows is not None:
+            # A compressed row missing from the GPU cache keeps its host row: the gather
+            # reads it there and stores it into the cache row the fetch admitted it to,
+            # merged here as the indices were.
+            data_slot = sparse_state.out_slots[layer_idx][descriptor.data_buffer_index]
+            count = len(descriptor.buffer_ids)
+            fill_rows = merge_sparse_arena_indices(
+                compressed_local_indices,
+                req_id,
+                sparse_state.batch_rows,
+                sparse_state.active_request_count,
+                metadata.compressed_kv_lens_cuda[self.compress_ratio][: metadata.num_seqs],
+                sparse_state.history_lengths,
+                sparse_state.fetched_cells[count][:, data_slot, :],
+                sparse_state.write_indices[count][:, data_slot],
+                sparse_state.fill_rows[: compressed_local_indices.shape[0]],
+                unit_tokens=descriptor.unit_tokens,
+            )
+            if not self._uses_nvfp4_compress:
+                # Attention reads one compressed pool, so with host reads it reads the
+                # selected rows gathered from the arena and host memory.
+                num_compressed_indices = metadata.max_compressed_indices[self.compress_ratio]
+                compressed_indices = global_indices[:, -num_compressed_indices:].contiguous()
+                gather_sparse_rows(
+                    kv_cache_manager.get_sparse_compress_row_arena(layer_idx),
+                    compressed_indices,
+                    sparse_state.row_scratch,
+                    host_rows=host_rows,
+                    fill_rows=fill_rows,
+                )
+                global_indices[:, -num_compressed_indices:] = compressed_indices
+                forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = (
+                    sparse_state.row_scratch.data_ptr()
+                )
+                return global_indices, None
+
         if self._uses_nvfp4_compress and self.compress_ratio > 1:
             num_compressed_indices = metadata.max_compressed_indices[self.compress_ratio]
             compressed_indices = global_indices[:, -num_compressed_indices:].contiguous()
@@ -469,27 +509,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                     )
                 scratch = sparse_state.nvfp4_scratch[: compressed_indices.shape[0]]
                 data_pool, scale_pool = kv_cache_manager.get_sparse_compress_buffers(layer_idx)
-                # With host reads, a compressed row missing from the GPU cache keeps its
-                # host row: the gather reads it there and stores it into the cache row
-                # the fetch admitted it to, merged here as the indices were.
-                host_args = ()
-                host_rows = kv_cache_manager.sparse_host_rows(descriptor)
-                if host_rows is not None:
-                    data_slot = sparse_state.out_slots[layer_idx][descriptor.data_buffer_index]
-                    count = len(descriptor.buffer_ids)
-                    fill_rows = merge_sparse_arena_indices(
-                        compressed_local_indices,
-                        req_id,
-                        sparse_state.batch_rows,
-                        sparse_state.active_request_count,
-                        metadata.compressed_kv_lens_cuda[self.compress_ratio][: metadata.num_seqs],
-                        sparse_state.history_lengths,
-                        sparse_state.fetched_cells[count][:, data_slot, :],
-                        sparse_state.write_indices[count][:, data_slot],
-                        sparse_state.fill_rows[: compressed_indices.shape[0]],
-                        unit_tokens=descriptor.unit_tokens,
-                    )
-                    host_args = (*host_rows, fill_rows)
+                host_args = () if host_rows is None else (*host_rows, fill_rows)
                 # Paired arena geometry gives data and scales the same row indices.
                 # The existing gather replaces those indices with FP8 scratch indices.
                 torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(

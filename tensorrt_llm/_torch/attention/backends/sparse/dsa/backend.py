@@ -26,7 +26,11 @@ from ..mixed_precision_high_rows import (
     mixed_precision_high_row_indices,
     overlay_mixed_precision_high_rows,
 )
-from ..offload_kernels import gather_sparse_batch_rows, merge_sparse_arena_indices
+from ..offload_kernels import (
+    gather_sparse_batch_rows,
+    gather_sparse_rows,
+    merge_sparse_arena_indices,
+)
 from .indexer import (
     Indexer,
     transform_local_topk_and_prepare_pool_view,
@@ -379,19 +383,12 @@ class DSATrtllmAttention(TrtllmAttention):
             unit_tokens=descriptor.unit_tokens,
             coverage=state.coverage,
         )
-        if state.nvfp4_scratch is None:
-            forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = (
-                descriptor.arena_base_addresses[data_index]
-            )
-            return indices
-        # The data and scale arenas share their rows, so one index reads both. The
-        # gather replaces each arena row with its FP8 scratch row, -1 staying -1.
         manager = metadata.kv_cache_manager
-        data_rows, scale_rows = manager.get_sparse_latent_nvfp4_arenas(self.layer_idx)
-        scratch = state.nvfp4_scratch[:num_tokens]
         host_rows = manager.sparse_host_rows(descriptor)
-        host_args = ()
+        fill_rows = None
         if host_rows is not None:
+            # A token read from host memory is stored into the cache row the fetch
+            # admitted it to, merged here as its index was.
             fill_rows = merge_sparse_arena_indices(
                 topk_indices,
                 request_indices,
@@ -404,7 +401,29 @@ class DSATrtllmAttention(TrtllmAttention):
                 state.fill_rows[:num_tokens],
                 unit_tokens=descriptor.unit_tokens,
             )
-            host_args = (*host_rows, fill_rows)
+        if state.nvfp4_scratch is None:
+            if host_rows is None:
+                forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = (
+                    descriptor.arena_base_addresses[data_index]
+                )
+                return indices
+            # Attention reads one pool, so with host reads it reads the selected rows
+            # gathered from the arena and host memory, at compacted indices.
+            scratch = state.row_scratch
+            gather_sparse_rows(
+                manager.get_sparse_latent_row_arena(self.layer_idx),
+                indices,
+                scratch,
+                host_rows=host_rows,
+                fill_rows=fill_rows,
+            )
+            forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
+            return indices
+        # The data and scale arenas share their rows, so one index reads both. The
+        # gather replaces each arena row with its FP8 scratch row, -1 staying -1.
+        data_rows, scale_rows = manager.get_sparse_latent_nvfp4_arenas(self.layer_idx)
+        scratch = state.nvfp4_scratch[:num_tokens]
+        host_args = () if host_rows is None else (*host_rows, fill_rows)
         torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
             data_rows,
             scale_rows,

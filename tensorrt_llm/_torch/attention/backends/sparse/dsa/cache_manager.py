@@ -546,6 +546,7 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
         self._sparse_offload_descriptors: dict[int, SparseOffloadLayerDescriptor] = {}
         self._sparse_latent_write_pools: dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._sparse_latent_nvfp4_arenas: dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._sparse_latent_row_arenas: dict[int, torch.Tensor] = {}
         if self._enable_kv_cache_offload:
             self._sparse_offload_descriptors = self.get_sparse_offload_descriptors()
             self._initialize_sparse_arena_padding(self._sparse_offload_descriptors)
@@ -557,6 +558,18 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
                 self._sparse_latent_nvfp4_arenas = self._latent_nvfp4_arena_views(
                     self._sparse_offload_descriptors
                 )
+            elif self._sparse_host_reads:
+                row_words = self._sparse_offload_row_bytes() // 4
+                self._sparse_latent_row_arenas = {
+                    layer: convert_to_torch_tensor(
+                        TensorWrapper(
+                            descriptor.arena_base_addresses[descriptor.data_buffer_index],
+                            torch.int32,
+                            (descriptor.arena_row_counts[descriptor.data_buffer_index], row_words),
+                        )
+                    )
+                    for layer, descriptor in self._sparse_offload_descriptors.items()
+                }
         primary_converters = [
             self.impl.get_page_index_converter(local_layer_idx, Role.KEY)
             for local_layer_idx in range(self.num_local_layers)
@@ -783,11 +796,6 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
             )
         if self._sparse_offload_topk is None or self._sparse_offload_topk <= 0:
             raise ValueError("DSA KV cache offload requires a positive index_topk")
-        if self._sparse_host_reads and dtype != DataType.NVFP4:
-            raise NotImplementedError(
-                "DSA kv_cache_offload_config.read_misses_from_host requires an NVFP4 MLA latent: "
-                "the NVFP4 gather reads host rows, and other latents go to attention in place."
-            )
 
     def _sparse_latent_roles(self) -> Tuple[DataRole, ...]:
         """The latent buffers offload keeps in host memory: data, and NVFP4 block scales."""
@@ -972,6 +980,22 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
     def get_sparse_latent_nvfp4_arenas(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return a layer's NVFP4 latent data and block-scale arena views, indexed by arena row."""
         return self._sparse_latent_nvfp4_arenas[layer_idx]
+
+    def get_sparse_latent_row_arena(self, layer_idx: int) -> torch.Tensor:
+        """Return a layer's FP8 or BF16 latent arena as int32 words per row, with host reads."""
+        return self._sparse_latent_row_arenas[layer_idx]
+
+    def _sparse_offload_row_bytes(self) -> Optional[int]:
+        # With host reads, an FP8 or BF16 latent reaches attention through the row
+        # gather; NVFP4 goes through its dequantizing gather.
+        if not self._sparse_host_reads or self.dtype == DataType.NVFP4:
+            return None
+        row_bytes = self.get_layer_bytes_per_token(0, Role.KEY)
+        if row_bytes % 4:
+            raise ValueError(
+                f"DSA host reads need latent rows of whole words, got {row_bytes} bytes"
+            )
+        return row_bytes
 
     def _sparse_offload_nvfp4_head_dim(self) -> Optional[int]:
         return self.head_dim if self.dtype == DataType.NVFP4 else None

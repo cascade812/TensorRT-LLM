@@ -459,6 +459,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             topk=self.sparse_mla_topk,
             nvfp4_head_dim=manager._sparse_offload_nvfp4_head_dim(),
             host_reads=manager.sparse_host_reads,
+            row_bytes=manager._sparse_offload_row_bytes(),
         )
         self.sparse_latent_block_offsets = allocate(
             "latent_block_offsets", (1, batch, 2, 1), torch.int32

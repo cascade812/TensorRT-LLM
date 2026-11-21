@@ -7,9 +7,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.offload import SparseHostRows
 from tensorrt_llm._torch.attention.backends.sparse.offload_kernels import (
     SPARSE_ARENA_COVERAGE_MESSAGE,
     gather_sparse_batch_rows,
+    gather_sparse_rows,
     merge_sparse_arena_indices,
     select_sparse_history_units,
 )
@@ -300,3 +302,56 @@ def test_gather_rejects_invalid_layout(invalid):
         out = torch.empty(3, dtype=torch.int32, device="cuda")
     with pytest.raises(ValueError):
         gather_sparse_batch_rows(values, rows, out)
+
+
+@_requires_cuda
+@pytest.mark.parametrize("row_bytes", [512, 576, 1152])
+def test_row_gather_copies_arena_and_host_rows_and_fills_cache_rows(row_bytes):
+    """Rows land at their flat positions, host rows fill their cache rows, indices compact."""
+    words = row_bytes // 4
+    generator = torch.Generator(device="cuda").manual_seed(4)
+    arena = torch.randint(
+        -(2**31), 2**31 - 1, (12, words), dtype=torch.int32, device="cuda", generator=generator
+    )
+    rows_per_page = 4
+    # Host pages hold their rows first and padding after, so a wrong stride reads padding.
+    page_words = rows_per_page * words + 32
+    host = torch.randint(-(2**31), 2**31 - 1, (3, page_words), dtype=torch.int32).pin_memory()
+    host_rows = SparseHostRows(host.data_ptr(), 0, page_words * 4, 0, rows_per_page)
+    indices = torch.tensor(
+        [[3, -2 - 5, -1, 11], [-2 - 0, 7, -2 - 9, 12]], dtype=torch.int32, device="cuda"
+    )
+    fill_rows = torch.tensor([[-1, 2, -1, -1], [8, -1, -1, -1]], dtype=torch.int32, device="cuda")
+    before = arena.clone()
+    out = torch.zeros((8, words), dtype=torch.int32, device="cuda")
+    gather_sparse_rows(arena, indices, out, host_rows=host_rows, fill_rows=fill_rows)
+
+    def host_row(row):
+        page, offset = divmod(row, rows_per_page)
+        return host[page, offset * words : (offset + 1) * words].cuda()
+
+    # Row 12 is past the pool, so it is padding like -1.
+    assert indices.tolist() == [[0, 1, -1, 3], [4, 5, 6, -1]]
+    expected = {
+        0: before[3],
+        1: host_row(5),
+        3: before[11],
+        4: host_row(0),
+        5: before[7],
+        6: host_row(9),
+    }
+    for position, row in expected.items():
+        assert torch.equal(out[position], row), position
+    filled = before.clone()
+    filled[2], filled[8] = host_row(5), host_row(0)
+    assert torch.equal(arena, filled)
+
+
+@_requires_cuda
+def test_row_gather_without_host_rows_treats_host_indices_as_padding():
+    arena = torch.arange(4 * 128, dtype=torch.int32, device="cuda").view(4, 128)
+    indices = torch.tensor([[2, -7, 0]], dtype=torch.int32, device="cuda")
+    out = torch.zeros((3, 128), dtype=torch.int32, device="cuda")
+    gather_sparse_rows(arena, indices, out)
+    assert indices.tolist() == [[0, -1, 2]]
+    assert torch.equal(out[0], arena[2]) and torch.equal(out[2], arena[0])

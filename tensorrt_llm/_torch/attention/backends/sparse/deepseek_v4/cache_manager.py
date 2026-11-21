@@ -421,11 +421,10 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         self._compressor_dtype = compressor_dtype
         self._use_nvfp4_compress = dtype == DataType.NVFP4
         self._nvfp4_residual_dim = get_nvfp4_compress_residual_dim()
-        if self._sparse_host_reads and not self._use_nvfp4_compress:
+        if self._sparse_host_reads and self.use_fp8_ds_mla:
             raise NotImplementedError(
-                "DeepSeek-V4 kv_cache_offload_config.read_misses_from_host requires an NVFP4 KV "
-                "cache: the NVFP4 gather reads host rows, and other caches go to attention in "
-                "place."
+                "DeepSeek-V4 kv_cache_offload_config.read_misses_from_host does not support "
+                "kv_cache_config.dtype='fp8_ds_mla'."
             )
         cache_dtype = DataType.FP8 if self._use_nvfp4_compress else dtype
         # If MTP is enabled, append compress ratios for MTP virtual layers.
@@ -468,6 +467,7 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         self._assert_layer_pool_scale()
         self._assert_nvfp4_compress_pool_layout()
         self._sparse_arena_buffers: dict[int, tuple[torch.Tensor, torch.Tensor | None]] = {}
+        self._sparse_row_arenas: dict[int, torch.Tensor] = {}
         if self._enable_kv_cache_offload:
             descriptors = self.get_sparse_offload_descriptors()
             self._initialize_sparse_arena_buffers(descriptors)
@@ -1601,6 +1601,18 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         """Return the device pool bytes one decoding request of ``num_tokens`` tokens holds."""
         return self._get_cache_bytes_for_tokens(num_tokens, context=False)
 
+    def _sparse_offload_row_bytes(self) -> int | None:
+        # With host reads, an FP8 or BF16 compressed row reaches attention through the
+        # row gather; NVFP4 goes through its dequantizing gather.
+        if not self._sparse_host_reads or self._use_nvfp4_compress:
+            return None
+        row_bytes = self.head_dim * get_size_in_bytes(1, self.dtype)
+        if row_bytes % 4:
+            raise ValueError(
+                f"DeepSeek-V4 host reads need compressed rows of whole words, got {row_bytes} bytes"
+            )
+        return row_bytes
+
     def _sparse_offload_nvfp4_head_dim(self) -> int | None:
         return self.head_dim if self._use_nvfp4_compress else None
 
@@ -1875,12 +1887,29 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
                         )
                     views.append(pool_views[base])
                 self._sparse_arena_buffers[layer] = (views[0], views[1] if len(views) > 1 else None)
+                row_bytes = self._sparse_offload_row_bytes()
+                if row_bytes is not None:
+                    # The row gather copies the compressed rows as int32 words.
+                    self._sparse_row_arenas[layer] = convert_to_torch_tensor(
+                        TensorWrapper(
+                            descriptor.arena_base_addresses[descriptor.data_buffer_index],
+                            torch.int32,
+                            (
+                                descriptor.arena_row_counts[descriptor.data_buffer_index],
+                                row_bytes // 4,
+                            ),
+                        )
+                    )
 
     def get_sparse_compress_buffers(
         self, layer_idx: int
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Return cached data/scales arena views indexed by prepared or fetched rows."""
         return self._sparse_arena_buffers[layer_idx]
+
+    def get_sparse_compress_row_arena(self, layer_idx: int) -> torch.Tensor:
+        """Return a layer's FP8 or BF16 compressed arena as int32 words per row, with host reads."""
+        return self._sparse_row_arenas[layer_idx]
 
     def prepare_sparse_compressor_write_indices(
         self, state: SparseOffloadState, layer_idx: int

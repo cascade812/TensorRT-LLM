@@ -454,3 +454,98 @@ def gather_sparse_batch_rows(
             BLOCK=block,
         )
     return out
+
+
+@triton.jit(do_not_specialize=["num_pool_rows", "host_offset", "host_page_stride"])
+def _gather_sparse_rows_kernel(
+    arena_ptr,
+    indices_ptr,
+    fill_rows_ptr,
+    out_ptr,
+    num_pool_rows,
+    host_offset,
+    host_page_stride,
+    ROWS_PER_PAGE: tl.constexpr,
+    ROW_WORDS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    HOST: tl.constexpr,
+):
+    pair = tl.program_id(0)
+    index = tl.load(indices_ptr + pair).to(tl.int64)
+    in_arena = (index >= 0) & (index < num_pool_rows)
+    words = tl.arange(0, BLOCK)
+    in_row = words < ROW_WORDS
+    if HOST:
+        on_host = index < -1
+        unit = -2 - index
+        page = unit // ROWS_PER_PAGE
+        source = tl.where(
+            on_host,
+            host_offset + page * host_page_stride + (unit - page * ROWS_PER_PAGE) * ROW_WORDS,
+            index * ROW_WORDS,
+        )
+        valid = in_arena | on_host
+    else:
+        source = index * ROW_WORDS
+        valid = in_arena
+    row = tl.load(arena_ptr + source + words, mask=in_row & valid, other=0)
+    tl.store(out_ptr + pair * ROW_WORDS + words, row, mask=in_row & valid)
+    if HOST:
+        fill = tl.load(fill_rows_ptr + pair).to(tl.int64)
+        tl.store(arena_ptr + fill * ROW_WORDS + words, row, mask=in_row & on_host & (fill >= 0))
+    tl.store(indices_ptr + pair, tl.where(valid, pair, -1).to(tl.int32))
+
+
+def gather_sparse_rows(
+    arena: torch.Tensor,
+    indices: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    host_rows=None,
+    fill_rows: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Copy each index's arena row into ``out`` at the index's position, and compact.
+
+    ``arena`` is one buffer's arena as int32 words, [pool rows, row words];
+    ``indices`` int32 [Q, K] arena rows, -1 for none, rewritten in place to the
+    flat position ``q * K + k`` of each copied row (-1 stays -1); ``out`` is
+    [Q * K, row words]. Attention then reads ``out`` with the rewritten indices
+    as it would the arena with the original ones.
+
+    With ``host_rows`` (``offload.SparseHostRows``) an index ``i < -1`` names
+    host row ``-2 - i``, read in place; ``fill_rows`` int32 [Q, K] names the
+    arena row the same position's host row is stored into, -1 for none.
+    """
+    rows, row_words = arena.shape
+    num_pairs = indices.numel()
+    if arena.dtype != torch.int32 or indices.dtype != torch.int32 or out.dtype != torch.int32:
+        raise ValueError("gather_sparse_rows takes int32 words and indices")
+    if not indices.is_contiguous() or out.shape[0] < num_pairs or out.shape[1] != row_words:
+        raise ValueError("indices must be contiguous and out [Q * K, row words]")
+    host = host_rows is not None
+    if host:
+        if fill_rows is None or fill_rows.shape != indices.shape or not fill_rows.is_contiguous():
+            raise ValueError("Host reads need contiguous fill_rows shaped like indices")
+        if (
+            host_rows.data_page_stride % 4
+            or (host_rows.data - arena.data_ptr()) % 4
+            or host_rows.data_page_stride < host_rows.rows_per_page * row_words * 4
+        ):
+            raise ValueError("Host rows must be word-aligned pages of whole rows")
+    if num_pairs == 0:
+        return out
+    with torch.cuda.device(arena.device):
+        _gather_sparse_rows_kernel[(num_pairs,)](
+            arena,
+            indices,
+            fill_rows if host else indices,
+            out,
+            rows,
+            (host_rows.data - arena.data_ptr()) // 4 if host else 0,
+            host_rows.data_page_stride // 4 if host else 0,
+            ROWS_PER_PAGE=host_rows.rows_per_page if host else 1,
+            ROW_WORDS=row_words,
+            BLOCK=triton.next_power_of_2(row_words),
+            HOST=host,
+        )
+    return out

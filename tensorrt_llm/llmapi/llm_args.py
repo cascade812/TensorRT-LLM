@@ -1081,7 +1081,9 @@ class SparseKvCacheOffloadConfig(StrictBaseModel):
         "host memory, instead of waiting for them to be copied in first. The "
         "kernel that reads such a unit also stores it into its GPU cache slot, "
         "so later steps find it on the GPU and no separate copy runs. Supported "
-        "by MiniMax-M3, and by DSA and DeepSeek-V4 with an NVFP4 KV cache.")
+        "by MiniMax-M3, DSA and DeepSeek-V4; DSA and DeepSeek-V4 FP8 and BF16 "
+        "caches reach attention through a copy of the selected rows, and "
+        "kv_cache_config.dtype='fp8_ds_mla' is not supported.")
 
 
 class BaseSparseAttentionConfig(StrictBaseModel):
