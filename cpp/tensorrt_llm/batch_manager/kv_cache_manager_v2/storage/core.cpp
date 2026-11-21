@@ -621,6 +621,19 @@ ManagedSlotPool::ManagedSlotPool(
     }
     TLLM_LOG_INFO("KVCM2 managed pool: %zu of %zu reserved bytes placed in host memory, NUMA node %d", mBytes,
         mReserved, mHost.type == CU_MEM_LOCATION_TYPE_HOST_NUMA ? mHost.id : -1);
+    int hostPageTables = 0;
+    if (cuDeviceGetAttribute(&hostPageTables, CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES, device)
+            == CUDA_SUCCESS
+        && hostPageTables != 0)
+    {
+        // On such systems (ATS, e.g. GB200/GB300) the GPU takes recurring page faults of a
+        // millisecond or more on managed pages kept in host memory, including pages it has
+        // read before; pinned host memory takes none.
+        TLLM_LOG_WARNING(
+            "KVCM2 managed pool: this GPU reaches host memory through the CPU's page tables, where GPU reads of "
+            "managed host memory take recurring page faults; prefer pinned host memory (host_history_memory: "
+            "pinned)");
+    }
 }
 
 ManagedSlotPool::~ManagedSlotPool()

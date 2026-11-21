@@ -476,9 +476,10 @@ bounds the host history budget in bytes; when unset, sizing follows the shared
 sparse offload memory planner. `host_history_memory: managed` holds the history
 in CUDA managed (unified) memory kept in host memory instead of pinned memory;
 the GPU reads it in place through its own mapping. Prefer the default pinned
-memory on GB300: in a microbenchmark where many selected blocks were missing
-from the GPU cache, GPU reads of managed history were about five times slower,
-although full-model decode measured the same with either. With `read_misses_from_host: true`, decode attention reads the selected
+memory on GB200 and GB300: there the GPU reaches host memory through the CPU's
+page tables and takes recurring page faults of a millisecond or more on managed
+host pages, which made a microbenchmark with many cache misses about five times
+slower; full-model decode measured the same with either. With `read_misses_from_host: true`, decode attention reads the selected
 blocks that are not in the GPU cache directly from host memory instead of
 waiting for them to be copied in, and stores each one into its GPU cache slot as
 it reads it, so later steps find it on the GPU. CUDA graphs reuse the same

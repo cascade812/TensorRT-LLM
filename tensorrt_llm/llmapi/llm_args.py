@@ -1068,8 +1068,10 @@ class SparseKvCacheOffloadConfig(StrictBaseModel):
         "Kind of host memory that holds the offloaded attention history. "
         "'pinned' is page-locked host memory. 'managed' is CUDA managed "
         "(unified) memory kept in host memory: the GPU reads and writes it in "
-        "place through its own mapping, without page faults, and the driver "
-        "does not migrate it into GPU memory. Either kind counts against "
+        "place through its own mapping, and the driver does not migrate it into "
+        "GPU memory. Where the GPU reaches host memory through the CPU's page "
+        "tables (GB200, GB300), GPU reads of managed memory take recurring page "
+        "faults, so prefer 'pinned' there. Either kind counts against "
         "host_history_size.")
     read_misses_from_host: bool = Field(
         default=False,
