@@ -41,6 +41,18 @@ inline constexpr int32_t kSparseAdmittedSlotBit = 1 << 30;
 //! page * pageStride addresses it). So it is never a cell index (>= 0) nor kBadPageIndex.
 inline constexpr int32_t kSparseHostIndexBase = -2;
 
+//! Units that `tokens` reach: every whole unit, plus the growing one when the sparse cache
+//! includes partial units.
+//!
+//! History rounds down, since a growing unit is not yet history; capacities, the copyable
+//! range and a flush's end round up through this. The kernels and the host share it so that
+//! device residency and host flushes agree.
+[[nodiscard]] constexpr int32_t sparseUnitsReached(
+    int32_t tokens, int32_t unitTokens, bool includePartialUnits) noexcept
+{
+    return tokens / unitTokens + static_cast<int32_t>(includePartialUnits && tokens % unitTokens != 0);
+}
+
 //! These kernels enforce their preconditions by trapping, not by reporting: a violation is
 //! a KVCM2 logic error, and the trap destroys the context, so no status could be read back.
 //! A debug build names the condition before halting.
