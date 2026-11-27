@@ -169,14 +169,16 @@ struct SparseResolveArgs
     //!
     //! Ordinals below historyUnits are selectable history. Ordinals in
     //! [historyUnits, capacityUnits) are in flight and pinned against eviction. With
-    //! includePartialUnits, a newly reserved cell restores the host prefix of the
-    //! partially filled history unit before the model appends data. See
-    //! "Unflushed entries carry no state" in SPARSE_ATTENTION_DESIGN.md.
+    //! includePartialUnits, write preparation restores the host prefix of the partially
+    //! filled history unit when it reserves that unit's cell, before the model appends
+    //! data; a selection resolve leaves that unit to it. See "Unflushed entries carry no
+    //! state" in SPARSE_ATTENTION_DESIGN.md.
     int32_t const* historyTokens;
     int32_t const* capacityTokens;
     //! tokens_per_block / unitsPerPage, a per-layer-group constant.
     int32_t unitTokens;
-    //! Round capacity up to a unit, restoring a partial history prefix on a miss.
+    //! Round capacity up to a unit; write preparation restores a partial history prefix on
+    //! a miss.
     bool includePartialUnits = false;
 
     //! [numRows][selectionWidth] entry index per selection, kNoSparseSlot where padded or
@@ -195,9 +197,10 @@ struct SparseResolveArgs
     //! since a call resolves one selection; every buffer of every layer naming that
     //! selection copies from it, each into its own mirror of the entry.
     //!
-    //! With includePartialUnits, a missing in-flight unit with a nonempty host prefix
-    //! also appears here. Write preparation uses a separate fixed list indexed by row;
-    //! a selection resolve uses the compacted list.
+    //! Only complete history appears here. With includePartialUnits, write preparation
+    //! restores a missing in-flight unit's nonempty host prefix through a separate fixed
+    //! list indexed by row, and a selection resolve leaves that unit to it, so no copy in
+    //! the compacted list lands on a token written to the unit.
     SparseWorkList work;
     //! [numRows] entries this row contributed. The copy does not read it -- it walks the
     //! compacted list -- but it is what makes a row's hit rate observable.
@@ -242,12 +245,17 @@ struct SparseResolveArgs
 //! a driver call and so the one part worth holding on to.
 [[nodiscard]] int32_t sparseCopyMultiprocessors(CUdevice device);
 
+//! Chunk size from which a fetch copies each work item with a whole CTA rather than a warp:
+//! a host read that large needs a CTA's loads in flight to cover the link's latency.
+inline constexpr uint32_t kSparseCtaCopyMinChunkBytes = 16 * 1024;
+
 //! CTAs to give a copy: enough to fill a machine of `smCount` multiprocessors, capped by
-//! the most work items the list could ever hold, since beyond that the extra CTAs would
-//! only exit.
+//! what the most work items the list could ever hold occupy -- a CTA each when
+//! `ctaPerItem`, as a fetch of chunks of at least kSparseCtaCopyMinChunkBytes copies them,
+//! and a warp each otherwise -- since beyond that the extra CTAs would only exit.
 //!
 //! Fixed before a graph captures the copy, so it follows the machine rather than the step.
-[[nodiscard]] int32_t sparseCopyGridCtas(int32_t workCapacity, int32_t smCount) noexcept;
+[[nodiscard]] int32_t sparseCopyGridCtas(int32_t workCapacity, int32_t smCount, bool ctaPerItem) noexcept;
 
 //! Which way a unit moves between its cold page and its cache entry.
 enum class SparseCopyDirection : uint8_t
@@ -302,9 +310,10 @@ struct SparseCopyRun
 //! its entry within the page table -- can be folded in here instead of being paid per work
 //! item.
 //!
-//! Sixteen-byte aligned and exactly four of them wide, so the load vectorises; the strides
-//! are 32-bit because a page, a lease and a cell are all far smaller than that, and only
-//! their products with a page or lease index need the wider type.
+//! Sixteen-byte aligned and exactly four of them wide, so the load vectorises. The fields
+//! are 32-bit: a page and a cell are far smaller than 4 GiB, and a lease is held as a cell
+//! count because its bytes are not -- its pool holds every layer's buffers. Only their
+//! products with an index need the wider type.
 struct alignas(16) SparseCopyDesc
 {
     //! Base this buffer's converted page indices are relative to. Shared by the buffers of
@@ -317,16 +326,16 @@ struct alignas(16) SparseCopyDesc
     //! share an entry and so share this pointer; buffers of one request do not.
     int32_t const* pageTable;
     //! This buffer's sub-region of its pool in the cell arena, which is the pool's base
-    //! plus its slot there. A lease's cells follow at `leaseIndex * leaseStride`.
+    //! plus its slot there. A lease's cells follow at `leaseIndex * cellsPerLease` cells.
     CUdeviceptr deviceBase;
 
     uint32_t hostPageStride;
     uint32_t pageTableStride;
     //! Blocks a row's page table describes; an ordinal past them is outside this call.
     uint32_t numBlocks;
-    //! Bytes one lease takes in this pool's region, which is its cells there times the
-    //! cell size. Multiplied by a lease index, so widened at the multiply.
-    uint32_t leaseStride;
+    //! Cells one lease takes in this pool's region. Its bytes can pass 4 GiB, so a lease's
+    //! offset is formed in 64 bits from this and `cellBytes`.
+    uint32_t cellsPerLease;
     //! Bytes of one cell, which is one buffer's worth of pages.
     uint32_t cellBytes;
 
@@ -382,10 +391,12 @@ struct SparseUnitCopyArgs
     //! CTAs along the work dimension. A work item is one warp's worth -- a selection unit is
     //! 288 bytes of NVFP4 data or 36 of scales, which is 18 or 36 lanes, so a block per item
     //! would leave most of it idle -- and the warps walk the list with a grid-stride loop.
+    //! A fetch of chunks of at least kSparseCtaCopyMinChunkBytes is the exception: each of
+    //! its items takes a whole CTA, and the CTAs walk the list instead.
     //!
     //! Sized from the machine, not the work: the fetch is captured in a graph, so the grid
     //! is fixed before anyone knows how many units a step will miss. The device-side total
-    //! is what the loop actually follows.
+    //! is what the loop actually follows. sparseCopyGridCtas gives the size.
     int32_t gridCtas;
 
     //! Optional [numRows] token bounds for partial-unit write-back. Descriptors opt

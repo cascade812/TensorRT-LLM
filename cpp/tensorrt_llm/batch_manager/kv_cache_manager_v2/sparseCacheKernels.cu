@@ -444,8 +444,6 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     __shared__ int32_t numMiss;
     __shared__ int32_t numCopy;
     __shared__ int32_t numResolved;
-    // Misses of the write unit's restored prefix, which the hit/miss statistics leave out.
-    __shared__ int32_t numRestoreMisses;
     //! Resident units that lack chunks the selection reads, and the chunk copies the call asks for.
     __shared__ int32_t numPartial;
     __shared__ int32_t numSlices;
@@ -476,7 +474,6 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         numMiss = 0;
         numCopy = 0;
         numResolved = 0;
-        numRestoreMisses = 0;
         numPartial = 0;
         numSlices = 0;
         claimedMisses = 0;
@@ -581,16 +578,19 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
                 partNeed[j] = need;
             }
         }
+        else if (i < inFlight && ord < copyableUnits)
+        {
+            // A growing unit with a host prefix is its write preparation's to reserve, which
+            // restores the prefix before the model writes. Queued here, the copy could land
+            // after a token written in between.
+            inFlightSlot[i] = kNoSparseSlot;
+        }
         else
         {
             int32_t const j = atomicAdd(&numMiss, 1);
             missOrd[j] = ord;
             missIdx[j] = i;
             missMask[j] = want;
-            if (i < inFlight && ord < copyableUnits)
-            {
-                atomicAdd(&numRestoreMisses, 1);
-            }
         }
     }
     if (resolvedMine > 0)
@@ -600,14 +600,14 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     __syncthreads();
 
     // Claim this row's run in the compacted list now that the miss set is final, so the
-    // eviction loop below can write straight into it. Copyable misses include a partial
-    // host prefix when configured. Hit/miss statistics count only selected entries,
-    // excluding the write unit's restore, and are added once per row.
+    // eviction loop below can write straight into it. Only complete history is copied, so
+    // every claimed entry is a selected miss. Hit/miss statistics count only selected
+    // entries, and are added once per row.
     {
         int32_t mine = 0;
         for (int32_t j = tid; j < numMiss; j += kResolveThreads)
         {
-            mine += missOrd[j] < copyableUnits ? 1 : 0;
+            mine += missOrd[j] < historyUnits ? 1 : 0;
         }
         int32_t scanned = 0;
         int32_t claimed = 0;
@@ -615,22 +615,20 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         if (tid == 0)
         {
             // A resident unit lacking chunks is copied like a miss, so it joins the run after
-            // the misses. A unit is one or the other, so the run never exceeds the selection
-            // plus the growing unit's prefix, which is what the list is sized for.
+            // the misses. A selected unit is one or the other, and an in-flight unit is always
+            // whole, so the run never exceeds the selection.
             claimedMisses = claimed;
             int32_t const total = claimed + numPartial;
             copyBase = total > 0 ? atomicAdd(args.work.total, total) : 0;
-            // The list is sized for every row missing its whole selection and, with partial
-            // units, the growing unit's prefix, so a claim can only run past it if the caller
-            // sized it from a different width.
+            // The list is sized for every row missing its whole selection, so a claim can only
+            // run past it if the caller sized it from a different width.
             KVCM2_SPARSE_REQUIRE(copyBase + total <= args.work.capacity);
             if (args.hitMiss != nullptr)
             {
                 atomicAdd(&args.hitMiss->resolved, static_cast<unsigned long long>(numResolved));
-                int32_t const selectedMisses = claimed - numRestoreMisses + numPartial;
-                if (selectedMisses > 0)
+                if (total > 0)
                 {
-                    atomicAdd(&args.hitMiss->misses, static_cast<unsigned long long>(selectedMisses));
+                    atomicAdd(&args.hitMiss->misses, static_cast<unsigned long long>(total));
                 }
             }
         }
@@ -708,10 +706,10 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         // written; a selected one holds the chunks its copy brings.
         uint8_t const chunks = position < inFlight ? chunkFull : missMask[j];
         validGlobal[s] = chunks;
-        // Fetch complete history and, when configured, the host prefix of a newly
-        // reserved partial unit. Resident units are hits, so a fetch never overwrites
-        // the token the model has just appended to its reserved cell.
-        if (ordinal < copyableUnits)
+        // Fetch complete history only. An in-flight miss is just reserved: the one with a
+        // host prefix was left to write preparation above, so no copy queued here can land
+        // on a token the model writes before the fetch runs.
+        if (ordinal < historyUnits)
         {
             auto const c = copyBase + atomicAdd(&numCopy, 1);
             args.work.row[c] = row;
@@ -818,9 +816,10 @@ __device__ void copySparseUnitsImpl(
         // Direction only chooses which of the two is read.
         auto* cold = reinterpret_cast<char*>(
             desc.hostBase + hostPage * desc.hostPageStride + static_cast<uint64_t>(srcUnit) * desc.layout.unitStride);
-        auto* hot = reinterpret_cast<char*>(desc.deviceBase + static_cast<uint64_t>(lease.value()) * desc.leaseStride
-            + static_cast<uint64_t>(slot / args.unitsPerPage) * desc.cellBytes
-            + static_cast<uint64_t>(dstUnit) * desc.layout.unitStride);
+        auto const cell = static_cast<uint64_t>(lease.value()) * desc.cellsPerLease
+            + static_cast<uint64_t>(slot / args.unitsPerPage);
+        auto* hot = reinterpret_cast<char*>(
+            desc.deviceBase + cell * desc.cellBytes + static_cast<uint64_t>(dstUnit) * desc.layout.unitStride);
         bool const fetching = args.direction == SparseCopyDirection::kFetch;
         char const* src = fetching ? cold : hot;
         char* dst = fetching ? hot : cold;
@@ -860,8 +859,9 @@ __device__ void copySparseUnits(
     SparseUnitCopyArgs const& args, SparseCopyDesc const& desc, int32_t list, int32_t globalWarp)
 {
     // Large host reads need enough independent loads to cover link latency. Small
-    // units and dirty-token writes keep a warp per item for batch parallelism.
-    if (args.direction == SparseCopyDirection::kFetch && desc.layout.chunkBytes >= 16 * 1024)
+    // units and dirty-token writes keep a warp per item for batch parallelism. The
+    // grid gives each large item a CTA of its own; see sparseCopyGridCtas.
+    if (args.direction == SparseCopyDirection::kFetch && desc.layout.chunkBytes >= kSparseCtaCopyMinChunkBytes)
     {
         copySparseUnitsImpl<Vec, kThreads>(args, desc, list, globalWarp);
     }
@@ -1168,12 +1168,13 @@ int32_t sparseCopyMultiprocessors(CUdevice device)
     return std::max(smCount, 1);
 }
 
-int32_t sparseCopyGridCtas(int32_t workCapacity, int32_t smCount) noexcept
+int32_t sparseCopyGridCtas(int32_t workCapacity, int32_t smCount, bool ctaPerItem) noexcept
 {
     constexpr int32_t kCtasPerSm = 4;
 
     int32_t const full = std::max(smCount, 1) * kCtasPerSm;
-    int32_t const needed = (workCapacity + kWarpsPerCopyCta - 1) / kWarpsPerCopyCta;
+    int32_t const itemsPerCta = ctaPerItem ? 1 : kWarpsPerCopyCta;
+    int32_t const needed = (workCapacity + itemsPerCta - 1) / itemsPerCta;
     return std::max(1, std::min(full, needed));
 }
 

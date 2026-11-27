@@ -451,9 +451,8 @@ scales. Dense target layers and the shared Eagle3 draft layer keep FP8 caches.
 Prefill uses MSA kernels; decode uses TensorRT LLM's Triton sparse kernels
 within the MSA backend. This does not select `implementation: triton`.
 The optional `fuse_qkv_index_projection: true` supports FP8 and NVFP4 main
-caches with an FP8 indexer. With `enable_kv_cache_offload: true`, layers with an
-NVFP4 main cache skip the fused producer and run the unfused norm, RoPE and
-cache writes. The MiniMax-M3.1-Flash targets of the Modeling V2 `minimax_m3`
+caches with an FP8 indexer, with or without `enable_kv_cache_offload: true`.
+The MiniMax-M3.1-Flash targets of the Modeling V2 `minimax_m3`
 family also accept a standalone DSpark drafter; see the deployment guide.
 
 On a disaggregated generation worker, `enable_kv_cache_offload: true` keeps
@@ -486,8 +485,9 @@ Enable offload only on the generation worker and use matching KV precision
 on the context worker. An offloading worker serves only generation requests, so
 it requires a `cache_transceiver_config`. Offload requires single-token,
 single-beam generation, pipeline parallel size 1, and no speculative decoding.
-`gpu_cache_factor` multiplies the maximum union size (`sparse_topk_blocks` times
-local KV heads), with one additional block reserved for writing. A larger factor
+`gpu_cache_factor` multiplies the maximum union size (`sparse_topk_blocks`, which
+MSA fixes at 16, times local KV heads), with one additional block reserved for
+writing. A larger factor
 holds more of each request's recently selected blocks on the GPU, so fewer
 decode steps wait for host fetches, at the cost of GPU memory per request. In a
 32K-input decode benchmark on two GB300 GPUs, a factor of 6 reached a 95.5%
